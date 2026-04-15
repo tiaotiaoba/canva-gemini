@@ -45,7 +45,7 @@
     };
 })();
 
-import React, { useState, useRef, useEffect, useCallback, useMemo, memo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react';
 import { createPortal } from 'react-dom';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
@@ -59,7 +59,7 @@ import {
     Sparkles, Mic, Mic2, Camera, Code, ClipboardCopy, Edit, LayoutGrid, Check, CheckSquare, Eye,
     Scissors, Layout, Download, Save, FolderOpen, Brush, Undo2, Eraser, HardDrive, ChevronDown, ChevronUp, UploadCloud,
     Monitor,
-    Zap, // V3.5.24
+    Zap, Workflow, // V3.5.24
     Ban, Clock, Edit3, Pencil // V3.7.24: API management buttons + V3.7.25: Edit icons
 } from 'lucide-react';
 import JSZip from 'jszip';
@@ -254,7 +254,15 @@ const LocalImageManager = (() => {
                 request.onsuccess = () => {
                     const record = request.result;
                     if (record && record.blob) {
-                        // V3.7.32 Fix: Use FileReader to return Base64 avoiding blob:null security error in file:// protocol
+                        const isFileProtocol = typeof window !== 'undefined' && window.location?.protocol === 'file:';
+                        if (!isFileProtocol) {
+                            const objectUrl = URL.createObjectURL(record.blob);
+                            blobUrlCache.set(id, objectUrl);
+                            resolve(objectUrl);
+                            return;
+                        }
+
+                        // file:// 模式下仍然回退到 Data URL，避免 blob:null 安全限制
                         const reader = new FileReader();
                         reader.onloadend = () => {
                             const base64 = reader.result;
@@ -408,7 +416,7 @@ const truncateByBytes = (value, maxBytes) => {
     return output;
 };
 
-// --- LazyBase64Image 组件：将 Base64 转换为 Blob URL 的智能图片组件 ---
+// --- LazyBase64Image 组件：统一解析 Base64 / IndexedDB / 远程地址 ---
 const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => {
     const [blobUrl, setBlobUrl] = useState(null);
     const [error, setError] = useState(false);
@@ -418,9 +426,6 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
     useEffect(() => {
         let active = true;
         // src 变更时先清空旧图，避免“新图未加载时仍显示上一张”
-        if (blobUrlRef.current && blobUrlRef.current.startsWith('blob:')) {
-            URL.revokeObjectURL(blobUrlRef.current);
-        }
         blobUrlRef.current = null;
         setError(false);
         setBlobUrl(null);
@@ -465,49 +470,23 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
             return () => { active = false; };
         }
 
-        // 如果是 Base64 Data URL，优先直用（file:// 下避免 blob: 安全限制）
+        // Base64 Data URL 直接使用，避免在主线程重复做 dataURL -> Blob 转换
         if (src.startsWith('data:')) {
             const normalized = normalizeDataUrl(src);
-            const isFileProtocol = typeof window !== 'undefined' && window.location?.protocol === 'file:';
-            if (isFileProtocol) {
-                if (active) {
-                    blobUrlRef.current = normalized;
-                    setBlobUrl(normalized);
-                    setLoading(false);
-                }
-                return () => { active = false; };
+            if (active) {
+                blobUrlRef.current = normalized;
+                setBlobUrl(normalized);
+                setLoading(false);
             }
-            const convertToBlobUrl = async () => {
-                try {
-                    const blob = dataUrlToBlob(normalized);
-                    if (!active) return;
-                    if (!blob) {
-                        setError(true);
-                        setBlobUrl(null);
-                        return;
-                    }
-                    const url = URL.createObjectURL(blob);
-                    blobUrlRef.current = url;
-                    setBlobUrl(url);
-                } catch (err) {
-                    if (!active) return;
-                    console.warn('Base64转Blob失败', err);
-                    setError(true);
-                    setBlobUrl(null);
-                }
-            };
-            convertToBlobUrl();
+            return () => { active = false; };
         } else {
             setBlobUrl(src);
         }
 
-        // 清理函数：组件卸载时释放 Blob URL
+        // 清理函数：避免卸载后继续写状态
         return () => {
             active = false;
-            if (blobUrlRef.current && blobUrlRef.current.startsWith('blob:')) {
-                URL.revokeObjectURL(blobUrlRef.current);
-                blobUrlRef.current = null;
-            }
+            blobUrlRef.current = null;
         };
     }, [src]);
 
@@ -1295,8 +1274,11 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
     const canvasRef = useRef(null);
     const ctxRef = useRef(null);
     const lastPointRef = useRef(null); // V3.7.27: 用于平滑绘制
+    const rectStartRef = useRef(null);
     const [brushSize, setBrushSize] = useState(30);
+    const [toolMode, setToolMode] = useState('brush');
     const [isDrawing, setIsDrawing] = useState(false);
+    const [rectPreview, setRectPreview] = useState(null);
     const [history, setHistory] = useState([]);
     const [historyIndex, setHistoryIndex] = useState(-1);
     const maxHistory = 10;
@@ -1416,15 +1398,29 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         }
         lastPointRef.current = coords;
     };
+    const paintRect = (rect) => {
+        if (!rect || !ctxRef.current) return;
+        const ctx = ctxRef.current;
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    };
 
     // 鼠标事件处理
     const handleMouseDown = (e) => {
         if (e.button !== 0) return; // 只处理左键
         e.preventDefault();
         e.stopPropagation();
-        lastPointRef.current = null; // V3.7.27: 重置上一个点
         setIsDrawing(true);
         saveToHistory();
+        const coords = getCanvasCoordinates(e);
+        if (!coords) return;
+        if (toolMode === 'rect') {
+            rectStartRef.current = coords;
+            setRectPreview({ x: coords.x, y: coords.y, w: 0, h: 0 });
+            return;
+        }
+        lastPointRef.current = null; // V3.7.27: 重置上一个点
         draw(e);
     };
 
@@ -1432,6 +1428,18 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         if (!isDrawing) return;
         e.preventDefault();
         e.stopPropagation();
+        if (toolMode === 'rect') {
+            const coords = getCanvasCoordinates(e);
+            if (!coords || !rectStartRef.current) return;
+            const start = rectStartRef.current;
+            setRectPreview({
+                x: Math.min(start.x, coords.x),
+                y: Math.min(start.y, coords.y),
+                w: Math.abs(coords.x - start.x),
+                h: Math.abs(coords.y - start.y)
+            });
+            return;
+        }
         draw(e);
     };
 
@@ -1440,6 +1448,24 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         e.preventDefault();
         e.stopPropagation();
         setIsDrawing(false);
+        if (toolMode === 'rect') {
+            const coords = getCanvasCoordinates(e);
+            const finalRect = rectStartRef.current && coords
+                ? {
+                    x: Math.min(rectStartRef.current.x, coords.x),
+                    y: Math.min(rectStartRef.current.y, coords.y),
+                    w: Math.abs(coords.x - rectStartRef.current.x),
+                    h: Math.abs(coords.y - rectStartRef.current.y)
+                }
+                : rectPreview;
+            if (finalRect && finalRect.w > 0 && finalRect.h > 0) {
+                paintRect(finalRect);
+                saveToHistory();
+            }
+            rectStartRef.current = null;
+            setRectPreview(null);
+            return;
+        }
         lastPointRef.current = null; // V3.7.27: 清除上一个点
         saveToHistory();
     };
@@ -1458,6 +1484,8 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         if (!canvasRef.current || !ctxRef.current) return;
         const ctx = ctxRef.current;
         ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        rectStartRef.current = null;
+        setRectPreview(null);
         saveToHistory();
     };
 
@@ -1518,6 +1546,17 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
                     onMouseUp={handleMouseUp}
                     onMouseLeave={handleMouseUp}
                 />
+                {toolMode === 'rect' && rectPreview && resolvedDimensions?.w && resolvedDimensions?.h && (
+                    <div
+                        className="absolute border-2 border-dashed border-white bg-white/20 pointer-events-none"
+                        style={{
+                            left: `${(rectPreview.x / resolvedDimensions.w) * 100}%`,
+                            top: `${(rectPreview.y / resolvedDimensions.h) * 100}%`,
+                            width: `${(rectPreview.w / resolvedDimensions.w) * 100}%`,
+                            height: `${(rectPreview.h / resolvedDimensions.h) * 100}%`
+                        }}
+                    />
+                )}
 
                 {/* 视觉反馈层：半透明红色覆盖 - 使用 Canvas 作为 mask */}
                 <MaskVisualFeedback canvasRef={canvasRef} isDrawing={isDrawing} />
@@ -1532,6 +1571,40 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
                         }`}
                     onMouseDown={(e) => e.stopPropagation()}
                 >
+                    <div className="flex items-center gap-1">
+                        <button
+                            onClick={() => {
+                                setToolMode('brush');
+                                rectStartRef.current = null;
+                                setRectPreview(null);
+                            }}
+                            className={`p-1.5 rounded-full transition-colors ${toolMode === 'brush'
+                                ? 'bg-blue-600 text-white'
+                                : theme === 'dark'
+                                    ? 'hover:bg-zinc-800'
+                                    : 'hover:bg-zinc-100'
+                                }`}
+                            title={t('画笔')}
+                        >
+                            <Brush size={14} />
+                        </button>
+                        <button
+                            onClick={() => {
+                                setToolMode('rect');
+                                lastPointRef.current = null;
+                            }}
+                            className={`p-1.5 rounded-full transition-colors ${toolMode === 'rect'
+                                ? 'bg-blue-600 text-white'
+                                : theme === 'dark'
+                                    ? 'hover:bg-zinc-800'
+                                    : 'hover:bg-zinc-100'
+                                }`}
+                            title={t('框选')}
+                        >
+                            <Square size={14} />
+                        </button>
+                    </div>
+
                     {/* 笔刷粗细 */}
                     <div className="flex items-center gap-2">
                         <span className="text-[10px] font-medium whitespace-nowrap">笔刷</span>
@@ -1796,9 +1869,114 @@ const VIRTUAL_CANVAS_WIDTH = 4000;
 const VIRTUAL_CANVAS_HEIGHT = 4000;
 const IMAGE_TASK_TIMEOUT_MS = 60 * 1000;
 const VIDEO_TASK_TIMEOUT_MS = 5 * 60 * 1000;
+const MIN_NODE_WIDTH = 220;
+const MIN_NODE_HEIGHT = 160;
+
+const clampValue = (value, min, max) => Math.min(Math.max(value, min), max);
+
+const findScrollableElementWithinBoundary = (startElement, boundaryElement) => {
+    let current = startElement instanceof Element ? startElement : null;
+    while (current) {
+        if (current instanceof HTMLElement) {
+            const style = window.getComputedStyle(current);
+            const canScrollY = /(auto|scroll|overlay)/.test(style.overflowY) && current.scrollHeight > current.clientHeight + 1;
+            const canScrollX = /(auto|scroll|overlay)/.test(style.overflowX) && current.scrollWidth > current.clientWidth + 1;
+            if (canScrollY || canScrollX) {
+                return current;
+            }
+        }
+
+        if (!boundaryElement || current === boundaryElement) {
+            break;
+        }
+
+        current = current.parentElement;
+    }
+
+    return null;
+};
+
+const resizeNodeFromDirection = (startNode, direction, deltaX, deltaY) => {
+    const next = {
+        x: startNode.x,
+        y: startNode.y,
+        width: startNode.width,
+        height: startNode.height
+    };
+
+    if (direction.includes('right')) {
+        next.width = Math.max(MIN_NODE_WIDTH, startNode.width + deltaX);
+    }
+    if (direction.includes('left')) {
+        const widthFromLeft = Math.max(MIN_NODE_WIDTH, startNode.width - deltaX);
+        next.x = startNode.x + (startNode.width - widthFromLeft);
+        next.width = widthFromLeft;
+    }
+    if (direction.includes('bottom')) {
+        next.height = Math.max(MIN_NODE_HEIGHT, startNode.height + deltaY);
+    }
+    if (direction.includes('top')) {
+        const heightFromTop = Math.max(MIN_NODE_HEIGHT, startNode.height - deltaY);
+        next.y = startNode.y + (startNode.height - heightFromTop);
+        next.height = heightFromTop;
+    }
+
+    return next;
+};
 
 // --- 默认配置 ---
 const DEFAULT_BASE_URL = 'https://ai.comfly.chat';
+const GOOGLE_OFFICIAL_BASE_URL = 'https://generativelanguage.googleapis.com';
+const CHAT_CANVAS_CONTEXT_STORAGE_KEY = 'tapnow_chat_canvas_context_enabled';
+const CHAT_AUTO_ATTACH_MEDIA_STORAGE_KEY = 'tapnow_chat_canvas_media_enabled';
+const CHAT_GEMINI_THINKING_STORAGE_KEY = 'tapnow_chat_gemini_thinking';
+const CHAT_GEMINI_SEARCH_STORAGE_KEY = 'tapnow_chat_gemini_search';
+const CHAT_GEMINI_THINKING_BUDGET = 4096;
+const CHAT_CANVAS_CONTEXT_MAX_NODES = 18;
+const CHAT_CANVAS_CONTEXT_MAX_MEDIA = 8;
+const CHAT_CANVAS_CONTEXT_MAX_SHOTS = 6;
+const CHAT_CANVAS_CONTEXT_TEXT_LIMIT = 320;
+const GEMINI_DESIGN_AGENT_SYSTEM_PROMPT = `你是 TapNow 内置的 Gemini 设计 Agent。
+
+你的核心职责：
+1. 把用户需求拆成可执行的画布工作流，而不只是给一句提示词。
+2. 当消息里出现“节点#”或“素材#”时，必须严格按编号引用对应对象，不能混淆。
+3. 当提供了画布上下文时，要同时理解节点类型、上下游关系、提示词、模型参数、镜头语言和素材内容。
+4. 当提供了图片或视频素材时，要主动分析构图、主体、风格、镜头、颜色、品牌元素、质感与连续性。
+5. 当模型支持搜索时，先利用搜索补足时效性信息，再把结果转成可落地的设计或分镜建议。
+6. 优先输出完整方案：目标拆解、节点编排、素材对应关系、套图/分镜方案、可直接执行的提示词。
+
+输出要求：
+- 默认使用中文。
+- 如果引用画布对象，统一使用“节点#1 / 素材#1”格式。
+- 如果用户要做系列图、角色一致性、镜头脚本或品牌套图，优先给出分步骤工作流。
+- 如果需要用户下一步操作，明确告诉他应该修改哪个节点、补哪张素材、或如何串联节点。
+- 如果用户在做 AI 绘图、图生图、套图延展、镜头设计或 Gemini image 相关任务，优先输出可直接落到节点里的精简 JSON 提示词对象，结构优先使用全大写下划线格式的 SYSTEM_REASONING + API_PAYLOAD；其中 API_PAYLOAD 应尽量包含 COMPILED_PROMPT、EDIT_INSTRUCTION、NEGATIVE_PROMPT、ASPECT_RATIO、RESOLUTION、SAMPLE_COUNT，不要输出空字段或 Not applicable 之类无效值。
+- 如果是图生图或局部编辑，优先把“保留主体不变、只改哪里、改成什么”的动作写进 EDIT_INSTRUCTION；真正喂给图像模型的画面描述尽量集中在 COMPILED_PROMPT 里，并自动过滤空字段与无效占位值。
+- 当你给出多个方案时，要按“方案#1 / 方案#2”编号，并在每个方案里明确对应的素材编号、节点编号和预期产出。
+- 如果存在多素材 / 多提示词映射，每个方案都要显式写清 SOURCE_REFS（如 ["素材#1","素材#3"]）或在正文中明确标注“对应素材#1 + 素材#3”；一个素材对应多个方案时，每个方案都重复写出该素材编号。`;
+const NODE_TYPE_LABELS = Object.freeze({
+    'input-image': '图片输入',
+    'video-input': '视频输入',
+    'text-node': '文字节点',
+    'novel-input': '小说输入',
+    'storyboard-node': '智能分镜表',
+    'gen-image': 'AI 绘图',
+    'gen-video': 'AI 视频',
+    'video-analyze': '视频拆解',
+    'extract-characters-scenes': '提取角色和场景',
+    'character-description': '角色描述',
+    'scene-description': '场景描述',
+    'generate-character-image': '生成角色图片',
+    'generate-scene-image': '生成场景图片',
+    'generate-character-video': '生成角色视频',
+    'generate-scene-video': '生成场景视频',
+    'create-character': '创建角色',
+    'create-scene': '创建场景',
+    'image-compare': '图像对比',
+    'preview': '预览窗口',
+    'local-save': '保存到本地'
+});
 
 // 即梦API配置（代理地址，默认本地5100端口）
 const JIMENG_API_BASE_URL = 'http://localhost:5100';
@@ -1807,7 +1985,7 @@ const JIMENG_SESSION_ID = '7a16459fbd65d9c87b4ea44d3318f5fa';
 // V3.6.0: 供应商配置（简化版 - 无 name 字段，直接用 key 作为显示名）
 const DEFAULT_PROVIDERS = {
     'openai': { key: '', url: DEFAULT_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
-    'google': { key: '', url: DEFAULT_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
+    'google': { key: '', url: GOOGLE_OFFICIAL_BASE_URL, apiType: 'gemini', useProxy: false, forceAsync: false, officialApi: true },
     'deepseek': { key: '', url: DEFAULT_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
     'midjourney': { key: '', url: 'https://api.midjourney.com', apiType: 'openai', useProxy: false, forceAsync: false },
     'jimeng': { key: '', url: JIMENG_API_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
@@ -1822,7 +2000,10 @@ const DEFAULT_API_CONFIGS = [
     { id: 'gpt-5.2', provider: 'openai', type: 'Chat' },
     { id: 'gpt-4o', provider: 'openai', type: 'Chat' },
     { id: 'deepseek-v3-1-250821', provider: 'deepseek', type: 'Chat' },
-    { id: 'gemini-3-pro-preview', provider: 'google', type: 'Chat' },
+    { id: 'gemini-3.1-pro-preview', provider: 'google', type: 'Chat' },
+    { id: 'gemini-3.1-flash-preview', provider: 'google', type: 'Chat' },
+    { id: 'gemini-3-flash-preview', provider: 'google', type: 'Chat' },
+    { id: 'gemini-3-pro-image-preview', provider: 'google', type: 'ChatImage' },
 
     // Image Models
     { id: 'MJ V6', provider: 'midjourney', type: 'Image' },
@@ -1859,6 +2040,95 @@ const VIDEO_RES_OPTIONS = ['1080P', '720P'];
 const PROMPT_LIBRARY_KEY = 'tapnow_prompt_library';
 const GRID_PROMPT_TEXT = `基于我上传的这张参考图，生成一张九宫格（3x3 grid）布局的分镜脚本。请严格保持角色与参考图一致（Keep character strictly consistent），但在9个格子中展示该角色不同的动作、表情和拍摄角度（如正面、侧面、背面、特写等）。要求风格高度统一，形成一张完整的角色动态表（Character Sheet）。`;
 const UPSCALE_PROMPT_TEXT = `请对参考图片进行无损高清放大（Upscale）。请严格保持原图的构图、色彩、光影和所有细节元素不变，不要进行任何创造性的重绘或添加新内容。仅专注于提升分辨率、锐化边缘（Sharpening）和去除噪点（Denoising），实现像素级的高清修复。Best quality, 8k, masterpiece, highres, ultra detailed, sharp focus, image restoration, upscale, faithful to original.`;
+const INPAINT_PROMPT_TEXT = `请仅修改我提供遮罩覆盖的区域，其余未遮罩区域必须保持像素级一致。优先执行局部重绘、局部替换、瑕疵修复、文字擦除与版面微调，边缘过渡自然，不要破坏原图构图与材质。`;
+const TEXT_RETOUCH_PROMPT_TEXT = `请基于遮罩区域进行无痕文字修改。保持原海报/包装/画面的视觉风格、字体气质、透视、阴影、反光与排版节奏一致，只替换或重绘指定文案，不要影响未遮罩区域。`;
+const CUTOUT_PROMPT_TEXT = `请精准识别主体并完成抠图/换底级编辑：保留主体轮廓、发丝、透明材质与阴影细节，清理杂乱背景，输出适合继续排版或换底合成的干净结果。`;
+const splitPromptSegments = (text) => String(text || '').split(/[,;\n]/).map((item) => item.trim()).filter(Boolean);
+const IMAGE_BACKGROUND_PRESETS = Object.freeze([
+    { id: 'auto', label: '跟随提示词', prompt: '' },
+    { id: 'pure-white', label: '纯白抠图底', prompt: 'pure white seamless backdrop' },
+    { id: 'luxury-gray', label: '极简高级灰', prompt: 'minimal premium light gray backdrop' },
+    { id: 'industrial-workbench', label: '工业风工作台', prompt: 'industrial workbench surface, controlled commercial workshop setup' },
+    { id: 'marble-table', label: '大理石台面', prompt: 'clean marble tabletop, premium studio setup' }
+]);
+const IMAGE_LIGHTING_PRESETS = Object.freeze([
+    { id: 'auto', label: '跟随提示词', prompt: '' },
+    { id: 'soft-studio', label: '柔和影棚光', prompt: 'soft studio lighting, bright even illumination' },
+    { id: 'hard-rim', label: '硬朗轮廓光', prompt: 'hard rim lighting, crisp contour highlights' },
+    { id: 'natural-sun', label: '自然阳光', prompt: 'natural daylight, realistic sunlight highlights' }
+]);
+const IMAGE_SHADOW_PRESETS = Object.freeze([
+    { id: 'auto', label: '跟随提示词', prompt: '' },
+    { id: 'no-shadow', label: '无阴影', prompt: 'no visible shadow' },
+    { id: 'soft-bottom', label: '底部软阴影', prompt: 'soft natural drop shadow under the product' },
+    { id: 'side-long', label: '侧向长阴影', prompt: 'long directional side shadow' }
+]);
+const IMAGE_ECOMMERCE_STYLE_PRESETS = Object.freeze([
+    {
+        id: 'white-soft-shadow',
+        label: '纯白底 + 柔和阴影',
+        description: '阿里国际 / 亚马逊标准白底主图',
+        backgroundPreset: 'pure-white',
+        lightingPreset: 'soft-studio',
+        shadowPreset: 'soft-bottom',
+        stylePrompt: 'resting on a pure white seamless background (RGB 255,255,255), bright even studio illumination, very soft and subtle contact shadow directly beneath the product, minimalist e-commerce style, edge-to-edge clarity, 8k resolution, highly detailed photorealistic',
+        negativePromptAddon: 'dark background, harsh shadows, dramatic lighting, reflections, floating in air, colored background'
+    },
+    {
+        id: 'white-reflection',
+        label: '白底 + 镜面轻倒影',
+        description: '适合数码 / 五金 / 高端仪器',
+        backgroundPreset: 'pure-white',
+        lightingPreset: 'soft-studio',
+        shadowPreset: 'no-shadow',
+        stylePrompt: 'placed on a pristine glossy white acrylic surface, a crystal-clear and elegant mirror reflection beneath the product, studio softbox lighting highlighting product textures, premium commercial advertising photography, clean and clinical',
+        negativePromptAddon: 'matte surface, blurry reflection, distorted reflection, messy environment, dark shadows'
+    },
+    {
+        id: 'gray-side-shadow',
+        label: '高级灰 + 侧向阴影',
+        description: '适合独立站 / 社媒推广图',
+        backgroundPreset: 'luxury-gray',
+        lightingPreset: 'soft-studio',
+        shadowPreset: 'side-long',
+        stylePrompt: 'centered on a seamless flat neutral light gray background, minimalist setup, soft directional lighting from the top left casting a clean diagonal drop shadow to the right, modern aesthetic, trendy e-commerce product shot, sharp focus',
+        negativePromptAddon: 'complex background, textures on background, multiple light sources, messy shadows, pure white background'
+    },
+    {
+        id: 'pro-workbench-dof',
+        label: '专业工作台 + 极度景深',
+        description: '适合工业 / 专业工具 / 仪表',
+        backgroundPreset: 'industrial-workbench',
+        lightingPreset: 'hard-rim',
+        shadowPreset: 'soft-bottom',
+        stylePrompt: 'resting on a clean, sleek industrial metallic or matte black workbench. In the background, a heavily blurred, shallow depth-of-field professional workshop environment. Studio rim lighting outlining the product shape, cinematic commercial lighting, 85mm lens, f/1.8',
+        negativePromptAddon: 'cluttered background, clear background details, people, distracting elements, white background, flat lighting'
+    }
+]);
+const IMAGE_ECOMMERCE_PRESET_NEGATIVE_SEGMENTS = Object.freeze(
+    Array.from(new Set(
+        IMAGE_ECOMMERCE_STYLE_PRESETS.flatMap((preset) => splitPromptSegments(preset.negativePromptAddon).map((segment) => segment.toLowerCase()))
+    ))
+);
+const IMAGE_ECOMMERCE_PRESET_PROMPT_SEGMENTS = Object.freeze(
+    Array.from(new Set(
+        IMAGE_ECOMMERCE_STYLE_PRESETS.flatMap((preset) => splitPromptSegments(preset.stylePrompt).map((segment) => segment.toLowerCase()))
+    ))
+);
+const IMAGE_CONSOLE_PRESET_PROMPT_SEGMENTS = Object.freeze(
+    Array.from(new Set([
+        ...IMAGE_BACKGROUND_PRESETS.flatMap((preset) => splitPromptSegments(preset.prompt).map((segment) => segment.toLowerCase())),
+        ...IMAGE_LIGHTING_PRESETS.flatMap((preset) => splitPromptSegments(preset.prompt).map((segment) => segment.toLowerCase())),
+        ...IMAGE_SHADOW_PRESETS.flatMap((preset) => splitPromptSegments(preset.prompt).map((segment) => segment.toLowerCase())),
+        ...IMAGE_ECOMMERCE_PRESET_PROMPT_SEGMENTS
+    ]))
+);
+const IMAGE_NEGATIVE_FLAG_DEFS = Object.freeze([
+    { id: 'preserve-proportion', label: '拒绝改变产品比例', prompt: 'changed product proportions, altered structural details, distorted interfaces' },
+    { id: 'clean-background', label: '拒绝背景杂乱', prompt: 'messy background, clutter, distracting props' },
+    { id: 'no-extra-text', label: '拒绝生成多余文字 / 水印', prompt: 'extra text, watermark, random labels' },
+    { id: 'logical-shadow', label: '拒绝阴影不合逻辑', prompt: 'illogical shadow, floating shadow, harsh unrealistic shadow' }
+]);
 const STORYBOARD_PROMPT_TEXT = `you are a veteran Hollywood storyboard artist with years of experience. You have the ability to accurately analyze character features and scene characteristics based on images. Provide me with the most suitable camera angles and storyboards. Strictly base this on the uploaded character and scene images, while maintaining a consistent visual style.
 
 MANDATORY LAYOUT: Create a precise 3x3 GRID containing exactly 9 distinct panels.
@@ -4785,7 +5055,7 @@ function TapnowApp() {
         return () => { document.head.removeChild(styleSheet); };
     }, []);
 
-    useEffect(() => {
+    useLayoutEffect(() => {
         window.__APP_BOOTED__ = true;
         if (window.__APP_BOOT_TIMER__) {
             clearTimeout(window.__APP_BOOT_TIMER__);
@@ -4946,8 +5216,12 @@ function TapnowApp() {
 
     // === V3.4.7: Undo/Redo 功能 (可配置步数) ===
     const [maxUndoSteps, setMaxUndoSteps] = useState(() => {
-        const saved = localStorage.getItem('tapnow_max_undo_steps');
-        return saved ? Math.min(30, Math.max(1, parseInt(saved) || 5)) : 5;
+        try {
+            const saved = localStorage.getItem('tapnow_max_undo_steps');
+            return saved ? Math.min(30, Math.max(1, parseInt(saved) || 5)) : 5;
+        } catch (e) {
+            return 5;
+        }
     });
     const [undoStack, setUndoStack] = useState([]); // { nodes, connections }[]
     const [redoStack, setRedoStack] = useState([]);
@@ -4971,7 +5245,13 @@ function TapnowApp() {
         }
     });
     const [batchTick, setBatchTick] = useState(0); // Used to trigger next batch after cooldown
-    const [batchConcurrency, setBatchConcurrency] = useState(() => parseInt(localStorage.getItem('tapnow_batch_concurrency') || '1')); // Default 1
+    const [batchConcurrency, setBatchConcurrency] = useState(() => {
+        try {
+            return parseInt(localStorage.getItem('tapnow_batch_concurrency') || '1') || 1;
+        } catch (e) {
+            return 1;
+        }
+    }); // Default 1
     const pendingStartsRef = useRef(new Set()); // Track items that are starting but not yet 'generating' in nodes
     const batchStateRef = useRef('idle'); // 'idle' | 'running' | 'cooling'
 
@@ -5307,6 +5587,16 @@ function TapnowApp() {
     }, [undo, redo]);
     // === End Undo/Redo ===
     const [view, setView] = useState(() => ({ ...DEFAULT_VIEW }));
+    const supportsCssZoom = useMemo(() => {
+        try {
+            return typeof window !== 'undefined'
+                && typeof window.CSS !== 'undefined'
+                && typeof window.CSS.supports === 'function'
+                && window.CSS.supports('zoom', '1');
+        } catch {
+            return false;
+        }
+    }, []);
     const normalizeViewState = (candidate) => {
         if (!candidate || typeof candidate !== 'object') return { ...DEFAULT_VIEW };
         const x = Number.isFinite(candidate.x) ? candidate.x : DEFAULT_VIEW.x;
@@ -5551,7 +5841,13 @@ function TapnowApp() {
         };
     }, [apiConfigs, providers]);
 
-    const [globalApiKey, setGlobalApiKey] = useState(() => localStorage.getItem('tapnow_global_key') || '');
+    const [globalApiKey, setGlobalApiKey] = useState(() => {
+        try {
+            return localStorage.getItem('tapnow_global_key') || '';
+        } catch (e) {
+            return '';
+        }
+    });
 
     // API 黑名单机制 (比照 Jimeng-api-tool 实现)
     const [apiBlacklist, setApiBlacklist] = useState(() => {
@@ -5659,8 +5955,12 @@ function TapnowApp() {
 
     // 即梦图生图使用本地文件设置（默认true，强制使用本地文件而不是URL）
     const [jimengUseLocalFile, setJimengUseLocalFile] = useState(() => {
-        const saved = localStorage.getItem('tapnow_jimeng_use_local_file');
-        return saved !== null ? saved === 'true' : true; // 默认true
+        try {
+            const saved = localStorage.getItem('tapnow_jimeng_use_local_file');
+            return saved !== null ? saved === 'true' : true; // 默认true
+        } catch (e) {
+            return true;
+        }
     });
 
     // V3.4.7: 项目名称状态 - 新项目（无节点）始终显示"未命名项目"
@@ -5717,7 +6017,11 @@ function TapnowApp() {
 
     // V2.6.1 Feature: 本地服务器 URL
     const [localServerUrl, setLocalServerUrl] = useState(() => {
-        return localStorage.getItem('tapnow_local_server_url') || 'http://127.0.0.1:9527';
+        try {
+            return localStorage.getItem('tapnow_local_server_url') || 'http://127.0.0.1:9527';
+        } catch (e) {
+            return 'http://127.0.0.1:9527';
+        }
     });
 
     // V2.6.1 Feature: 本地缓存服务器状态
@@ -6234,16 +6538,40 @@ function TapnowApp() {
     const [chatWidth, setChatWidth] = useState(400);
     const [chatFiles, setChatFiles] = useState([]);
     const [chatModel, setChatModel] = useState(() => {
-        try { return localStorage.getItem('tapnow_chat_model') || 'gemini-3-pro'; } catch { return 'gemini-3-pro'; }
+        try { return localStorage.getItem('tapnow_chat_model') || 'gemini-3.1-pro-preview'; } catch { return 'gemini-3.1-pro-preview'; }
     });
     const [chatModelDropdownOpen, setChatModelDropdownOpen] = useState(false);
     const [chatHoveredProvider, setChatHoveredProvider] = useState(null);
     const [isChatSending, setIsChatSending] = useState(false);
+    const [chatCanvasContextEnabled, setChatCanvasContextEnabled] = useState(() => {
+        try { return localStorage.getItem(CHAT_CANVAS_CONTEXT_STORAGE_KEY) !== 'false'; } catch { return true; }
+    });
+    const [chatAutoAttachCanvasMedia, setChatAutoAttachCanvasMedia] = useState(() => {
+        try { return localStorage.getItem(CHAT_AUTO_ATTACH_MEDIA_STORAGE_KEY) !== 'false'; } catch { return true; }
+    });
+    const [chatGeminiThinkingEnabled, setChatGeminiThinkingEnabled] = useState(() => {
+        try { return localStorage.getItem(CHAT_GEMINI_THINKING_STORAGE_KEY) !== 'false'; } catch { return true; }
+    });
+    const [chatGeminiSearchEnabled, setChatGeminiSearchEnabled] = useState(() => {
+        try { return localStorage.getItem(CHAT_GEMINI_SEARCH_STORAGE_KEY) !== 'false'; } catch { return true; }
+    });
 
     // V3.7.24: 保存聊天模型选择到 localStorage
     useEffect(() => {
         try { localStorage.setItem('tapnow_chat_model', chatModel); } catch { }
     }, [chatModel]);
+    useEffect(() => {
+        try { localStorage.setItem(CHAT_CANVAS_CONTEXT_STORAGE_KEY, String(chatCanvasContextEnabled)); } catch { }
+    }, [chatCanvasContextEnabled]);
+    useEffect(() => {
+        try { localStorage.setItem(CHAT_AUTO_ATTACH_MEDIA_STORAGE_KEY, String(chatAutoAttachCanvasMedia)); } catch { }
+    }, [chatAutoAttachCanvasMedia]);
+    useEffect(() => {
+        try { localStorage.setItem(CHAT_GEMINI_THINKING_STORAGE_KEY, String(chatGeminiThinkingEnabled)); } catch { }
+    }, [chatGeminiThinkingEnabled]);
+    useEffect(() => {
+        try { localStorage.setItem(CHAT_GEMINI_SEARCH_STORAGE_KEY, String(chatGeminiSearchEnabled)); } catch { }
+    }, [chatGeminiSearchEnabled]);
 
     const [lightboxItem, setLightboxItem] = useState(null);
     // V3.7.22: Ref 用于解决 onNavigate 闭包过时问题
@@ -6283,6 +6611,7 @@ function TapnowApp() {
     const [promptLibraryForm, setPromptLibraryForm] = useState({ name: '', prompt: '' });
     const [promptLibraryCollapsed, setPromptLibraryCollapsed] = useState(false);
     const [promptLibraryEditorOpen, setPromptLibraryEditorOpen] = useState(false);
+    const [imageEditModal, setImageEditModal] = useState({ nodeId: null, isMasking: false });
     useEffect(() => {
         try {
             localStorage.setItem(PROMPT_LIBRARY_KEY, JSON.stringify(promptLibrary));
@@ -6455,6 +6784,7 @@ function TapnowApp() {
     const [deletingProviderKey, setDeletingProviderKey] = useState(null); // V3.4.7: Settings Modal Provider 删除确认状态
     const [apiTesting, setApiTesting] = useState(null);
     const [apiStatus, setApiStatus] = useState({});
+    const [providerRefreshState, setProviderRefreshState] = useState({});
     // 实时计时器状态：nodeId -> elapsedSeconds
     const [nodeTimers, setNodeTimers] = useState({});
     // V3.4.8: 记住上次使用的模型
@@ -6477,10 +6807,10 @@ function TapnowApp() {
         try { return localStorage.getItem('tapnow_last_segment_duration') || '3'; } catch { return '3'; }
     });
     const [lastUsedAnalyzeModel, setLastUsedAnalyzeModel] = useState(() => {
-        try { return localStorage.getItem('tapnow_last_analyze_model') || 'gemini-3-pro'; } catch { return 'gemini-3-pro'; }
+        try { return localStorage.getItem('tapnow_last_analyze_model') || 'gemini-3.1-pro-preview'; } catch { return 'gemini-3.1-pro-preview'; }
     });
     const [lastUsedExtractModel, setLastUsedExtractModel] = useState(() => {
-        try { return localStorage.getItem('tapnow_last_extract_model') || ''; } catch { return ''; }
+        try { return localStorage.getItem('tapnow_last_extract_model') || 'gemini-3.1-pro-preview'; } catch { return 'gemini-3.1-pro-preview'; }
     });
 
     // V2.6.1 Feature: 本地缓存服务器连接检查
@@ -6491,6 +6821,10 @@ function TapnowApp() {
         }
         const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
         if (!baseUrl) {
+            setLocalCacheServerConnected(false);
+            return;
+        }
+        if (/:9527(?:\/|$)/.test(baseUrl)) {
             setLocalCacheServerConnected(false);
             return;
         }
@@ -6648,7 +6982,7 @@ function TapnowApp() {
         return trimmed;
     };
 
-    const persistBase64ImageUrl = async (value, options = {}) => {
+    const persistBase64ImageUrl = useCallback(async (value, options = {}) => {
         if (!value || typeof value !== 'string' || !value.startsWith('data:')) return value;
         if (options.persistBase64 === false) return value;
         if (!LocalImageManager?.saveImage) return value;
@@ -6660,7 +6994,7 @@ function TapnowApp() {
         } catch (e) {
             return value;
         }
-    };
+    }, []);
 
     const normalizeImageUrls = async (urls, options = {}) => {
         if (!Array.isArray(urls)) return [];
@@ -8386,6 +8720,8 @@ function TapnowApp() {
     const pendingPanUpdate = useRef(null); // 待处理的画布拖动更新
     const multiNodeDragStartPos = useRef(null); // 多节点拖动起始位置，用于防止累积误差
     const lastZoomRef = useRef(null); // 跟踪上次的 zoom 值，用于检测缩放切换
+    const resizeSessionRef = useRef(null);
+    const pendingNodeMediaPersistenceRef = useRef(new Map());
 
     useEffect(() => {
         // 保存配置到 localStorage（不再过滤任何模型）
@@ -8925,6 +9261,34 @@ function TapnowApp() {
         isSelectingRef.current = isSelecting; // 同步更新框选状态ref
     }, [nodes, selectedNodeId, selectedNodeIds, connections, isSelecting]);
     useEffect(() => {
+        const pendingMap = pendingNodeMediaPersistenceRef.current;
+        const candidateNodes = nodes.filter((node) =>
+            (node.type === 'input-image' || node.type === 'video-input')
+            && typeof node.content === 'string'
+            && node.content.startsWith('data:')
+        );
+
+        if (candidateNodes.length === 0) return;
+
+        candidateNodes.forEach((node) => {
+            if (pendingMap.get(node.id) === node.content) return;
+            pendingMap.set(node.id, node.content);
+
+            persistBase64ImageUrl(node.content).then((persistedContent) => {
+                if (!persistedContent || persistedContent === node.content) return;
+                setNodes((prev) => prev.map((currentNode) => (
+                    currentNode.id === node.id && currentNode.content === node.content
+                        ? { ...currentNode, content: persistedContent }
+                        : currentNode
+                )));
+            }).finally(() => {
+                if (pendingMap.get(node.id) === node.content) {
+                    pendingMap.delete(node.id);
+                }
+            });
+        });
+    }, [nodes, persistBase64ImageUrl]);
+    useEffect(() => {
         const aliveIds = new Set(nodes.map((node) => node.id));
         setNodeSelectionPriority((prev) => {
             let changed = false;
@@ -9191,6 +9555,92 @@ function TapnowApp() {
         if (!base) return targetUrl;
         return `${base}/proxy?url=${encodeURIComponent(targetUrl)}`;
     }, [providers, localServerUrl]);
+
+    const stripGoogleModelPrefix = useCallback((value) => {
+        return String(value || '').trim().replace(/^models\//i, '');
+    }, []);
+    const inferCatalogModelType = useCallback((modelId, rawModel = {}, providerKey = '', apiType = 'openai') => {
+        const lowerId = String(modelId || '').trim().toLowerCase();
+        const methods = Array.isArray(rawModel?.supportedGenerationMethods)
+            ? rawModel.supportedGenerationMethods.map(method => String(method || '').toLowerCase())
+            : [];
+        const descriptor = [
+            lowerId,
+            rawModel?.displayName,
+            rawModel?.display_name,
+            rawModel?.description,
+            rawModel?.inputModalities,
+            rawModel?.outputModalities
+        ]
+            .flat()
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+        const supportsVideo = /(^|[\s-_])(veo|video)([\s-_]|$)/.test(descriptor) || methods.some(method => method.includes('video'));
+        if (supportsVideo) return 'Video';
+
+        const supportsImage = /(^|[\s-_])(image|vision)([\s-_]|$)/.test(descriptor)
+            || methods.some(method => method.includes('image'));
+        if (supportsImage) {
+            if (apiType === 'gemini' || providerKey === 'google' || /\bgpt-4o\b/.test(descriptor)) {
+                return 'ChatImage';
+            }
+            return providerKey === 'midjourney' ? 'Image' : 'ChatImage';
+        }
+
+        return 'Chat';
+    }, []);
+    const isOfficialGeminiProvider = useCallback((providerKey) => {
+        if (!providerKey) return false;
+        const provider = providers?.[providerKey];
+        const baseUrl = String(provider?.url || '').trim().toLowerCase();
+        return !!(provider?.officialApi || baseUrl.includes('generativelanguage.googleapis.com'));
+    }, [providers]);
+    const isGeminiAgentModelConfig = useCallback((cfg) => {
+        if (!cfg || typeof cfg !== 'object') return false;
+        const providerKey = cfg.provider || '';
+        const providerApiType = String(cfg.apiType || providers?.[providerKey]?.apiType || '').toLowerCase();
+        const modelId = stripGoogleModelPrefix(cfg.modelName || cfg.id || '').toLowerCase();
+        return providerApiType === 'gemini' || providerKey === 'google' || modelId.includes('gemini');
+    }, [providers, stripGoogleModelPrefix]);
+    const normalizeProviderCatalogModel = useCallback((rawModel, providerKey) => {
+        const provider = providers?.[providerKey] || {};
+        const apiType = provider?.apiType || 'openai';
+        const baseId = apiType === 'gemini'
+            ? stripGoogleModelPrefix(rawModel?.name || rawModel?.baseModelId || rawModel?.id || rawModel?.model || '')
+            : String(rawModel?.id || rawModel?.model || rawModel?.name || '').trim();
+        if (!baseId) return null;
+        const lowerId = baseId.toLowerCase();
+        if (/(embedding|embed|tts|speech|transcription|moderation|rerank)/.test(lowerId)) return null;
+        return {
+            id: baseId,
+            provider: providerKey,
+            modelName: baseId,
+            displayName: rawModel?.displayName || rawModel?.display_name || baseId,
+            type: inferCatalogModelType(baseId, rawModel, providerKey, apiType),
+            apiType,
+            libraryId: baseId,
+            source: 'provider-refresh'
+        };
+    }, [providers, stripGoogleModelPrefix, inferCatalogModelType]);
+    const buildProviderModelLibraryEntry = useCallback((catalogModel) => {
+        if (!catalogModel?.id) return null;
+        const lowerId = String(catalogModel.id || '').toLowerCase();
+        return normalizeModelLibraryEntry({
+            id: catalogModel.id,
+            displayName: catalogModel.displayName || catalogModel.modelName || catalogModel.id,
+            modelName: catalogModel.modelName || catalogModel.id,
+            type: catalogModel.type || 'Chat',
+            apiType: catalogModel.apiType || 'openai',
+            capabilities: {
+                supportsMultipart: false,
+                supportsRequestChain: false,
+                supportsSSE: false,
+                supportsWS: false,
+                supportsTools: (catalogModel.apiType === 'gemini' || lowerId.includes('gemini')) && catalogModel.type !== 'Image'
+            }
+        });
+    }, []);
 
     const getModelLabel = useCallback((modelId) => {
         if (!modelId) return '选择模型';
@@ -9580,6 +10030,14 @@ function TapnowApp() {
         }
         return 0;
     }, [getApiConfigByKey]);
+    const getDefaultDurationForModelRef = useRef((modelId) => {
+        if (!modelId) return '5s';
+        return '5s';
+    });
+    const getDefaultDurationsForModelRef = useRef((modelId) => {
+        if (!modelId) return ['5s', '10s'];
+        return ['5s', '10s'];
+    });
     const applyNodeModelSelection = useCallback((nodeId, nodeType, modelKey) => {
         if (!nodeId || !modelKey) return;
         const resolvedModel = resolveModelKey(modelKey);
@@ -9600,6 +10058,10 @@ function TapnowApp() {
                 const fallbackImageConcurrency = normalizeImageConcurrency(imageConfig?.defaultImageConcurrency || 1);
                 nextSettings.imageConcurrency = fallbackImageConcurrency;
                 nextSettings.concurrentImages = fallbackImageConcurrency;
+                delete nextSettings.duration;
+                delete nextSettings.isHD;
+                delete nextSettings.useFirstLastFrame;
+                delete nextSettings.veoFramesMode;
             } else if (nodeType === 'gen-video') {
                 const ratioOptions = getRatiosForModel(resolvedModel);
                 const fallbackRatio = getPreferredModelRatio(resolvedModel, 'video');
@@ -9609,6 +10071,11 @@ function TapnowApp() {
                 const fallbackResolution = getPreferredVideoResolutionForModel(resolvedModel);
                 const currentResolution = normalizeVideoResolution(nextSettings.resolution || '');
                 nextSettings.resolution = resolutionOptions.includes(currentResolution) ? currentResolution : fallbackResolution;
+                const durationOptions = getDefaultDurationsForModelRef.current(resolvedModel);
+                const currentDuration = String(nextSettings.duration || '').trim();
+                nextSettings.duration = durationOptions.includes(currentDuration)
+                    ? currentDuration
+                    : getDefaultDurationForModelRef.current(resolvedModel);
             }
             nextSettings.customParams = getDefaultCustomParamsForModel(
                 resolvedModel,
@@ -10182,153 +10649,85 @@ function TapnowApp() {
         };
     }, []);
 
-    // 使用原生事件监听器绑定 handleWheel，避免 React 合成事件的 passive 问题
-    useEffect(() => {
+    const handleCanvasWheel = useCallback((e) => {
         const canvasElement = canvasRef.current;
         if (!canvasElement) return;
 
-        const wheelHandler = (e) => {
-            // 如果按下了 Ctrl 键，直接阻止默认行为并不执行任何操作；使用 try-catch 避免控制台报错
-            if (e.ctrlKey) {
-                try {
-                    if (e.cancelable) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                    }
-                } catch (err) {
-                    // 静默处理 passive 事件监听器的错误
-                }
-                return;
-            }
-
-            // 检查鼠标是否在视频输入、视频拆解或智能分镜表节点内
-            const target = e.target;
-            let isInsideNode = false;
-            let scrollableElement = null;
-
-            // V3.7.28: 优先检查目标是否是可滚动的 textarea
-            if (target.tagName === 'TEXTAREA' && (target.scrollHeight > target.clientHeight)) {
-                try {
-                    if (e.cancelable) {
-                        e.preventDefault();
-                    }
-                } catch (err) { }
-                const maxScroll = target.scrollHeight - target.clientHeight;
-                const currentScroll = target.scrollTop;
-                const newScroll = Math.max(0, Math.min(maxScroll, currentScroll + e.deltaY));
-                target.scrollTop = newScroll;
-                return;
-            }
-
-            // 向上查找父元素，检查是否在 video-input、video-analyze 或 storyboard-node 节点内
-            let current = target;
-            while (current && current !== canvasElement) {
-                if (current.classList) {
-                    // 检查是否是智能分镜表容器（通过检查是否有特定的类组合）
-                    const isStoryboardContainer = current.classList.contains('flex') &&
-                        current.classList.contains('flex-col') &&
-                        current.classList.contains('h-full') &&
-                        current.classList.contains('rounded-xl') &&
-                        current.classList.contains('overflow-hidden');
-
-                    // 检查当前元素或父元素是否包含节点容器类
-                    if (current.classList.contains('video-input-container') ||
-                        current.classList.contains('video-analyze-container') ||
-                        isStoryboardContainer) {
-                        isInsideNode = true;
-
-                        // 如果是智能分镜表，查找特定的滚动容器
-                        if (isStoryboardContainer) {
-                            scrollableElement = current.querySelector('.flex-1.overflow-y-auto.custom-scrollbar');
-                            if (!scrollableElement) {
-                                scrollableElement = current.querySelector('.flex-1.overflow-y-auto');
-                            }
-                        } else {
-                            // 在当前容器内查找可滚动的元素
-                            scrollableElement = current.querySelector('.overflow-y-auto, .custom-scrollbar, [class*="overflow-y"]');
-                            if (!scrollableElement) {
-                                // 如果没找到，检查当前元素本身是否可滚动
-                                const style = window.getComputedStyle(current);
-                                if (style.overflowY === 'auto' || style.overflowY === 'scroll' ||
-                                    current.classList.contains('custom-scrollbar')) {
-                                    scrollableElement = current;
-                                }
-                            }
-                        }
-                        break;
-                    }
-
-                    // 使用 closest 方法查找最近的容器
-                    const container = current.closest('.video-input-container, .video-analyze-container');
-                    if (container) {
-                        isInsideNode = true;
-                        scrollableElement = container.querySelector('.overflow-y-auto, .custom-scrollbar, [class*="overflow-y"]');
-                        if (!scrollableElement) {
-                            const style = window.getComputedStyle(container);
-                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                                scrollableElement = container;
-                            }
-                        }
-                        break;
-                    }
-
-                    // 检查是否是智能分镜表容器
-                    const storyboardContainer = current.closest('.flex.flex-col.h-full.rounded-xl.overflow-hidden');
-                    if (storyboardContainer) {
-                        isInsideNode = true;
-                        scrollableElement = storyboardContainer.querySelector('.flex-1.overflow-y-auto.custom-scrollbar');
-                        if (!scrollableElement) {
-                            scrollableElement = storyboardContainer.querySelector('.flex-1.overflow-y-auto');
-                        }
-                        break;
-                    }
-                }
-                current = current.parentElement;
-            }
-
-            // 如果在节点内且找到可滚动元素，则滚动该元素而不是缩放画布
-            if (isInsideNode && scrollableElement) {
-                try {
-                    if (e.cancelable) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                    }
-                } catch (err) {
-                    // 静默处理 passive 事件监听器的错误
-                }
-                const maxScroll = scrollableElement.scrollHeight - scrollableElement.clientHeight;
-                const currentScroll = scrollableElement.scrollTop;
-                const newScroll = Math.max(0, Math.min(maxScroll, currentScroll + e.deltaY));
-                scrollableElement.scrollTop = newScroll;
-                return;
-            }
-
-            // 否则正常缩放画布
+        if (e.ctrlKey) {
             try {
                 if (e.cancelable) {
                     e.preventDefault();
+                    e.stopPropagation();
                 }
             } catch (err) {
                 // 静默处理 passive 事件监听器的错误
             }
-            const rect = canvasElement.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-            setView((prev) => {
-                const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-                let newZoom = Math.min(Math.max(prev.zoom * zoomFactor, 0.2), 3);
-                const scale = newZoom / prev.zoom;
-                return { zoom: newZoom, x: mouseX - (mouseX - prev.x) * scale, y: mouseY - (mouseY - prev.y) * scale };
-            });
-        };
+            return;
+        }
 
-        // 使用 { passive: false } 确保可以调用 preventDefault
-        canvasElement.addEventListener('wheel', wheelHandler, { passive: false });
+        const targetElement = e.target instanceof Element ? e.target : null;
+        const nodeWrapper = targetElement?.closest?.('.node-wrapper') || null;
+        const scrollableElement = nodeWrapper
+            ? findScrollableElementWithinBoundary(targetElement, nodeWrapper)
+            : null;
+
+        if (scrollableElement) {
+            try {
+                if (e.cancelable) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+            } catch (err) {
+                // 静默处理 passive 事件监听器的错误
+            }
+
+            const maxScrollTop = Math.max(0, scrollableElement.scrollHeight - scrollableElement.clientHeight);
+            const maxScrollLeft = Math.max(0, scrollableElement.scrollWidth - scrollableElement.clientWidth);
+
+            if (maxScrollTop > 0) {
+                scrollableElement.scrollTop = clampValue(scrollableElement.scrollTop + e.deltaY, 0, maxScrollTop);
+            }
+            if (maxScrollLeft > 0 && e.deltaX !== 0) {
+                scrollableElement.scrollLeft = clampValue(scrollableElement.scrollLeft + e.deltaX, 0, maxScrollLeft);
+            }
+            return;
+        }
+
+        try {
+            if (e.cancelable) {
+                e.preventDefault();
+            }
+        } catch (err) {
+            // 静默处理 passive 事件监听器的错误
+        }
+
+        const rect = canvasElement.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        setView((prev) => {
+            const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+            const newZoom = Math.min(Math.max(prev.zoom * zoomFactor, 0.2), 3);
+            const scale = newZoom / prev.zoom;
+            return {
+                zoom: newZoom,
+                x: mouseX - (mouseX - prev.x) * scale,
+                y: mouseY - (mouseY - prev.y) * scale
+            };
+        });
+    }, []);
+
+    // 使用原生事件监听器绑定滚轮，避免 React 合成事件的 passive 问题
+    useEffect(() => {
+        const canvasElement = canvasRef.current;
+        if (!canvasElement) return;
+
+        canvasElement.addEventListener('wheel', handleCanvasWheel, { passive: false });
 
         return () => {
-            canvasElement.removeEventListener('wheel', wheelHandler);
+            canvasElement.removeEventListener('wheel', handleCanvasWheel);
         };
-    }, [view]);
+    }, [handleCanvasWheel]);
 
     useEffect(() => {
         if (isResizingChat) {
@@ -10351,97 +10750,28 @@ function TapnowApp() {
         return { x: (localX - view.x) / view.zoom, y: (localY - view.y) / view.zoom };
     }, [view]);
 
-    const handleWheel = (e) => {
-        // 如果按下了 Ctrl 键，直接阻止默认行为并不执行任何操作；使用 try-catch 避免控制台报错
-        if (e.ctrlKey) {
-            try {
-                if (e.cancelable) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-            } catch (err) {
-                // 静默处理 passive 事件监听器的错误
-            }
-            return;
-        }
+    const beginNodeResize = useCallback((nodeId, direction, event) => {
+        event.stopPropagation();
+        event.preventDefault();
 
-        // 检查鼠标是否在视频输入或视频拆解节点内
-        const target = e.target;
-        let isInsideNode = false;
-        let scrollableElement = null;
+        const targetNode = (nodesRef.current || []).find((node) => node.id === nodeId);
+        if (!targetNode) return;
 
-        // 向上查找父元素，检查是否在 video-input 或 video-analyze 节点内
-        let current = target;
-        while (current && current !== e.currentTarget) {
-            if (current.classList) {
-                // 检查当前元素或父元素是否包含节点容器类
-                if (current.classList.contains('video-input-container') ||
-                    current.classList.contains('video-analyze-container')) {
-                    isInsideNode = true;
-                    // 在当前容器内查找可滚动的元素
-                    scrollableElement = current.querySelector('.overflow-y-auto, .custom-scrollbar, [class*="overflow-y"]');
-                    if (!scrollableElement) {
-                        // 如果没找到，检查当前元素本身是否可滚动
-                        const style = window.getComputedStyle(current);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll' ||
-                            current.classList.contains('custom-scrollbar')) {
-                            scrollableElement = current;
-                        }
-                    }
-                    break;
-                }
-                // 使用 closest 方法查找最近的容器
-                const container = current.closest('.video-input-container, .video-analyze-container');
-                if (container) {
-                    isInsideNode = true;
-                    scrollableElement = container.querySelector('.overflow-y-auto, .custom-scrollbar, [class*="overflow-y"]');
-                    if (!scrollableElement) {
-                        const style = window.getComputedStyle(container);
-                        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-                            scrollableElement = container;
-                        }
-                    }
-                    break;
-                }
+        resizeSessionRef.current = {
+            nodeId,
+            direction,
+            startWorld: screenToWorld(event.clientX, event.clientY),
+            startNode: {
+                x: Number(targetNode.x) || 0,
+                y: Number(targetNode.y) || 0,
+                width: Number(targetNode.width) || MIN_NODE_WIDTH,
+                height: Number(targetNode.height) || MIN_NODE_HEIGHT
             }
-            current = current.parentElement;
-        }
+        };
 
-        // 如果在节点内且找到可滚动元素，则滚动该元素而不是缩放画布
-        if (isInsideNode && scrollableElement) {
-            try {
-                if (e.cancelable) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-            } catch (err) {
-                // 静默处理 passive 事件监听器的错误
-            }
-            const maxScroll = scrollableElement.scrollHeight - scrollableElement.clientHeight;
-            const currentScroll = scrollableElement.scrollTop;
-            const newScroll = Math.max(0, Math.min(maxScroll, currentScroll + e.deltaY));
-            scrollableElement.scrollTop = newScroll;
-            return;
-        }
-
-        // 否则正常缩放画布
-        try {
-            if (e.cancelable) {
-                e.preventDefault();
-            }
-        } catch (err) {
-            // 静默处理 passive 事件监听器的错误
-        }
-        const rect = e.currentTarget.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-        setView((prev) => {
-            const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-            let newZoom = Math.min(Math.max(prev.zoom * zoomFactor, 0.2), 3);
-            const scale = newZoom / prev.zoom;
-            return { zoom: newZoom, x: mouseX - (mouseX - prev.x) * scale, y: mouseY - (mouseY - prev.y) * scale };
-        });
-    };
+        touchNodeSelectionPriority(nodeId);
+        setResizingNodeId(nodeId);
+    }, [screenToWorld, touchNodeSelectionPriority]);
 
     const handleMouseDown = (e) => {
         if (e.button === 0 || e.button === 1) {
@@ -10626,8 +10956,18 @@ function TapnowApp() {
 
     const handleMouseMove = useCallback((e) => {
         const { clientX, clientY } = e;
-        const worldPos = screenToWorld(clientX, clientY);
-        setMousePos(worldPos);
+        const shouldTrackMouseInWorld = !!(connectingSource || connectingTarget || resizingNodeId);
+        const worldPos = shouldTrackMouseInWorld
+            ? screenToWorld(clientX, clientY)
+            : null;
+
+        if ((connectingSource || connectingTarget) && worldPos) {
+            setMousePos((prev) => (
+                prev.x === worldPos.x && prev.y === worldPos.y
+                    ? prev
+                    : worldPos
+            ));
+        }
 
         // 框选模式 - 使用 requestAnimationFrame 节流
         // 使用ref检查，确保即使Ctrl松开也能继续框选
@@ -10750,11 +11090,32 @@ function TapnowApp() {
         }
 
         if (resizingNodeId) {
-            scheduleNodeUpdate(resizingNodeId, (node) => ({
-                ...node,
-                width: Math.max(250, worldPos.x - node.x),
-                height: Math.max(250, worldPos.y - node.y)
-            }));
+            const resizeSession = resizeSessionRef.current;
+            if (!resizeSession || !worldPos) {
+                return;
+            }
+
+            const nextNodeFrame = resizeNodeFromDirection(
+                resizeSession.startNode,
+                resizeSession.direction,
+                worldPos.x - resizeSession.startWorld.x,
+                worldPos.y - resizeSession.startWorld.y
+            );
+
+            scheduleNodeUpdate(resizingNodeId, (node) => {
+                if (
+                    node.x === nextNodeFrame.x &&
+                    node.y === nextNodeFrame.y &&
+                    node.width === nextNodeFrame.width &&
+                    node.height === nextNodeFrame.height
+                ) {
+                    return node;
+                }
+                return {
+                    ...node,
+                    ...nextNodeFrame
+                };
+            });
         } else if (dragNodeId) {
             // 确保 zoom 在有效范围内（0.2-3.0），防止极端缩放下的计算错误
             const safeZoom = Math.max(0.2, Math.min(3.0, view.zoom));
@@ -10815,7 +11176,7 @@ function TapnowApp() {
                 }));
             }
         }
-    }, [isPanning, isSelecting, selectionBox, dragNodeId, resizingNodeId, screenToWorld, view.zoom, scheduleNodeUpdate, scheduleMultiNodeUpdate]);
+    }, [isPanning, isSelecting, selectionBox, dragNodeId, resizingNodeId, connectingSource, connectingTarget, screenToWorld, view.zoom, scheduleNodeUpdate, scheduleMultiNodeUpdate]);
 
     const handleMouseUp = () => {
         const releasedDragNodeIds = Array.isArray(dragPriorityNodeIdsRef.current)
@@ -10851,6 +11212,8 @@ function TapnowApp() {
             });
             pendingPanUpdate.current = null;
         }
+
+        resizeSessionRef.current = null;
 
         // 确保多节点更新被刷新（处理待处理的更新）
         if (multiNodeUpdateRef.current && nodeUpdateRaf.current) {
@@ -11327,7 +11690,231 @@ function TapnowApp() {
         return images[0] || null;
     }, [getConnectedInputImages]);
 
+    const truncateChatContextText = useCallback((value, maxLength = CHAT_CANVAS_CONTEXT_TEXT_LIMIT) => {
+        const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+        if (!normalized) return '';
+        if (normalized.length <= maxLength) return normalized;
+        return `${normalized.slice(0, Math.max(32, maxLength - 1)).trim()}…`;
+    }, []);
+    const buildChatCanvasContext = useCallback(() => {
+        const snapshotNodes = Array.isArray(nodesRef.current) ? nodesRef.current : [];
+        const snapshotConnections = Array.isArray(connectionsRef.current) ? connectionsRef.current : [];
+        if (snapshotNodes.length === 0) return null;
 
+        const visibleIdSet = new Set((Array.isArray(visibleNodes) ? visibleNodes : []).map(node => node.id));
+        const selectedIdSet = new Set([
+            selectedNodeIdRef.current,
+            ...(selectedNodeIdsRef.current ? Array.from(selectedNodeIdsRef.current) : []),
+            activeShot?.nodeId
+        ].filter(Boolean));
+        const selectedIdsOrdered = Array.from(selectedIdSet).sort((a, b) => {
+            const priorityA = Number(nodeSelectionPriority?.[a] || 0);
+            const priorityB = Number(nodeSelectionPriority?.[b] || 0);
+            if (priorityA !== priorityB) return priorityB - priorityA;
+            const visibleA = visibleIdSet.has(a) ? 1 : 0;
+            const visibleB = visibleIdSet.has(b) ? 1 : 0;
+            if (visibleA !== visibleB) return visibleB - visibleA;
+            return 0;
+        });
+
+        const seedIds = selectedIdsOrdered.length > 0
+            ? selectedIdsOrdered
+            : (Array.isArray(visibleNodes) && visibleNodes.length > 0
+                ? visibleNodes.slice(0, CHAT_CANVAS_CONTEXT_MAX_NODES).map(node => node.id)
+                : snapshotNodes.slice(-CHAT_CANVAS_CONTEXT_MAX_NODES).map(node => node.id));
+        const includeIds = new Set(seedIds.filter(Boolean));
+        snapshotConnections.forEach((conn) => {
+            if (includeIds.has(conn.from) || includeIds.has(conn.to)) {
+                includeIds.add(conn.from);
+                includeIds.add(conn.to);
+            }
+        });
+
+        const scoredNodes = snapshotNodes
+            .filter(node => includeIds.size === 0 || includeIds.has(node.id))
+            .map((node, index) => {
+                let score = 0;
+                if (selectedIdSet.has(node.id)) score += 100;
+                if (activeShot?.nodeId === node.id) score += 80;
+                if (visibleIdSet.has(node.id)) score += 20;
+                score += Math.max(0, Number(nodeSelectionPriority?.[node.id] || 0));
+                score += Math.max(0, snapshotNodes.length - index);
+                return { node, score, index };
+            })
+            .sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                return a.index - b.index;
+            })
+            .slice(0, CHAT_CANVAS_CONTEXT_MAX_NODES)
+            .map(item => item.node);
+
+        if (scoredNodes.length === 0) return null;
+
+        const nodeRefMap = new Map();
+        scoredNodes.forEach((node, index) => {
+            nodeRefMap.set(node.id, `节点#${index + 1}`);
+        });
+
+        const assetEntries = [];
+        const assetMap = new Map();
+        const ensureAssetEntry = (mediaItem, sourceNode, labelHint = '') => {
+            if (!mediaItem?.url || assetEntries.length >= CHAT_CANVAS_CONTEXT_MAX_MEDIA && !assetMap.has(`${mediaItem.type}:${mediaItem.url}`)) {
+                return null;
+            }
+            const assetKey = `${mediaItem.type || 'image'}:${String(mediaItem.url || '').trim()}`;
+            if (assetMap.has(assetKey)) {
+                const existing = assetMap.get(assetKey);
+                const sourceRef = nodeRefMap.get(sourceNode.id) || sourceNode.id;
+                if (!existing.sourceNodes.includes(sourceRef)) existing.sourceNodes.push(sourceRef);
+                return existing;
+            }
+            const assetRef = `素材#${assetEntries.length + 1}`;
+            const sourceRef = nodeRefMap.get(sourceNode.id) || sourceNode.id;
+            const assetEntry = {
+                ref: assetRef,
+                type: mediaItem.type || 'image',
+                url: mediaItem.url,
+                label: labelHint || `${NODE_TYPE_LABELS[sourceNode.type] || sourceNode.type} 输出`,
+                sourceNodes: [sourceRef]
+            };
+            assetMap.set(assetKey, assetEntry);
+            assetEntries.push(assetEntry);
+            return assetEntry;
+        };
+
+        const nodeSummaries = scoredNodes.map((node) => {
+            const settings = node?.settings && typeof node.settings === 'object' ? node.settings : {};
+            const sourceRef = nodeRefMap.get(node.id) || node.id;
+            const promptTexts = extractNodeIOTextPayload(node)
+                .slice(0, node.type === 'storyboard-node' ? CHAT_CANVAS_CONTEXT_MAX_SHOTS : 3)
+                .map(text => truncateChatContextText(text));
+            const params = [];
+            const modelValue = resolveModelKey(settings.chatModel || settings.model || settings.imageModel || '');
+            if (modelValue) params.push(`模型:${truncateChatContextText(getModelLabelWithProvider(modelValue), 80)}`);
+            if (settings.mode) params.push(`模式:${settings.mode}`);
+            if (settings.analysisMode) params.push(`分析:${settings.analysisMode}`);
+            if (settings.ratio || settings.imageRatio) params.push(`比例:${settings.ratio || settings.imageRatio}`);
+            if (settings.resolution || settings.imageResolution) params.push(`分辨率:${settings.resolution || settings.imageResolution}`);
+            if (settings.duration) params.push(`时长:${settings.duration}`);
+            if (settings.style && settings.style !== 'none') params.push(`风格:${truncateChatContextText(settings.style, 80)}`);
+
+            const relatedAssetRefs = [];
+            extractNodeIOMediaPayload(node).forEach((mediaItem, mediaIndex) => {
+                const labelHint = node.type === 'storyboard-node'
+                    ? `分镜输出 ${mediaIndex + 1}`
+                    : `${NODE_TYPE_LABELS[node.type] || node.type} 素材 ${mediaIndex + 1}`;
+                const assetEntry = ensureAssetEntry(mediaItem, node, labelHint);
+                if (assetEntry?.ref && !relatedAssetRefs.includes(assetEntry.ref)) {
+                    relatedAssetRefs.push(assetEntry.ref);
+                }
+            });
+
+            const shots = node.type === 'storyboard-node' && Array.isArray(settings.shots)
+                ? settings.shots
+                    .slice(0, CHAT_CANVAS_CONTEXT_MAX_SHOTS)
+                    .map((shot, shotIndex) => {
+                        const shotText = truncateChatContextText(
+                            shot?.prompt || shot?.description || shot?.scene_description || '',
+                            180
+                        );
+                        const shotCamera = truncateChatContextText(shot?.camera || '', 80);
+                        return {
+                            ref: `镜头${shot?.scene_index || shotIndex + 1}`,
+                            text: shotText,
+                            camera: shotCamera
+                        };
+                    })
+                    .filter(shot => shot.text || shot.camera)
+                : [];
+
+            const upstream = snapshotConnections
+                .filter(conn => conn.to === node.id && nodeRefMap.has(conn.from))
+                .map(conn => nodeRefMap.get(conn.from));
+            const downstream = snapshotConnections
+                .filter(conn => conn.from === node.id && nodeRefMap.has(conn.to))
+                .map(conn => nodeRefMap.get(conn.to));
+
+            return {
+                ref: sourceRef,
+                id: node.id,
+                type: node.type,
+                label: NODE_TYPE_LABELS[node.type] || node.type,
+                selected: selectedIdSet.has(node.id),
+                visible: visibleIdSet.has(node.id),
+                activeShot: activeShot?.nodeId === node.id,
+                prompts: promptTexts,
+                params,
+                assets: relatedAssetRefs,
+                shots,
+                upstream,
+                downstream
+            };
+        });
+
+        const lines = [
+            '以下是当前画布上下文，请严格使用“节点# / 素材#”编号引用对象，并结合上下游关系、提示词、参数与素材内容进行分析。',
+            `当前聚焦: ${selectedIdsOrdered.length > 0 ? selectedIdsOrdered.map(id => nodeRefMap.get(id)).filter(Boolean).join('、') : '无明确选中节点'}`
+        ];
+        if (activeShot?.nodeId && nodeRefMap.has(activeShot.nodeId)) {
+            lines.push(`激活镜头: ${nodeRefMap.get(activeShot.nodeId)} / ${activeShot.shotId || '当前镜头'}`);
+        }
+        lines.push('节点列表:');
+        nodeSummaries.forEach((node) => {
+            const flags = [];
+            if (node.selected) flags.push('已选中');
+            if (node.activeShot) flags.push('当前镜头所在节点');
+            if (node.visible) flags.push('当前视图可见');
+            lines.push(`- ${node.ref} | ${node.label}${flags.length > 0 ? `（${flags.join('，')}）` : ''}`);
+            if (node.params.length > 0) lines.push(`  参数: ${node.params.join(' | ')}`);
+            if (node.prompts.length > 0) lines.push(`  文本/提示词: ${node.prompts.map((text, index) => `[${index + 1}] ${text}`).join('；')}`);
+            if (node.shots.length > 0) {
+                lines.push(`  镜头: ${node.shots.map(shot => `${shot.ref}${shot.camera ? `(${shot.camera})` : ''} ${shot.text}`.trim()).join('；')}`);
+            }
+            if (node.assets.length > 0) lines.push(`  关联素材: ${node.assets.join('、')}`);
+            if (node.upstream.length > 0 || node.downstream.length > 0) {
+                lines.push(`  连接关系: 上游 ${node.upstream.join('、') || '无'}；下游 ${node.downstream.join('、') || '无'}`);
+            }
+        });
+        if (assetEntries.length > 0) {
+            lines.push('素材列表:');
+            assetEntries.forEach((asset) => {
+                lines.push(`- ${asset.ref} | ${asset.type === 'video' ? '视频' : '图片'} | 来源 ${asset.sourceNodes.join('、')} | ${truncateChatContextText(asset.label, 80)}`);
+            });
+        }
+
+        return {
+            text: lines.join('\n'),
+            nodes: nodeSummaries,
+            assets: assetEntries
+        };
+    }, [visibleNodes, activeShot, nodeSelectionPriority, extractNodeIOTextPayload, extractNodeIOMediaPayload, resolveModelKey, getModelLabelWithProvider, truncateChatContextText]);
+    const buildChatCanvasAutoFiles = useCallback((canvasContext, existingFiles = []) => {
+        if (!canvasContext?.assets || canvasContext.assets.length === 0) return [];
+        const existingUrls = new Set(
+            (Array.isArray(existingFiles) ? existingFiles : [])
+                .map(file => String(file?.content || '').trim())
+                .filter(Boolean)
+        );
+        return canvasContext.assets
+            .filter(asset => asset.type === 'image' && asset.url && !existingUrls.has(asset.url))
+            .slice(0, CHAT_CANVAS_CONTEXT_MAX_MEDIA)
+            .map((asset, index) => ({
+                name: `${asset.ref || `canvas-${index + 1}`}.png`,
+                type: 'image/png',
+                content: asset.url,
+                isImage: true,
+                isVideo: false,
+                isAudio: false,
+                isPDF: false,
+                isDoc: false,
+                isExcel: false,
+                fromCanvas: true,
+                canvasRef: asset.ref,
+                fileExt: 'png'
+            }));
+    }, []);
+
+    
     // 将生成结果同步到连接的预览节点
     const updatePreviewFromTask = (taskId, url, contentType = 'image', sourceNodeIdOverride = null, mjImages = null, filename = null) => {
         if (!url && (!mjImages || mjImages.length === 0)) return;
@@ -11760,33 +12347,263 @@ function TapnowApp() {
         });
     };
 
+    const fetchProviderAvailableModels = useCallback(async (providerKey) => {
+        const provider = providers?.[providerKey];
+        if (!provider) throw new Error('未找到对应的模型供应商');
+        const apiKey = String(provider?.key || globalApiKey || '').trim();
+        const baseUrl = String(provider?.url || DEFAULT_BASE_URL).trim().replace(/\/+$/, '');
+        const apiType = provider?.apiType || 'openai';
+        const useProxy = !!provider?.useProxy;
+        if (!apiKey) throw new Error('请先配置该供应商的 API Key');
+        if (!baseUrl) throw new Error('请先配置该供应商的 Base URL');
+
+        const requestJson = async (requestUrl, options = {}) => {
+            const targetUrl = useProxy ? buildProxyUrl(requestUrl, providerKey) : requestUrl;
+            const response = await fetch(targetUrl, options);
+            const rawText = await response.text();
+            let payload = null;
+            try {
+                payload = rawText ? JSON.parse(rawText) : null;
+            } catch {
+                payload = null;
+            }
+            if (!response.ok) {
+                throw new Error(
+                    payload?.error?.message
+                    || payload?.message
+                    || rawText
+                    || `请求失败 (${response.status})`
+                );
+            }
+            return payload;
+        };
+
+        if (apiType === 'gemini' && isOfficialGeminiProvider(providerKey)) {
+            const collected = [];
+            let pageToken = '';
+            do {
+                const requestUrl = `${baseUrl}/v1beta/models?key=${encodeURIComponent(apiKey)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+                const payload = await requestJson(requestUrl, {
+                    method: 'GET',
+                    headers: { Accept: 'application/json' }
+                });
+                if (Array.isArray(payload?.models)) {
+                    collected.push(...payload.models);
+                }
+                pageToken = String(payload?.nextPageToken || '').trim();
+            } while (pageToken);
+            return collected
+                .map(model => normalizeProviderCatalogModel(model, providerKey))
+                .filter(Boolean);
+        }
+
+        const payload = await requestJson(`${baseUrl}/v1/models`, {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+                Accept: 'application/json'
+            }
+        });
+        const models = Array.isArray(payload?.data)
+            ? payload.data
+            : (Array.isArray(payload?.models) ? payload.models : []);
+        return models
+            .map(model => normalizeProviderCatalogModel(model, providerKey))
+            .filter(Boolean);
+    }, [providers, globalApiKey, buildProxyUrl, isOfficialGeminiProvider, normalizeProviderCatalogModel]);
+    const mergeRefreshedProviderModels = useCallback((providerKey, catalogModels) => {
+        const normalizedModels = Array.from(new Map(
+            (Array.isArray(catalogModels) ? catalogModels : [])
+                .filter(Boolean)
+                .map(model => [model.id, model])
+        ).values());
+        if (normalizedModels.length === 0) {
+            return { total: 0, added: 0, updated: 0, libraryAdded: 0 };
+        }
+
+        let added = 0;
+        let updated = 0;
+        let libraryAdded = 0;
+        const incomingById = new Map(normalizedModels.map(model => [model.id, model]));
+        const nextApiConfigs = apiConfigs.map((existing) => {
+            if (existing.provider !== providerKey) return existing;
+            const incoming = incomingById.get(existing.id);
+            if (!incoming) return existing;
+            incomingById.delete(existing.id);
+            const merged = {
+                ...existing,
+                modelName: incoming.modelName || existing.modelName || existing.id,
+                displayName: incoming.displayName || existing.displayName || existing.id,
+                type: incoming.type || existing.type || 'Chat',
+                apiType: incoming.apiType || existing.apiType || 'openai',
+                libraryId: existing.libraryId || incoming.libraryId || existing.id
+            };
+            if (
+                merged.modelName !== existing.modelName
+                || merged.displayName !== existing.displayName
+                || merged.type !== existing.type
+                || merged.apiType !== existing.apiType
+                || merged.libraryId !== existing.libraryId
+            ) {
+                updated += 1;
+            }
+            return merged;
+        });
+
+        incomingById.forEach((incoming) => {
+            added += 1;
+            nextApiConfigs.push({
+                ...incoming,
+                libraryId: incoming.libraryId || incoming.id,
+                _uid: `uid-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+            });
+        });
+
+        const nextModelLibrary = [...modelLibrary];
+        const existingLibraryIds = new Set(nextModelLibrary.map(entry => entry.id));
+        normalizedModels.forEach((model) => {
+            if (existingLibraryIds.has(model.id)) return;
+            const entry = buildProviderModelLibraryEntry(model);
+            if (!entry) return;
+            nextModelLibrary.push(entry);
+            existingLibraryIds.add(entry.id);
+            libraryAdded += 1;
+        });
+
+        setApiConfigs(nextApiConfigs);
+        if (libraryAdded > 0) {
+            setModelLibrary(nextModelLibrary);
+        }
+
+        return {
+            total: normalizedModels.length,
+            added,
+            updated,
+            libraryAdded
+        };
+    }, [apiConfigs, modelLibrary, buildProviderModelLibraryEntry]);
+    const refreshProviderModels = useCallback(async (providerKey) => {
+        if (!providerKey) return null;
+        setProviderRefreshState(prev => ({
+            ...prev,
+            [providerKey]: { status: 'loading', message: '正在刷新模型列表…', updatedAt: Date.now() }
+        }));
+        try {
+            const models = await fetchProviderAvailableModels(providerKey);
+            const summary = mergeRefreshedProviderModels(providerKey, models);
+            const successMessage = summary.total > 0
+                ? `已刷新 ${summary.total} 个模型（新增 ${summary.added}，更新 ${summary.updated}）`
+                : '未拉取到可用模型';
+            setProviderRefreshState(prev => ({
+                ...prev,
+                [providerKey]: { status: 'success', message: successMessage, updatedAt: Date.now() }
+            }));
+            showToast(`${providerKey}: ${successMessage}`, 'success', 2600);
+            return summary;
+        } catch (error) {
+            const errorMessage = error?.message || '刷新失败';
+            setProviderRefreshState(prev => ({
+                ...prev,
+                [providerKey]: { status: 'error', message: errorMessage, updatedAt: Date.now() }
+            }));
+            showToast(`${providerKey}: ${errorMessage}`, 'error', 3200);
+            throw error;
+        }
+    }, [fetchProviderAvailableModels, mergeRefreshedProviderModels, showToast]);
+
     const testApiConnection = async (modelKey) => {
         const config = getApiConfigByKey(modelKey);
-        const statusKey = config?._uid || modelKey;
+        const providerKey = config?.provider || modelKey;
+        const statusKey = config?._uid || providerKey;
         setApiTesting(statusKey);
         setApiStatus((prev) => ({ ...prev, [statusKey]: 'idle' }));
 
-        // V3.4.8: 使用 getApiCredentials 获取 Provider 配置
-        const { key: apiKey, url: baseUrl } = getApiCredentials(modelKey);
-
-        if (!apiKey) {
-            setApiStatus((prev) => ({ ...prev, [statusKey]: 'error' }));
-            setApiTesting(null);
-            return;
-        }
-
         try {
-            const response = await fetch(`${baseUrl}/v1/models`, {
-                method: 'GET',
-                headers: { Authorization: `Bearer ${apiKey}` },
-            });
-            if (response.ok) setApiStatus((prev) => ({ ...prev, [statusKey]: 'success' }));
-            else setApiStatus((prev) => ({ ...prev, [statusKey]: 'error' }));
+            await fetchProviderAvailableModels(providerKey);
+            setApiStatus((prev) => ({ ...prev, [statusKey]: 'success' }));
         } catch {
             setApiStatus((prev) => ({ ...prev, [statusKey]: 'error' }));
         }
         setApiTesting(null);
     };
+    const mimeTypeToFileExt = useCallback((mimeType) => {
+        const normalized = String(mimeType || '').toLowerCase();
+        if (normalized.includes('png')) return 'png';
+        if (normalized.includes('jpeg') || normalized.includes('jpg')) return 'jpg';
+        if (normalized.includes('webp')) return 'webp';
+        if (normalized.includes('gif')) return 'gif';
+        if (normalized.includes('mp4')) return 'mp4';
+        if (normalized.includes('webm')) return 'webm';
+        if (normalized.includes('pdf')) return 'pdf';
+        return 'bin';
+    }, []);
+    const buildGeminiGroundingFooter = useCallback((groundingMetadata) => {
+        if (!groundingMetadata || typeof groundingMetadata !== 'object') return '';
+        const sourceMap = new Map();
+        const addSource = (uri, title) => {
+            const normalizedUri = String(uri || '').trim();
+            if (!normalizedUri || sourceMap.has(normalizedUri)) return;
+            sourceMap.set(normalizedUri, String(title || '').trim() || normalizedUri);
+        };
+        const chunks = Array.isArray(groundingMetadata?.groundingChunks)
+            ? groundingMetadata.groundingChunks
+            : (Array.isArray(groundingMetadata?.grounding_chunks) ? groundingMetadata.grounding_chunks : []);
+        chunks.forEach((chunk) => {
+            addSource(chunk?.web?.uri || chunk?.retrievedContext?.uri, chunk?.web?.title || chunk?.retrievedContext?.title);
+        });
+        const queries = (Array.isArray(groundingMetadata?.webSearchQueries)
+            ? groundingMetadata.webSearchQueries
+            : (Array.isArray(groundingMetadata?.web_search_queries) ? groundingMetadata.web_search_queries : []))
+            .map(item => String(item || '').trim())
+            .filter(Boolean);
+        if (sourceMap.size === 0 && queries.length === 0) return '';
+        const lines = ['---', '参考来源'];
+        Array.from(sourceMap.entries()).slice(0, 8).forEach(([uri, title], index) => {
+            lines.push(`${index + 1}. [${title}](${uri})`);
+        });
+        if (queries.length > 0) {
+            lines.push(`搜索关键词：${queries.slice(0, 5).join(' / ')}`);
+        }
+        return lines.join('\n');
+    }, []);
+    const parseGeminiAssistantPayload = useCallback((payload) => {
+        if (!payload || typeof payload !== 'object') {
+            return { text: '', files: [], candidate: null };
+        }
+        const candidate = Array.isArray(payload?.candidates) ? payload.candidates[0] : null;
+        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+        const textParts = [];
+        const files = [];
+        parts.forEach((part, index) => {
+            const text = typeof part?.text === 'string' ? part.text.trim() : '';
+            if (text) textParts.push(text);
+            const inline = part?.inlineData || part?.inline_data;
+            if (!inline?.data) return;
+            const mimeType = inline?.mimeType || inline?.mime_type || 'application/octet-stream';
+            const ext = mimeTypeToFileExt(mimeType);
+            files.push({
+                name: `gemini-output-${index + 1}.${ext}`,
+                type: mimeType,
+                content: `data:${mimeType};base64,${inline.data}`,
+                isImage: mimeType.startsWith('image/'),
+                isVideo: mimeType.startsWith('video/'),
+                isAudio: mimeType.startsWith('audio/'),
+                isPDF: mimeType === 'application/pdf',
+                isDoc: false,
+                isExcel: false,
+                fileExt: ext
+            });
+        });
+        let text = textParts.join('\n\n').trim();
+        const groundingFooter = buildGeminiGroundingFooter(candidate?.groundingMetadata || candidate?.grounding_metadata);
+        if (groundingFooter) {
+            text = text ? `${text}\n\n${groundingFooter}` : groundingFooter;
+        }
+        if (!text && files.length > 0) {
+            text = '已返回可直接查看的多模态结果。';
+        }
+        return { text, files, candidate };
+    }, [buildGeminiGroundingFooter, mimeTypeToFileExt]);
 
     const getStatusColor = (modelId) => {
         if (!modelId) return 'bg-zinc-600';
@@ -11797,6 +12614,90 @@ function TapnowApp() {
         const { key } = getApiCredentials(modelId);
         return key ? 'bg-zinc-400' : 'bg-zinc-700';
     };
+
+    const preferredGeminiAgentModel = useMemo(() => {
+        const candidates = [
+            'gemini-3.1-pro-preview',
+            'gemini-3-pro-preview',
+            'gemini-3.1-flash-preview',
+            'gemini-3-flash-preview'
+        ];
+        for (const candidate of candidates) {
+            const resolved = resolveModelKey(candidate);
+            const config = getApiConfigByKey(resolved);
+            if (config && isChatModelType(config.type)) {
+                return resolved;
+            }
+        }
+        const firstChatModel = apiConfigs.find(c => isChatModelType(c.type));
+        return resolveModelKey(firstChatModel?._uid || firstChatModel?.id || '');
+    }, [apiConfigs, resolveModelKey, getApiConfigByKey]);
+    const preferredGeminiImageModel = useMemo(() => {
+        const candidates = [
+            'gemini-3.1-flash-images',
+            'gemini-3.1-flash-image',
+            'gemini-3.1-flash-image-preview',
+            'gemini-3.1-flash-images-preview',
+            'gemini-3-pro-image-preview',
+            'imagen-3.0-generate-002'
+        ];
+        for (const candidate of candidates) {
+            const resolved = resolveModelKey(candidate);
+            const config = getApiConfigByKey(resolved);
+            if (config && isImageModelType(config.type)) {
+                return resolved;
+            }
+        }
+        const firstGeminiImage = apiConfigs.find((config) => {
+            if (!isImageModelType(config.type)) return false;
+            const id = String(config.id || config.modelName || '').toLowerCase();
+            return id.includes('gemini') || id.includes('imagen');
+        });
+        if (firstGeminiImage) {
+            return resolveModelKey(firstGeminiImage._uid || firstGeminiImage.id || '');
+        }
+        return resolveModelKey(lastUsedImageModel || apiConfigs.find(c => isImageModelType(c.type))?.id || '');
+    }, [apiConfigs, resolveModelKey, getApiConfigByKey, lastUsedImageModel]);
+    const currentChatModelConfig = useMemo(() => getApiConfigByKey(chatModel), [getApiConfigByKey, chatModel]);
+    const currentChatSupportsDesignAgent = useMemo(() => {
+        return isGeminiAgentModelConfig(currentChatModelConfig);
+    }, [currentChatModelConfig, isGeminiAgentModelConfig]);
+    const currentChatUsesOfficialGemini = useMemo(() => {
+        if (!currentChatModelConfig?.provider) return false;
+        const providerApiType = String(currentChatModelConfig?.apiType || providers?.[currentChatModelConfig.provider]?.apiType || '').toLowerCase();
+        return providerApiType === 'gemini' && isOfficialGeminiProvider(currentChatModelConfig.provider);
+    }, [currentChatModelConfig, providers, isOfficialGeminiProvider]);
+    const chatCanvasContextPreview = useMemo(() => {
+        if (!isChatOpen || !chatCanvasContextEnabled) return null;
+        return buildChatCanvasContext();
+    }, [isChatOpen, chatCanvasContextEnabled, buildChatCanvasContext, selectedNodeId, selectedNodeIds, activeShot, visibleNodes, nodeSelectionPriority]);
+
+    useEffect(() => {
+        if (!apiConfigs.length) return;
+        const fallbackChatModel = preferredGeminiAgentModel || resolveModelKey(apiConfigs.find(c => isChatModelType(c.type))?.id || '');
+        if (!fallbackChatModel) return;
+        const normalizeStateModel = (value, setter) => {
+            const resolved = resolveModelKey(value);
+            if (resolved && resolved !== value) {
+                setter(resolved);
+                return;
+            }
+            if ((!value || !getApiConfigByKey(value)) && value !== fallbackChatModel) {
+                setter(fallbackChatModel);
+            }
+        };
+        normalizeStateModel(chatModel, setChatModel);
+        normalizeStateModel(lastUsedAnalyzeModel, setLastUsedAnalyzeModel);
+        normalizeStateModel(lastUsedExtractModel, setLastUsedExtractModel);
+    }, [
+        apiConfigs,
+        chatModel,
+        lastUsedAnalyzeModel,
+        lastUsedExtractModel,
+        preferredGeminiAgentModel,
+        resolveModelKey,
+        getApiConfigByKey
+    ]);
 
     const currentSession = useMemo(() => chatSessions.find(s => s.id === currentChatId) || chatSessions[0], [chatSessions, currentChatId]);
 
@@ -12420,8 +13321,7 @@ function TapnowApp() {
     const sendChatMessage = async () => {
         if ((!chatInput.trim() && chatFiles.length === 0) || isChatSending) return;
 
-        // V3.4.8: 使用 getApiCredentials 获取 Provider 配置
-        const config = getApiConfigByKey(chatModel);
+        const config = currentChatModelConfig || getApiConfigByKey(chatModel);
         const { key: apiKey, url: baseUrl, modelName } = getApiCredentials(chatModel);
 
         if (!apiKey) {
@@ -12430,7 +13330,6 @@ function TapnowApp() {
             return;
         }
 
-        // 确保使用当前激活的会话（避免新建对话后第一条消息被写入旧会话）
         const chatIdToUse = currentChatId || chatSessions[0]?.id;
         const sessionToUse = chatSessions.find(s => s.id === chatIdToUse) || chatSessions[0];
         const currentSessionMessages = sessionToUse?.messages || [];
@@ -12438,101 +13337,43 @@ function TapnowApp() {
 
         setIsChatSending(true);
 
+        const rawUserInput = chatInput;
+        const manualFiles = [...chatFiles];
+        const canvasContext = chatCanvasContextEnabled ? buildChatCanvasContext() : null;
+        const autoCanvasFiles = chatAutoAttachCanvasMedia ? buildChatCanvasAutoFiles(canvasContext, manualFiles) : [];
+        const effectiveFiles = [...manualFiles, ...autoCanvasFiles];
+
         const newUserMsg = {
             id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             role: 'user',
-            content: chatInput,
-            files: [...chatFiles],
+            content: rawUserInput,
+            files: effectiveFiles,
+            canvasContextMeta: canvasContext ? { nodeCount: canvasContext.nodes?.length || 0, assetCount: canvasContext.assets?.length || 0 } : null,
             timestamp: Date.now(),
-            modelId: chatModel // 保存发送消息时使用的模型ID
+            modelId: chatModel
         };
 
         setChatSessions(prev => prev.map(s => {
             if (s.id === chatIdToUse) {
-                return { ...s, messages: [...s.messages, newUserMsg], title: s.messages.length === 0 ? chatInput.slice(0, 20) : s.title };
+                const nextTitle = s.messages.length === 0
+                    ? (rawUserInput.trim() || effectiveFiles[0]?.canvasRef || effectiveFiles[0]?.name || '多模态对话').slice(0, 20)
+                    : s.title;
+                return { ...s, messages: [...s.messages, newUserMsg], title: nextTitle };
             }
             return s;
         }));
         setChatInput('');
         setChatFiles([]);
 
-        // 构建带上下文的对话历史，帮助模型回顾上下文
-        // 使用当前会话的消息加上新消息
-        const allMessages = [...currentSessionMessages, newUserMsg];
         const MAX_HISTORY_MESSAGES = 20;
-        const recentMessages = allMessages.length > MAX_HISTORY_MESSAGES
-            ? allMessages.slice(-MAX_HISTORY_MESSAGES)
-            : allMessages;
-
-        let apiMessages = [
-            {
-                role: 'system',
-                content: t('你是一名多模态AI助手，需要结合整个对话的上下文进行连续回答。')
-            },
-            ...recentMessages.map(m => ({
-                role: m.role,
-                content: m.content
-            }))
-        ];
-
-        const currentContent = [];
-        if (newUserMsg.content) currentContent.push({ type: "text", text: newUserMsg.content });
-
-        newUserMsg.files.forEach(f => {
-            const isGeminiLike = (config?.modelName ?? '').toLowerCase().includes('gemini');
-
-            if (f.isImage) {
-                currentContent.push({
-                    type: "image_url",
-                    image_url: { url: f.content }
-                });
-            } else if (f.isVideo) {
-                if (isGeminiLike) {
-                    // Gemini 视频分析：按官方规范也走 image_url，url 直接指向 mp4
-                    currentContent.push({
-                        type: "image_url",
-                        image_url: { url: f.content }
-                    });
-                } else {
-                    currentContent.push({
-                        type: "text",
-                        text: `\n[User attached video: ${f.name}]\n`
-                    });
-                }
-            } else if (f.isAudio) {
-                currentContent.push({
-                    type: "text",
-                    text: `\n[User attached audio: ${f.name}]\n`
-                });
-            } else if (f.isPDF || f.isDoc || f.isExcel) {
-                // PDF、Word、Excel 等文档文件，发送文件名和类型信息
-                currentContent.push({
-                    type: "text",
-                    text: `\n[User attached document: ${f.name} (${f.isPDF ? 'PDF' : f.isDoc ? 'Word' : 'Excel'})]\n`
-                });
-            } else if (f.isCode || (f.content && typeof f.content === 'string' && f.content.length < 50000)) {
-                // 代码文件或文本文件，直接发送内容
-                currentContent.push({
-                    type: "text",
-                    text: `\n[File: ${f.name}]\n\`\`\`${f.fileExt || 'text'}\n${f.content}\n\`\`\`\n`
-                });
-            } else {
-                // 其他文件或二进制文件
-                currentContent.push({
-                    type: "text",
-                    text: `\n[User attached file: ${f.name}]\n`
-                });
-            }
-        });
-
-        apiMessages.push({ role: 'user', content: currentContent });
+        const historyMessages = currentSessionMessages.length > MAX_HISTORY_MESSAGES
+            ? currentSessionMessages.slice(-MAX_HISTORY_MESSAGES)
+            : currentSessionMessages;
+        const agentSystemPrompt = currentChatSupportsDesignAgent
+            ? GEMINI_DESIGN_AGENT_SYSTEM_PROMPT
+            : t('你是一名多模态AI助手，需要结合整个对话的上下文进行连续回答。');
 
         try {
-            const contractIssues = validateModelLibraryContract(config || {});
-            const blockingIssue = contractIssues.find((issue) => issue.level === 'error');
-            if (blockingIssue) {
-                throw new Error(`[配置校验阻断] ${blockingIssue.message}`);
-            }
             const parseChatContent = (payload) => {
                 if (!payload || typeof payload !== 'object') return null;
                 const primaryMessage = payload?.choices?.[0]?.message || payload?.data?.choices?.[0]?.message;
@@ -12564,24 +13405,7 @@ function TapnowApp() {
                 return null;
             };
 
-            const fallbackTemplate = getDefaultRequestTemplateForType(config?.type || 'Chat');
-            const requestTemplate = normalizeRequestTemplate(config?.requestTemplate || fallbackTemplate)
-                || normalizeRequestTemplate(fallbackTemplate);
-            if (!requestTemplate?.endpoint) {
-                throw new Error('聊天请求模板未配置 endpoint');
-            }
-            const requestChain = normalizeRequestChain(config?.requestChain);
-            const transportMode = normalizeTransportMode(config?.transport);
-            const transportOptions = normalizeTransportOptions(config?.transportOptions);
-            const requestOverrideEnabled = !!config?.requestOverrideEnabled;
-            const requestOverridePatch = normalizeRequestOverridePatch(config?.requestOverridePatch);
-
-            const templateText = JSON.stringify(requestTemplate || {});
-            const needsBlob = (requestTemplate?.bodyType || '').toLowerCase() === 'multipart'
-                || /:blob\s*}}/.test(templateText);
-            const needsDataUrl = /:blob\s*}}/.test(templateText);
-
-            const attachmentMetas = (newUserMsg.files || []).map((file, idx) => {
+            const attachmentMetas = effectiveFiles.map((file, idx) => {
                 const rawContent = typeof file?.content === 'string' ? file.content : '';
                 const isDataUrl = rawContent.startsWith('data:');
                 const isHttpUrl = rawContent.startsWith('http://') || rawContent.startsWith('https://');
@@ -12602,7 +13426,6 @@ function TapnowApp() {
                     dataUrl: isDataUrl ? rawContent : ''
                 };
             });
-
             const buildAttachmentBlob = async (attachment) => {
                 if (!attachment) return null;
                 if (attachment.dataUrl) {
@@ -12625,191 +13448,401 @@ function TapnowApp() {
                 }
                 return null;
             };
-
-            const templateVars = {
-                modelName: modelName || chatModel,
-                prompt: newUserMsg.content || '',
-                input: newUserMsg.content || '',
-                stream: false,
-                messages: apiMessages,
-                chatMessages: apiMessages,
-                provider: {
-                    key: apiKey,
-                    baseUrl,
-                    id: config?.provider,
-                    useProxy: !!(config?.provider && providers?.[config.provider]?.useProxy)
-                },
-                files: attachmentMetas,
-                attachments: attachmentMetas,
-                fileCount: attachmentMetas.length
-            };
-
-            if (attachmentMetas.length > 0) {
-                const firstAttachment = attachmentMetas[0];
-                templateVars.fileName = firstAttachment.name;
-                templateVars.fileUrl = firstAttachment.url;
-                templateVars.fileDataUrl = firstAttachment.dataUrl;
-                templateVars.fileDataURL = firstAttachment.dataUrl;
-                templateVars.fileUrls = attachmentMetas.map(item => item.url).filter(Boolean);
-                templateVars.fileNames = attachmentMetas.map(item => item.name);
-
-                attachmentMetas.forEach((attachment) => {
-                    const index = attachment.index;
-                    templateVars[`fileName${index}`] = attachment.name;
-                    templateVars[`file${index}Name`] = attachment.name;
-                    templateVars[`fileUrl${index}`] = attachment.url;
-                    templateVars[`file${index}Url`] = attachment.url;
-                    templateVars[`fileDataUrl${index}`] = attachment.dataUrl;
-                    templateVars[`fileDataURL${index}`] = attachment.dataUrl;
-                    templateVars[`file${index}DataUrl`] = attachment.dataUrl;
-                    templateVars[`file${index}DataURL`] = attachment.dataUrl;
-                });
-            }
-
             const imageAttachments = attachmentMetas.filter((attachment) => attachment.isImage || attachment.isVideo);
-            const imageSources = imageAttachments
-                .map((attachment) => attachment.url || attachment.dataUrl)
-                .filter(Boolean);
-            if (imageSources.length > 0) {
-                templateVars.imageUrl = imageSources[0];
-                templateVars.imageUrls = imageSources;
-                templateVars.imagesUrl = imageSources;
-                templateVars.imagesUrls = imageSources;
-                imageSources.forEach((url, idx) => {
-                    const index = idx + 1;
-                    templateVars[`imageUrl${index}`] = url;
-                    templateVars[`image${index}Url`] = url;
-                });
-            }
 
-            if (needsDataUrl && attachmentMetas.length > 0) {
-                const dataUrls = await Promise.all(attachmentMetas.map(async (attachment) => {
-                    if (attachment.dataUrl) return attachment.dataUrl;
-                    if (attachment.url) {
-                        try {
-                            const useProxy = getProxyPreferenceForUrl(attachment.url, false);
-                            const base64 = await getBase64FromUrl(attachment.url, { useProxy });
-                            const mimeType = attachment.type || 'application/octet-stream';
-                            return `data:${mimeType};base64,${base64}`;
-                        } catch {
-                            return '';
+            let data = null;
+            let aiContent = '';
+            let assistantFiles = [];
+
+            if (currentChatUsesOfficialGemini) {
+                const buildGeminiFilePart = async (file) => {
+                    if (!file?.isImage || !file?.content) return null;
+                    const rawContent = String(file.content || '');
+                    try {
+                        if (rawContent.startsWith('data:')) {
+                            const normalized = normalizeDataUrl(rawContent);
+                            const mimeMatch = normalized.match(/^data:([^;,]+)[;,]/i);
+                            return {
+                                inline_data: {
+                                    mime_type: mimeMatch?.[1] || file.type || 'image/png',
+                                    data: normalized.split(',')[1] || ''
+                                }
+                            };
                         }
+                        const useProxy = getProxyPreferenceForUrl(rawContent, false);
+                        const base64 = await getBase64FromUrl(rawContent, { useProxy });
+                        return {
+                            inline_data: {
+                                mime_type: file.type || 'image/png',
+                                data: base64
+                            }
+                        };
+                    } catch {
+                        return null;
                     }
-                    if (attachment.rawContent) {
-                        const blob = new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
-                        try {
-                            return await blobToDataURL(blob);
-                        } catch {
-                            return '';
-                        }
+                };
+                const buildGeminiFallbackText = (file) => {
+                    if (file?.isVideo) return `[附加视频素材: ${file.canvasRef || file.name || 'video'}]`;
+                    if (file?.isAudio) return `[附加音频素材: ${file.name || 'audio'}]`;
+                    if (file?.isPDF || file?.isDoc || file?.isExcel) return `[附加文档: ${file.name || 'document'}]`;
+                    if (file?.isCode || (file?.content && typeof file.content === 'string' && file.content.length < 50000)) {
+                        return `\n[文件: ${file.name}]\n\`\`\`${file.fileExt || 'text'}\n${file.content}\n\`\`\`\n`;
                     }
-                    return '';
-                }));
-                if (dataUrls.length > 0) {
-                    templateVars.fileDataUrls = dataUrls.filter(Boolean);
-                    dataUrls.forEach((dataUrl, idx) => {
-                        const index = idx + 1;
-                        templateVars[`fileDataUrl${index}`] = dataUrl;
-                        templateVars[`fileDataURL${index}`] = dataUrl;
-                        templateVars[`file${index}DataUrl`] = dataUrl;
-                        templateVars[`file${index}DataURL`] = dataUrl;
+                    return `[附加文件: ${file?.name || 'file'}]`;
+                };
+                const buildGeminiParts = async (message, extraTexts = [], includeFiles = false) => {
+                    const parts = [];
+                    if (message?.content) parts.push({ text: String(message.content) });
+                    (Array.isArray(extraTexts) ? extraTexts : []).filter(Boolean).forEach((text) => {
+                        parts.push({ text: String(text) });
                     });
-                    if (dataUrls[0]) {
-                        templateVars.fileDataUrl = dataUrls[0];
-                        templateVars.fileDataURL = dataUrls[0];
+                    if (includeFiles) {
+                        for (const file of (Array.isArray(message?.files) ? message.files : [])) {
+                            const inlinePart = await buildGeminiFilePart(file);
+                            if (inlinePart) {
+                                parts.push(inlinePart);
+                            } else {
+                                parts.push({ text: buildGeminiFallbackText(file) });
+                            }
+                        }
+                    } else if (!message?.content && Array.isArray(message?.files) && message.files.length > 0) {
+                        parts.push({ text: `[${message.files.length} 个多模态素材已在前文提供]` });
                     }
-                    const imageDataUrls = dataUrls.filter(Boolean);
-                    if (imageDataUrls.length > 0) {
-                        templateVars.imageDataUrl = imageDataUrls[0];
-                        templateVars.imageDataURL = imageDataUrls[0];
-                        templateVars.imageDataUrls = imageDataUrls;
-                        templateVars.imagesDataUrl = imageDataUrls;
-                        templateVars.imagesDataURL = imageDataUrls;
-                        imageDataUrls.forEach((dataUrl, idx) => {
+                    return parts.length > 0 ? parts : [{ text: '继续' }];
+                };
+
+                const geminiContents = [];
+                for (const message of historyMessages) {
+                    geminiContents.push({
+                        role: message.role === 'assistant' ? 'model' : 'user',
+                        parts: await buildGeminiParts(message, [], false)
+                    });
+                }
+                const currentGeminiParts = await buildGeminiParts(
+                    newUserMsg,
+                    canvasContext?.text ? [`\n[画布上下文]\n${canvasContext.text}`] : [],
+                    true
+                );
+                const requestBody = {
+                    systemInstruction: {
+                        parts: [{ text: agentSystemPrompt }]
+                    },
+                    contents: [
+                        ...geminiContents,
+                        { role: 'user', parts: currentGeminiParts }
+                    ]
+                };
+                if (chatGeminiSearchEnabled && currentChatSupportsDesignAgent) {
+                    requestBody.tools = [{ google_search: {} }];
+                }
+                if (chatGeminiThinkingEnabled && currentChatSupportsDesignAgent) {
+                    requestBody.generationConfig = {
+                        thinkingConfig: {
+                            thinkingBudget: CHAT_GEMINI_THINKING_BUDGET
+                        }
+                    };
+                }
+
+                const geminiModelName = stripGoogleModelPrefix(modelName || config?.modelName || config?.id || chatModel);
+                const requestUrl = `${String(baseUrl || '').replace(/\/+$/, '')}/v1beta/models/${encodeURIComponent(geminiModelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+                const targetUrl = config?.provider ? buildProxyUrl(requestUrl, config.provider) : requestUrl;
+                const response = await fetch(targetUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Accept: 'application/json'
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+                const rawText = await response.text();
+                try {
+                    data = rawText ? JSON.parse(rawText) : null;
+                } catch {
+                    data = null;
+                }
+                if (!response.ok) {
+                    throw new Error(
+                        data?.error?.message
+                        || data?.message
+                        || rawText
+                        || `API Error: ${response.status || 0}`
+                    );
+                }
+                const parsedGemini = parseGeminiAssistantPayload(data);
+                aiContent = parsedGemini.text;
+                assistantFiles = parsedGemini.files;
+            } else {
+                const currentContent = [];
+                if (newUserMsg.content) currentContent.push({ type: 'text', text: newUserMsg.content });
+                if (canvasContext?.text) {
+                    currentContent.push({ type: 'text', text: `\n[画布上下文]\n${canvasContext.text}\n` });
+                }
+
+                effectiveFiles.forEach((file) => {
+                    const isGeminiLike = currentChatSupportsDesignAgent || (config?.modelName ?? '').toLowerCase().includes('gemini');
+                    if (file.isImage) {
+                        currentContent.push({
+                            type: 'image_url',
+                            image_url: { url: file.content }
+                        });
+                    } else if (file.isVideo) {
+                        if (isGeminiLike) {
+                            currentContent.push({
+                                type: 'image_url',
+                                image_url: { url: file.content }
+                            });
+                        } else {
+                            currentContent.push({
+                                type: 'text',
+                                text: `\n[User attached video: ${file.name}]\n`
+                            });
+                        }
+                    } else if (file.isAudio) {
+                        currentContent.push({
+                            type: 'text',
+                            text: `\n[User attached audio: ${file.name}]\n`
+                        });
+                    } else if (file.isPDF || file.isDoc || file.isExcel) {
+                        currentContent.push({
+                            type: 'text',
+                            text: `\n[User attached document: ${file.name} (${file.isPDF ? 'PDF' : file.isDoc ? 'Word' : 'Excel'})]\n`
+                        });
+                    } else if (file.isCode || (file.content && typeof file.content === 'string' && file.content.length < 50000)) {
+                        currentContent.push({
+                            type: 'text',
+                            text: `\n[File: ${file.name}]\n\`\`\`${file.fileExt || 'text'}\n${file.content}\n\`\`\`\n`
+                        });
+                    } else {
+                        currentContent.push({
+                            type: 'text',
+                            text: `\n[User attached file: ${file.name}]\n`
+                        });
+                    }
+                });
+
+                const apiMessages = [
+                    {
+                        role: 'system',
+                        content: agentSystemPrompt
+                    },
+                    ...historyMessages.map(m => ({
+                        role: m.role,
+                        content: m.content
+                    })),
+                    { role: 'user', content: currentContent }
+                ];
+
+                const contractIssues = validateModelLibraryContract(config || {});
+                const blockingIssue = contractIssues.find((issue) => issue.level === 'error');
+                if (blockingIssue) {
+                    throw new Error(`[配置校验阻断] ${blockingIssue.message}`);
+                }
+
+                const fallbackTemplate = getDefaultRequestTemplateForType(config?.type || 'Chat');
+                const requestTemplate = normalizeRequestTemplate(config?.requestTemplate || fallbackTemplate)
+                    || normalizeRequestTemplate(fallbackTemplate);
+                if (!requestTemplate?.endpoint) {
+                    throw new Error('聊天请求模板未配置 endpoint');
+                }
+                const requestChain = normalizeRequestChain(config?.requestChain);
+                const transportMode = normalizeTransportMode(config?.transport);
+                const transportOptions = normalizeTransportOptions(config?.transportOptions);
+                const requestOverrideEnabled = !!config?.requestOverrideEnabled;
+                const requestOverridePatch = normalizeRequestOverridePatch(config?.requestOverridePatch);
+
+                const templateText = JSON.stringify(requestTemplate || {});
+                const needsBlob = (requestTemplate?.bodyType || '').toLowerCase() === 'multipart'
+                    || /:blob\s*}}/.test(templateText);
+                const needsDataUrl = /:blob\s*}}/.test(templateText);
+                const templateVars = {
+                    modelName: modelName || chatModel,
+                    prompt: newUserMsg.content || '',
+                    input: newUserMsg.content || '',
+                    stream: false,
+                    messages: apiMessages,
+                    chatMessages: apiMessages,
+                    provider: {
+                        key: apiKey,
+                        baseUrl,
+                        id: config?.provider,
+                        useProxy: !!(config?.provider && providers?.[config.provider]?.useProxy)
+                    },
+                    files: attachmentMetas,
+                    attachments: attachmentMetas,
+                    fileCount: attachmentMetas.length
+                };
+
+                if (canvasContext?.text) {
+                    templateVars.canvasContext = canvasContext.text;
+                    templateVars.canvasNodes = canvasContext.nodes;
+                    templateVars.canvasAssets = canvasContext.assets;
+                }
+
+                if (attachmentMetas.length > 0) {
+                    const firstAttachment = attachmentMetas[0];
+                    templateVars.fileName = firstAttachment.name;
+                    templateVars.fileUrl = firstAttachment.url;
+                    templateVars.fileDataUrl = firstAttachment.dataUrl;
+                    templateVars.fileDataURL = firstAttachment.dataUrl;
+                    templateVars.fileUrls = attachmentMetas.map(item => item.url).filter(Boolean);
+                    templateVars.fileNames = attachmentMetas.map(item => item.name);
+
+                    attachmentMetas.forEach((attachment) => {
+                        const index = attachment.index;
+                        templateVars[`fileName${index}`] = attachment.name;
+                        templateVars[`file${index}Name`] = attachment.name;
+                        templateVars[`fileUrl${index}`] = attachment.url;
+                        templateVars[`file${index}Url`] = attachment.url;
+                        templateVars[`fileDataUrl${index}`] = attachment.dataUrl;
+                        templateVars[`fileDataURL${index}`] = attachment.dataUrl;
+                        templateVars[`file${index}DataUrl`] = attachment.dataUrl;
+                        templateVars[`file${index}DataURL`] = attachment.dataUrl;
+                    });
+                }
+
+                const imageSources = imageAttachments
+                    .map((attachment) => attachment.url || attachment.dataUrl)
+                    .filter(Boolean);
+                if (imageSources.length > 0) {
+                    templateVars.imageUrl = imageSources[0];
+                    templateVars.imageUrls = imageSources;
+                    templateVars.imagesUrl = imageSources;
+                    templateVars.imagesUrls = imageSources;
+                    imageSources.forEach((url, idx) => {
+                        const index = idx + 1;
+                        templateVars[`imageUrl${index}`] = url;
+                        templateVars[`image${index}Url`] = url;
+                    });
+                }
+
+                if (needsDataUrl && attachmentMetas.length > 0) {
+                    const dataUrls = await Promise.all(attachmentMetas.map(async (attachment) => {
+                        if (attachment.dataUrl) return attachment.dataUrl;
+                        if (attachment.url) {
+                            try {
+                                const useProxy = getProxyPreferenceForUrl(attachment.url, false);
+                                const base64 = await getBase64FromUrl(attachment.url, { useProxy });
+                                const mimeType = attachment.type || 'application/octet-stream';
+                                return `data:${mimeType};base64,${base64}`;
+                            } catch {
+                                return '';
+                            }
+                        }
+                        if (attachment.rawContent) {
+                            const blob = new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
+                            try {
+                                return await blobToDataURL(blob);
+                            } catch {
+                                return '';
+                            }
+                        }
+                        return '';
+                    }));
+                    if (dataUrls.length > 0) {
+                        templateVars.fileDataUrls = dataUrls.filter(Boolean);
+                        dataUrls.forEach((dataUrl, idx) => {
                             const index = idx + 1;
-                            templateVars[`imageDataUrl${index}`] = dataUrl;
-                            templateVars[`imageDataURL${index}`] = dataUrl;
-                            templateVars[`image${index}DataUrl`] = dataUrl;
-                            templateVars[`image${index}DataURL`] = dataUrl;
+                            templateVars[`fileDataUrl${index}`] = dataUrl;
+                            templateVars[`fileDataURL${index}`] = dataUrl;
+                            templateVars[`file${index}DataUrl`] = dataUrl;
+                            templateVars[`file${index}DataURL`] = dataUrl;
+                        });
+                        if (dataUrls[0]) {
+                            templateVars.fileDataUrl = dataUrls[0];
+                            templateVars.fileDataURL = dataUrls[0];
+                        }
+                        const imageDataUrls = dataUrls.filter(Boolean);
+                        if (imageDataUrls.length > 0) {
+                            templateVars.imageDataUrl = imageDataUrls[0];
+                            templateVars.imageDataURL = imageDataUrls[0];
+                            templateVars.imageDataUrls = imageDataUrls;
+                            templateVars.imagesDataUrl = imageDataUrls;
+                            templateVars.imagesDataURL = imageDataUrls;
+                            imageDataUrls.forEach((dataUrl, idx) => {
+                                const index = idx + 1;
+                                templateVars[`imageDataUrl${index}`] = dataUrl;
+                                templateVars[`imageDataURL${index}`] = dataUrl;
+                                templateVars[`image${index}DataUrl`] = dataUrl;
+                                templateVars[`image${index}DataURL`] = dataUrl;
+                            });
+                        }
+                    }
+                }
+
+                if (needsBlob && attachmentMetas.length > 0) {
+                    const attachmentBlobs = await Promise.all(attachmentMetas.map((attachment) => buildAttachmentBlob(attachment)));
+                    templateVars.fileBlob = attachmentBlobs[0] || null;
+                    templateVars.fileBlobs = attachmentBlobs.filter(Boolean);
+                    attachmentBlobs.forEach((blob, idx) => {
+                        const index = idx + 1;
+                        templateVars[`fileBlob${index}`] = blob;
+                        templateVars[`file${index}Blob`] = blob;
+                    });
+
+                    const imageBlobs = [];
+                    for (const attachment of imageAttachments) {
+                        const blob = await buildAttachmentBlob(attachment);
+                        if (blob) imageBlobs.push(blob);
+                    }
+                    if (imageBlobs.length > 0) {
+                        templateVars.imageBlob = imageBlobs[0];
+                        templateVars.imageBlobs = imageBlobs;
+                        templateVars.imagesBlob = imageBlobs;
+                        imageBlobs.forEach((blob, idx) => {
+                            const index = idx + 1;
+                            templateVars[`imageBlob${index}`] = blob;
+                            templateVars[`image${index}Blob`] = blob;
                         });
                     }
                 }
-            }
 
-            if (needsBlob && attachmentMetas.length > 0) {
-                const attachmentBlobs = await Promise.all(attachmentMetas.map((attachment) => buildAttachmentBlob(attachment)));
-                templateVars.fileBlob = attachmentBlobs[0] || null;
-                templateVars.fileBlobs = attachmentBlobs.filter(Boolean);
-                attachmentBlobs.forEach((blob, idx) => {
-                    const index = idx + 1;
-                    templateVars[`fileBlob${index}`] = blob;
-                    templateVars[`file${index}Blob`] = blob;
+                const requestVars = await runRequestChain(
+                    requestChain,
+                    templateVars,
+                    config?.provider,
+                    transportMode,
+                    transportOptions
+                );
+                let request = buildRequestFromTemplate(requestTemplate, requestVars, { bodyType: requestTemplate.bodyType });
+                if (!request || !request.url) {
+                    throw new Error('聊天请求模板构建失败');
+                }
+                request = requestOverrideEnabled && requestOverridePatch
+                    ? applyRequestOverridePatch({ ...request }, requestOverridePatch)
+                    : request;
+
+                const requestHeaders = request?.headers && typeof request.headers === 'object'
+                    ? { ...request.headers }
+                    : {};
+                if (apiKey && !requestHeaders.Authorization && !requestHeaders.authorization) {
+                    requestHeaders.Authorization = `Bearer ${apiKey}`;
+                    request = { ...request, headers: requestHeaders };
+                }
+
+                const transportResult = await executeTransportRequest({
+                    request,
+                    baseUrl,
+                    providerKey: config?.provider,
+                    transport: transportMode,
+                    transportOptions
                 });
 
-                const imageBlobs = [];
-                for (const attachment of imageAttachments) {
-                    const blob = await buildAttachmentBlob(attachment);
-                    if (blob) imageBlobs.push(blob);
+                if (!transportResult.ok) {
+                    const errorText = transportResult?.data?.message
+                        || transportResult?.data?.error?.message
+                        || transportResult?.errorMessage
+                        || transportResult?.text;
+                    throw new Error(errorText || `API Error: ${transportResult.status || 0}`);
                 }
-                if (imageBlobs.length > 0) {
-                    templateVars.imageBlob = imageBlobs[0];
-                    templateVars.imageBlobs = imageBlobs;
-                    templateVars.imagesBlob = imageBlobs;
-                    imageBlobs.forEach((blob, idx) => {
-                        const index = idx + 1;
-                        templateVars[`imageBlob${index}`] = blob;
-                        templateVars[`image${index}Blob`] = blob;
-                    });
+
+                data = transportResult.data;
+                aiContent = parseChatContent(data);
+                if ((!aiContent || String(aiContent).trim() === '') && transportResult.aggregateText) {
+                    aiContent = transportResult.aggregateText;
                 }
-            }
-
-            const requestVars = await runRequestChain(
-                requestChain,
-                templateVars,
-                config?.provider,
-                transportMode,
-                transportOptions
-            );
-            let request = buildRequestFromTemplate(requestTemplate, requestVars, { bodyType: requestTemplate.bodyType });
-            if (!request || !request.url) {
-                throw new Error('聊天请求模板构建失败');
-            }
-            request = requestOverrideEnabled && requestOverridePatch
-                ? applyRequestOverridePatch({ ...request }, requestOverridePatch)
-                : request;
-
-            const requestHeaders = request?.headers && typeof request.headers === 'object'
-                ? { ...request.headers }
-                : {};
-            if (apiKey && !requestHeaders.Authorization && !requestHeaders.authorization) {
-                requestHeaders.Authorization = `Bearer ${apiKey}`;
-                request = { ...request, headers: requestHeaders };
-            }
-
-            const transportResult = await executeTransportRequest({
-                request,
-                baseUrl,
-                providerKey: config?.provider,
-                transport: transportMode,
-                transportOptions
-            });
-
-            if (!transportResult.ok) {
-                const errorText = transportResult?.data?.message
-                    || transportResult?.data?.error?.message
-                    || transportResult?.errorMessage
-                    || transportResult?.text;
-                throw new Error(errorText || `API Error: ${transportResult.status || 0}`);
-            }
-
-            const data = transportResult.data;
-
-            let aiContent = parseChatContent(data);
-            if ((!aiContent || String(aiContent).trim() === '') && transportResult.aggregateText) {
-                aiContent = transportResult.aggregateText;
-            }
-            if ((!aiContent || String(aiContent).trim() === '') && data === null && transportResult.text) {
-                aiContent = transportResult.text;
+                if ((!aiContent || String(aiContent).trim() === '') && data === null && transportResult.text) {
+                    aiContent = transportResult.text;
+                }
             }
 
             if (aiContent && typeof aiContent !== 'string') {
@@ -12817,15 +13850,16 @@ function TapnowApp() {
             }
             if (!aiContent || aiContent.trim() === '') {
                 console.error('[聊天] API 响应内容为空:', data);
-                aiContent = "No response";
+                aiContent = 'No response';
             }
 
             const newAssistantMsg = {
                 id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                 role: 'assistant',
                 content: aiContent,
+                files: assistantFiles.length > 0 ? assistantFiles : undefined,
                 timestamp: Date.now(),
-                modelId: chatModel // 保存回复消息时使用的模型ID
+                modelId: chatModel
             };
 
             setChatSessions(prev => prev.map(s => {
@@ -12835,7 +13869,10 @@ function TapnowApp() {
                 return s;
             }));
 
-            const chatImageUrls = extractChatImageUrls(data || {}, aiContent);
+            const chatImageUrls = [
+                ...assistantFiles.filter(file => file?.isImage).map(file => file.content),
+                ...extractChatImageUrls(data || {}, aiContent)
+            ].filter((url, index, arr) => !!url && arr.indexOf(url) === index);
             if (chatImageUrls.length > 0) {
                 const now = Date.now();
                 const primaryUrl = chatImageUrls[0];
@@ -12864,7 +13901,7 @@ function TapnowApp() {
             }
 
         } catch (error) {
-            console.error("Chat Error", error);
+            console.error('Chat Error', error);
             const errorMsg = {
                 id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                 role: 'assistant',
@@ -13686,9 +14723,10 @@ function TapnowApp() {
                         dimensions = await getImageDimensions(metaUrl);
                     } catch { }
                 }
+                const persistedContent = !isVideo ? await persistBase64ImageUrl(dragUrl) : dragUrl;
                 saveToUndoStack();
                 setNodes((prev) => prev.map((n) => n.id === nodeId
-                    ? { ...n, content: dragUrl, dimensions: isVideo ? null : dimensions }
+                    ? { ...n, content: persistedContent, dimensions: isVideo ? null : dimensions }
                     : n));
                 return;
             }
@@ -13704,9 +14742,10 @@ function TapnowApp() {
                     dimensions = await getImageDimensions(metaUrl);
                 } catch { }
             }
+            const persistedContent = !isVideo ? await persistBase64ImageUrl(dragUrlCandidate) : dragUrlCandidate;
             saveToUndoStack();
             setNodes((prev) => prev.map((n) => n.id === nodeId
-                ? { ...n, content: dragUrlCandidate, dimensions: isVideo ? null : dimensions }
+                ? { ...n, content: persistedContent, dimensions: isVideo ? null : dimensions }
                 : n));
             return;
         }
@@ -13720,9 +14759,10 @@ function TapnowApp() {
                 const content = ev.target.result;
                 let dimensions = { w: 0, h: 0 };
                 try { dimensions = await getImageDimensions(content); } catch (e) { }
+                const persistedContent = await persistBase64ImageUrl(content);
                 // V3.4.7: 保存撤销状态（图片更换是可撤销的操作）
                 saveToUndoStack();
-                setNodes((prev) => prev.map((n) => n.id === nodeId ? { ...n, content: content, dimensions } : n));
+                setNodes((prev) => prev.map((n) => n.id === nodeId ? { ...n, content: persistedContent, dimensions } : n));
             };
             reader.readAsDataURL(file);
         }
@@ -13838,7 +14878,8 @@ function TapnowApp() {
             const real = await getImageDimensions(dragUrl);
             if (real?.w && real?.h) dims = { w: real.w, h: real.h };
         } catch { }
-        addNode('input-image', world.x, world.y, null, dragUrl, dims);
+        const persistedDragUrl = await persistBase64ImageUrl(dragUrl);
+        addNode('input-image', world.x, world.y, null, persistedDragUrl, dims);
     };
 
     const handleChatDrop = (e) => {
@@ -14001,11 +15042,12 @@ function TapnowApp() {
                             try {
                                 dimensions = await getImageDimensions(content);
                             } catch (e) { }
+                            const persistedContent = await persistBase64ImageUrl(content);
                             // V3.4.7: 保存撤销状态（图片粘贴是可撤销的操作）
                             saveToUndoStack();
                             setNodes((prev) => prev.map((n) =>
                                 n.id === targetNode.id
-                                    ? { ...n, content: content, dimensions }
+                                    ? { ...n, content: persistedContent, dimensions }
                                     : n
                             ));
                         };
@@ -16097,6 +17139,13 @@ function TapnowApp() {
 
 
         if (!prompt && !sourceImage) { alert(t('请输入提示词或连接参考图片')); return; }
+        const compiledPrompt = String(options.compiledPrompt || prompt || '').trim();
+        const negativePrompt = String(options.negativePrompt || '').trim();
+        const editInstruction = String(options.editInstruction || '').trim();
+        const renderPrompt = String(options.renderPrompt || prompt || '').trim();
+        if (renderPrompt) {
+            prompt = renderPrompt;
+        }
 
         // 检查是否是分镜表的虚拟节点ID（格式：storyboard-${nodeId}-shot-${shotId}）
         let node = null;
@@ -16526,7 +17575,7 @@ function TapnowApp() {
                 const requestTemplateEnabled = !!requestTemplate?.enabled;
                 const isModelScope = apiType === 'modelscope';
                 const isGeminiNative = apiType === 'gemini';
-                const isChatImage = config?.type === 'ChatImage';
+                const isChatImage = config?.type === 'ChatImage' && !isGeminiNative;
                 const useAsync = isModelScope ? forceAsync : false;
                 const resolveSourceProxy = (url) => getProxyPreferenceForUrl(url, useProxy);
                 const asyncConfig = normalizeAsyncConfig(config?.asyncConfig)
@@ -17199,6 +18248,10 @@ function TapnowApp() {
                     const vars = {
                         modelName: config?.modelName || modelId,
                         prompt: prompt || '',
+                        compiledPrompt: compiledPrompt || '',
+                        negativePrompt: negativePrompt || '',
+                        editInstruction: editInstruction || '',
+                        renderPrompt: renderPrompt || '',
                         ratio: omitRatioOnSubmit ? '' : ratio,
                         resolution: omitResolutionOnSubmit ? '' : resolution,
                         size: (omitRatioOnSubmit || omitResolutionOnSubmit) ? '' : sizeStr,
@@ -17258,6 +18311,10 @@ function TapnowApp() {
                         const vars = {
                             modelName: config?.modelName || modelId,
                             prompt: prompt || '',
+                            compiledPrompt: compiledPrompt || '',
+                            negativePrompt: negativePrompt || '',
+                            editInstruction: editInstruction || '',
+                            renderPrompt: renderPrompt || '',
                             ratio: omitRatioOnSubmit ? '' : ratio,
                             resolution: omitResolutionOnSubmit ? '' : resolution,
                             size: (omitRatioOnSubmit || omitResolutionOnSubmit) ? '' : sizeStr,
@@ -17416,6 +18473,25 @@ function TapnowApp() {
                     } else {
                         const cleanBaseUrl = currentBaseUrl.replace(/\/+$/, '');
                         fullUrl = `${cleanBaseUrl}${overrideUrl.startsWith('/') ? overrideUrl : '/' + overrideUrl}`;
+                    }
+
+                    const isOfficialGeminiRequest = isGeminiNative
+                        && isOfficialGeminiProvider(providerKey)
+                        && /generativelanguage\.googleapis\.com/i.test(String(fullUrl || currentBaseUrl || ''));
+
+                    if (isOfficialGeminiRequest) {
+                        delete overrideHeaders.Authorization;
+                        delete overrideHeaders.authorization;
+                        if (
+                            currentApiKey
+                            && !/[?&]key=/.test(fullUrl)
+                            && !overrideHeaders['x-goog-api-key']
+                            && !overrideHeaders['X-Goog-Api-Key']
+                        ) {
+                            overrideHeaders['x-goog-api-key'] = currentApiKey;
+                        }
+                    } else if (currentApiKey && !overrideHeaders.Authorization && !overrideHeaders.authorization) {
+                        overrideHeaders.Authorization = `Bearer ${currentApiKey}`;
                     }
 
                     if (overrideBodyType === 'multipart') {
@@ -20510,10 +21586,11 @@ function TapnowApp() {
     // --- 节点操作 ---
     const addNode = (type, worldX, worldY, sourceId, initialContent = undefined, initialDimensions = undefined, targetId = undefined, inputType = undefined) => {
         saveToUndoStack(); // V3.4.6: 保存到撤销栈
+        const idSeed = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const defaultSize = type === 'gen-video'
             ? { w: 400, h: 500 }
             : type === 'gen-image'
-                ? { w: 440, h: 420 }
+                ? { w: 620, h: 520 }
                 : type === 'video-input'
                     ? { w: 580, h: 460 }
                     : type === 'video-analyze'
@@ -20542,7 +21619,7 @@ function TapnowApp() {
                                                                     ? { w: 320, h: 380 }
                                         : { w: 260, h: 260 };
         const newNode = {
-            id: `node - ${Date.now()} `,
+            id: `node - ${idSeed} `,
             type,
             x: worldX - defaultSize.w / 2,
             y: worldY - defaultSize.h / 2,
@@ -20625,7 +21702,7 @@ function TapnowApp() {
         setNodes(prev => [...prev, newNode]);
         // 从输出端口连接到新节点（原有逻辑）
         if (sourceId) {
-            setConnections(prev => [...prev, { id: `conn - ${Date.now()} `, from: sourceId, to: newNode.id }]);
+            setConnections(prev => [...prev, { id: `conn - out - ${idSeed} `, from: sourceId, to: newNode.id }]);
         }
         // 从输入端口连接到新节点（反向连接）
         if (targetId) {
@@ -20636,14 +21713,14 @@ function TapnowApp() {
                         !(c.to === targetId && (c.inputType || 'default') === inputType)
                     );
                     return [...filtered, {
-                        id: `conn - ${Date.now()} `,
+                        id: `conn - in - ${idSeed} `,
                         from: newNode.id,
                         to: targetId,
                         inputType: inputType !== 'default' ? inputType : undefined
                     }];
                 }
                 return [...prev, {
-                    id: `conn - ${Date.now()} `,
+                    id: `conn - in - ${idSeed} `,
                     from: newNode.id,
                     to: targetId
                 }];
@@ -21170,6 +22247,8 @@ function TapnowApp() {
         if (resolvedId.includes('jimeng')) return ['5s', '10s'];  // Jimeng 只支持 5s 和 10s
         return ['5s', '10s'];
     };
+    getDefaultDurationForModelRef.current = getDefaultDurationForModel;
+    getDefaultDurationsForModelRef.current = getDefaultDurationsForModel;
 
     const getStoryboardDefaultPromptByMode = (mode) => {
         const normalizedMode = STORYBOARD_LLM_PROMPT_MODES.includes(mode) ? mode : 'script';
@@ -23115,9 +24194,10 @@ ${inputText.substring(0, 15000)} ... (截断)
                 const content = ev.target.result;
                 let dimensions = { w: 0, h: 0 };
                 try { dimensions = await getImageDimensions(content); } catch (e) { }
+                const persistedContent = await persistBase64ImageUrl(content);
                 // V3.4.7: 保存撤销状态（图片更换是可撤销的操作）
                 saveToUndoStack();
-                setNodes((prev) => prev.map((n) => n.id === nodeId ? { ...n, content: content, dimensions } : n));
+                setNodes((prev) => prev.map((n) => n.id === nodeId ? { ...n, content: persistedContent, dimensions } : n));
             };
             reader.readAsDataURL(file);
         }
@@ -23751,6 +24831,11 @@ ${inputText.substring(0, 15000)} ... (截断)
     };
     const applyLibraryPrompt = (nodeId, promptText) => {
         if (!nodeId || !promptText) return;
+        const targetNode = nodesMap.get(nodeId);
+        if (targetNode?.type === 'gen-image') {
+            applyImagePromptTextToNode(nodeId, promptText);
+            return;
+        }
         updateNodeSettings(nodeId, { prompt: promptText });
     };
 
@@ -25366,6 +26451,1888 @@ ${inputText.substring(0, 15000)} ... (截断)
         }
         return null;
     };
+    const stripChatSourceFooter = useCallback((text) => {
+        return String(text || '').replace(/\n---\n参考来源[\s\S]*$/i, '').trim();
+    }, []);
+    const extractActionablePromptFromChatMessage = useCallback((text) => {
+        const stripped = stripChatSourceFooter(text);
+        if (!stripped) return '';
+        const fencedJson = stripped.match(/```json\s*([\s\S]*?)```/i);
+        if (fencedJson?.[1]?.trim()) return fencedJson[1].trim();
+        const fencedAny = stripped.match(/```(?:prompt|text|markdown)?\s*([\s\S]*?)```/i);
+        if (fencedAny?.[1]?.trim()) return fencedAny[1].trim();
+        const jsonWindow = stripped.match(/\{[\s\S]*\}/);
+        if (jsonWindow?.[0]) {
+            try {
+                JSON.parse(jsonWindow[0]);
+                return jsonWindow[0];
+            } catch (error) { }
+        }
+        const lines = stripped
+            .split(/\r?\n/)
+            .map((line) => line.trimEnd())
+            .filter((line) => line.trim());
+        const filtered = lines.filter((line) => {
+            const normalized = line.trim();
+            if (!normalized) return false;
+            if (/^(说明|解释|建议|工作流|步骤|补充|使用方法|执行方式|可选项|推荐做法|注意事项)[:：]/i.test(normalized)) return false;
+            if (/^(?:[-*]|\d+\.)\s*(说明|解释|建议|工作流|步骤|补充|使用方法|执行方式|可选项|注意事项)/i.test(normalized)) return false;
+            return true;
+        });
+        return filtered.join('\n').trim() || stripped;
+    }, [stripChatSourceFooter]);
+    const extractChatSourceIndexesFromText = useCallback((text, maxCount = 0) => {
+        const source = String(text || '');
+        if (!source) return [];
+        if (maxCount > 0 && /(全部素材|所有素材|全部参考图|所有参考图|all materials|all images|all source images|all references)/i.test(source)) {
+            return Array.from({ length: maxCount }, (_, index) => index);
+        }
+        const indexes = new Set();
+        const addIndex = (rawValue) => {
+            const parsed = Number.parseInt(rawValue, 10);
+            if (!Number.isFinite(parsed)) return;
+            const resolvedIndex = parsed - 1;
+            if (resolvedIndex < 0) return;
+            if (maxCount > 0 && resolvedIndex >= maxCount) return;
+            indexes.add(resolvedIndex);
+        };
+        const addRange = (startValue, endValue) => {
+            const start = Number.parseInt(startValue, 10);
+            const end = Number.parseInt(endValue, 10);
+            if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+            const step = start <= end ? 1 : -1;
+            for (let current = start; step > 0 ? current <= end : current >= end; current += step) {
+                addIndex(current);
+            }
+        };
+        [
+            /素材#?\s*(\d+)\s*(?:-|~|至|到)\s*(\d+)/gi,
+            /(?:material|asset|image|file|source)\s*#?\s*(\d+)\s*(?:-|~|to|至|到)\s*(\d+)/gi
+        ].forEach((pattern) => {
+            let match;
+            pattern.lastIndex = 0;
+            while ((match = pattern.exec(source))) {
+                addRange(match[1], match[2]);
+            }
+        });
+        [
+            /素材#?\s*(\d+)/gi,
+            /(?:material|asset|image|file|source)\s*#?\s*(\d+)/gi
+        ].forEach((pattern) => {
+            let match;
+            pattern.lastIndex = 0;
+            while ((match = pattern.exec(source))) {
+                addIndex(match[1]);
+            }
+        });
+        return Array.from(indexes).sort((left, right) => left - right);
+    }, []);
+    const resolveChatWorkflowSourceIndexes = useCallback((entry, sourceCount = 0) => {
+        const indexes = new Set();
+        const addIndexes = (values) => {
+            (Array.isArray(values) ? values : [values]).forEach((value) => {
+                const parsed = Number.parseInt(value, 10);
+                if (!Number.isFinite(parsed)) return;
+                const resolvedIndex = parsed - 1;
+                if (resolvedIndex < 0) return;
+                if (sourceCount > 0 && resolvedIndex >= sourceCount) return;
+                indexes.add(resolvedIndex);
+            });
+        };
+        const sourceKeys = [
+            'sourceRefs',
+            'sourceRef',
+            'sourceImages',
+            'sourceImageIndexes',
+            'sourceImageIds',
+            'sourceIndexes',
+            'sourceIndex',
+            'materialRefs',
+            'materialRef',
+            'materialIndexes',
+            'materialIndex',
+            'materials',
+            'assetRefs',
+            'assetIndexes',
+            'assetIndex',
+            'imageRefs',
+            'imageIndexes',
+            'imageIndex',
+            'fileRefs',
+            'fileIndexes',
+            'fileIndex',
+            'inputRefs',
+            'inputIndexes',
+            'inputs',
+            '__rootSourceRefs'
+        ];
+        const textKeys = [
+            'title',
+            'name',
+            'label',
+            'description',
+            'notes',
+            'comment',
+            'content',
+            'text',
+            'prompt',
+            'promptText',
+            'requirement',
+            'requirements'
+        ];
+        const normalizeLookupKey = (key) => String(key || '')
+            .trim()
+            .replace(/[\s_-]+/g, '')
+            .toLowerCase();
+        const normalizedSourceKeys = new Set(sourceKeys.map((key) => normalizeLookupKey(key)));
+        const normalizedTextKeys = new Set(textKeys.map((key) => normalizeLookupKey(key)));
+        const visit = (value) => {
+            if (value === null || value === undefined) return;
+            if (typeof value === 'number') {
+                addIndexes(value);
+                return;
+            }
+            if (typeof value === 'string') {
+                const trimmed = value.trim();
+                if (!trimmed) return;
+                if (/^\d+(?:\s*,\s*\d+)+$/.test(trimmed)) {
+                    addIndexes(trimmed.split(','));
+                }
+                extractChatSourceIndexesFromText(trimmed, sourceCount).forEach((index) => indexes.add(index));
+                return;
+            }
+            if (Array.isArray(value)) {
+                value.forEach(visit);
+                return;
+            }
+            if (typeof value !== 'object') return;
+            Object.entries(value).forEach(([key, nestedValue]) => {
+                const normalizedKey = normalizeLookupKey(key);
+                if (normalizedSourceKeys.has(normalizedKey)) {
+                    visit(nestedValue);
+                }
+                if (normalizedTextKeys.has(normalizedKey) && typeof nestedValue === 'string') {
+                    visit(nestedValue);
+                }
+            });
+        };
+        visit(entry);
+        return Array.from(indexes).sort((left, right) => left - right);
+    }, [extractChatSourceIndexesFromText]);
+    const ensureNodeMinimumSize = useCallback((nodeId, minWidth, minHeight) => {
+        if (!nodeId) return;
+        setNodes((prev) => {
+            let changed = false;
+            const next = prev.map((node) => {
+                if (node.id !== nodeId) return node;
+                const nextWidth = Math.max(Number(node.width) || 0, Number(minWidth) || 0);
+                const nextHeight = Math.max(Number(node.height) || 0, Number(minHeight) || 0);
+                if (nextWidth === node.width && nextHeight === node.height) return node;
+                changed = true;
+                return {
+                    ...node,
+                    width: nextWidth,
+                    height: nextHeight
+                };
+            });
+            return changed ? next : prev;
+        });
+    }, [setNodes]);
+    const fitNodeToSuggestedSize = useCallback((nodeId, targetWidth, targetHeight) => {
+        if (!nodeId) return;
+        const resolvedWidth = Math.max(520, Math.min(1120, Math.round(Number(targetWidth) || 0)));
+        const resolvedHeight = Math.max(420, Math.min(1480, Math.round(Number(targetHeight) || 0)));
+        setNodes((prev) => {
+            let changed = false;
+            const next = prev.map((node) => {
+                if (node.id !== nodeId) return node;
+                if (node.width === resolvedWidth && node.height === resolvedHeight) return node;
+                changed = true;
+                return {
+                    ...node,
+                    width: resolvedWidth,
+                    height: resolvedHeight
+                };
+            });
+            return changed ? next : prev;
+        });
+    }, [setNodes]);
+    const normalizeGeminiImagePromptSpec = useCallback((spec = {}, defaults = {}) => {
+        const toCamelKey = (value) => String(value || '')
+            .trim()
+            .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+            .replace(/[\s-]+/g, '_')
+            .toLowerCase()
+            .replace(/_([a-z0-9])/g, (_, char) => char.toUpperCase());
+        const normalizeObjectKeysDeep = (value) => {
+            if (Array.isArray(value)) return value.map(normalizeObjectKeysDeep);
+            if (!value || typeof value !== 'object') return value;
+            return Object.entries(value).reduce((acc, [key, nestedValue]) => {
+                const normalizedKey = toCamelKey(key);
+                acc[normalizedKey] = normalizeObjectKeysDeep(nestedValue);
+                return acc;
+            }, {});
+        };
+        const raw = normalizeObjectKeysDeep(spec && typeof spec === 'object' ? spec : {});
+        const cleanFieldText = (value) => {
+            const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+            if (!text) return '';
+            if (/^(not applicable|n\/a|none|null|undefined|auto|无|暂无|不适用|未提供)$/i.test(text)) {
+                return '';
+            }
+            return text;
+        };
+        const pickValue = (...values) => {
+            for (const value of values) {
+                const cleaned = cleanFieldText(value);
+                if (cleaned) {
+                    return cleaned;
+                }
+            }
+            return '';
+        };
+        const base = {
+            creativeGoal: '',
+            subject: {
+                main: '',
+                action: '',
+                appearance: '',
+                props: ''
+            },
+            scene: {
+                environment: '',
+                background: '',
+                timeOfDay: '',
+                weather: ''
+            },
+            visualStyle: {
+                style: '',
+                mood: '',
+                colorPalette: '',
+                lighting: '',
+                material: ''
+            },
+            camera: {
+                shotType: '',
+                angle: '',
+                lens: '',
+                composition: '',
+                focus: ''
+            },
+            copywriting: {
+                headline: '',
+                subheadline: '',
+                body: '',
+                callToAction: '',
+                brandName: '',
+                logoPlacement: ''
+            },
+            output: {
+                aspectRatio: String(defaults.aspectRatio || lastUsedRatio || '1:1').trim() || '1:1',
+                resolution: normalizeImageResolution(defaults.resolution || lastUsedImageResolution || '2K') || '2K',
+                imageCount: normalizeImageConcurrency(defaults.imageCount || 1)
+            },
+            negativePrompt: '',
+            editNotes: ''
+        };
+        const next = {
+            ...base,
+            creativeGoal: String(pickValue(raw.creativeGoal, raw.goal, raw.prompt, base.creativeGoal)).trim(),
+            subject: {
+                ...base.subject,
+                ...(raw.subject && typeof raw.subject === 'object' ? raw.subject : {})
+            },
+            scene: {
+                ...base.scene,
+                ...(raw.scene && typeof raw.scene === 'object' ? raw.scene : {})
+            },
+            visualStyle: {
+                ...base.visualStyle,
+                ...(raw.visualStyle && typeof raw.visualStyle === 'object' ? raw.visualStyle : {})
+            },
+            camera: {
+                ...base.camera,
+                ...(raw.camera && typeof raw.camera === 'object' ? raw.camera : {})
+            },
+            copywriting: {
+                ...base.copywriting,
+                ...(raw.copywriting && typeof raw.copywriting === 'object' ? raw.copywriting : {})
+            },
+            output: {
+                ...base.output,
+                ...(raw.output && typeof raw.output === 'object' ? raw.output : {})
+            },
+            negativePrompt: String(pickValue(raw.negativePrompt, raw.negative, base.negativePrompt)).trim(),
+            editNotes: String(pickValue(raw.editNotes, raw.notes, base.editNotes)).trim()
+        };
+        next.output.aspectRatio = String(next.output.aspectRatio || base.output.aspectRatio).trim() || base.output.aspectRatio;
+        next.output.resolution = normalizeImageResolution(next.output.resolution || base.output.resolution) || base.output.resolution;
+        next.output.imageCount = normalizeImageConcurrency(next.output.imageCount || base.output.imageCount || 1);
+        const composedOriginalSubject = [
+            next.subject.main,
+            next.subject.appearance,
+            next.subject.props
+        ].map(cleanFieldText).filter(Boolean).join(', ');
+        const composedEditStrategy = [
+            next.editNotes,
+            next.scene.background,
+            next.visualStyle.lighting
+        ].map(cleanFieldText).filter(Boolean).join(', ');
+        const rawSystemReasoning = raw.systemReasoning && typeof raw.systemReasoning === 'object' ? raw.systemReasoning : {};
+        const rawApiPayload = raw.apiPayload && typeof raw.apiPayload === 'object' ? raw.apiPayload : {};
+        next.systemReasoning = {
+            intent: cleanFieldText(pickValue(rawSystemReasoning.intent, next.creativeGoal)),
+            originalSubject: cleanFieldText(pickValue(rawSystemReasoning.originalSubject, composedOriginalSubject, next.subject.main)),
+            editStrategy: cleanFieldText(pickValue(rawSystemReasoning.editStrategy, next.editNotes, composedEditStrategy))
+        };
+        next.apiPayload = {
+            compiledPrompt: cleanFieldText(pickValue(rawApiPayload.compiledPrompt, rawApiPayload.prompt)),
+            negativePrompt: cleanFieldText(pickValue(rawApiPayload.negativePrompt, next.negativePrompt)),
+            editInstruction: cleanFieldText(pickValue(rawApiPayload.editInstruction, rawApiPayload.instruction, next.editNotes)),
+            aspectRatio: cleanFieldText(pickValue(rawApiPayload.aspectRatio, next.output.aspectRatio, base.output.aspectRatio)) || base.output.aspectRatio,
+            resolution: normalizeImageResolution(pickValue(rawApiPayload.resolution, next.output.resolution, base.output.resolution)) || base.output.resolution,
+            sampleCount: normalizeImageConcurrency(rawApiPayload.sampleCount || rawApiPayload.imageCount || next.output.imageCount || base.output.imageCount || 1)
+        };
+        next.output = {
+            aspectRatio: next.apiPayload.aspectRatio,
+            resolution: next.apiPayload.resolution,
+            imageCount: next.apiPayload.sampleCount
+        };
+        next.negativePrompt = next.apiPayload.negativePrompt;
+        next.editNotes = next.apiPayload.editInstruction || next.systemReasoning.editStrategy;
+        next.creativeGoal = next.systemReasoning.intent || next.creativeGoal;
+        return next;
+    }, [lastUsedRatio, lastUsedImageResolution]);
+    const parseGeminiImagePromptSpec = useCallback((value, defaults = {}) => {
+        const rawText = stripChatSourceFooter(String(value || '').trim());
+        if (!rawText) return normalizeGeminiImagePromptSpec({}, defaults);
+        const fencedMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+        const jsonCandidate = fencedMatch?.[1]?.trim() || rawText;
+        try {
+            const parsed = JSON.parse(jsonCandidate);
+            return normalizeGeminiImagePromptSpec(parsed, defaults);
+        } catch {
+            return normalizeGeminiImagePromptSpec({ creativeGoal: rawText }, defaults);
+        }
+    }, [normalizeGeminiImagePromptSpec, stripChatSourceFooter]);
+    const buildGeminiImageRenderPayload = useCallback((spec, defaults = {}, options = {}) => {
+        const normalized = normalizeGeminiImagePromptSpec(spec, defaults);
+        const cleanFieldText = (value) => {
+            const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+            if (!text) return '';
+            if (/^(not applicable|n\/a|none|null|undefined|auto|无|暂无|不适用|未提供)$/i.test(text)) {
+                return '';
+            }
+            return text;
+        };
+        const compactSentence = (value) => cleanFieldText(value)
+            .replace(/[，、；;]+/g, ', ')
+            .replace(/\s*,\s*/g, ', ')
+            .trim()
+            .replace(/^[,.\s]+|[,.\s]+$/g, '');
+        const uniqSegments = (values) => values
+            .map(compactSentence)
+            .filter(Boolean)
+            .filter((value, index, items) => items.findIndex((item) => item.toLowerCase() === value.toLowerCase()) === index);
+        const explicitCompiledPromptSegments = splitPromptSegments(normalized.apiPayload?.compiledPrompt || '')
+            .map(compactSentence)
+            .filter(Boolean)
+            .filter((segment) => !/^(headline text:|subheadline text:|body copy:|call to action:|brand name:|logo placement:)/i.test(segment));
+        const compiledPromptSegments = uniqSegments([
+            normalized.systemReasoning?.intent,
+            normalized.systemReasoning?.originalSubject,
+            normalized.creativeGoal,
+            normalized.subject?.main,
+            normalized.subject?.appearance,
+            normalized.subject?.action,
+            normalized.subject?.props,
+            normalized.scene?.environment,
+            normalized.scene?.background,
+            normalized.scene?.timeOfDay,
+            normalized.scene?.weather,
+            normalized.visualStyle?.style,
+            normalized.visualStyle?.mood,
+            normalized.visualStyle?.colorPalette,
+            normalized.visualStyle?.lighting,
+            normalized.visualStyle?.material,
+            normalized.camera?.shotType,
+            normalized.camera?.angle,
+            normalized.camera?.lens,
+            normalized.camera?.composition,
+            normalized.camera?.focus
+        ]);
+        const copywritingPromptSegments = uniqSegments([
+            normalized.copywriting?.headline ? `headline text: ${normalized.copywriting.headline}` : '',
+            normalized.copywriting?.subheadline ? `subheadline text: ${normalized.copywriting.subheadline}` : '',
+            normalized.copywriting?.body ? `body copy: ${normalized.copywriting.body}` : '',
+            normalized.copywriting?.callToAction ? `call to action: ${normalized.copywriting.callToAction}` : '',
+            normalized.copywriting?.brandName ? `brand name: ${normalized.copywriting.brandName}` : '',
+            normalized.copywriting?.logoPlacement ? `logo placement: ${normalized.copywriting.logoPlacement}` : ''
+        ]);
+        const compiledPrompt = uniqSegments([
+            ...(explicitCompiledPromptSegments.length > 0 ? explicitCompiledPromptSegments : compiledPromptSegments),
+            ...copywritingPromptSegments
+        ]).join(', ');
+        const hasReferenceImage = !!options.hasReferenceImage;
+        const preset = String(options.sourceEditPreset || '').trim();
+        const fallbackEditInstruction = (() => {
+            if (preset === 'upscale') {
+                return 'Upscale and restore details, keep the subject completely intact and unchanged, reduce noise and preserve real materials.';
+            }
+            if (preset === 'text-rewrite') {
+                return 'Rewrite only the masked text area, keep the product, layout and background structure intact.';
+            }
+            if (preset === 'cutout') {
+                return 'Separate the main subject cleanly, simplify the background, keep edges, shadows and materials natural.';
+            }
+            if (hasReferenceImage) {
+                return 'Keep the subject completely intact and unchanged, only edit the requested area, preserve geometry, edges and material realism.';
+            }
+            return '';
+        })();
+        const editInstruction = compactSentence(
+            normalized.apiPayload?.editInstruction
+            || normalized.systemReasoning?.editStrategy
+            || fallbackEditInstruction
+        );
+        const negativePrompt = compactSentence(normalized.apiPayload?.negativePrompt || normalized.negativePrompt);
+        const renderSegments = [];
+        if (editInstruction && hasReferenceImage) renderSegments.push(editInstruction);
+        if (compiledPrompt) renderSegments.push(compiledPrompt);
+        if (negativePrompt) renderSegments.push(`Avoid: ${negativePrompt}`);
+        const renderPrompt = renderSegments.join('. ').replace(/\.\s+\./g, '. ').trim() || compiledPrompt || editInstruction;
+        const resolvedAspectRatio = String(normalized.apiPayload?.aspectRatio || normalized.output?.aspectRatio || defaults.aspectRatio || '1:1').trim() || '1:1';
+        const resolvedResolution = normalizeImageResolution(normalized.apiPayload?.resolution || normalized.output?.resolution || defaults.resolution || '2K') || '2K';
+        const resolvedSampleCount = normalizeImageConcurrency(normalized.apiPayload?.sampleCount || normalized.output?.imageCount || defaults.imageCount || 1);
+        return {
+            ...normalized,
+            systemReasoning: {
+                intent: cleanFieldText(normalized.systemReasoning?.intent || normalized.creativeGoal),
+                originalSubject: cleanFieldText(normalized.systemReasoning?.originalSubject || normalized.subject?.main),
+                editStrategy: cleanFieldText(normalized.systemReasoning?.editStrategy || editInstruction)
+            },
+            apiPayload: {
+                compiledPrompt,
+                negativePrompt,
+                editInstruction,
+                aspectRatio: resolvedAspectRatio,
+                resolution: resolvedResolution,
+                sampleCount: resolvedSampleCount
+            },
+            renderPrompt,
+            compiledPrompt,
+            negativePrompt,
+            editInstruction,
+            output: {
+                aspectRatio: resolvedAspectRatio,
+                resolution: resolvedResolution,
+                imageCount: resolvedSampleCount
+            }
+        };
+    }, [normalizeGeminiImagePromptSpec]);
+    const stringifyGeminiImagePromptSpec = useCallback((spec, defaults = {}) => {
+        const normalized = buildGeminiImageRenderPayload(spec, defaults);
+        const compactObject = (value, { keepZero = false } = {}) => {
+            const next = {};
+            Object.entries(value || {}).forEach(([key, rawValue]) => {
+                if (rawValue === null || rawValue === undefined) return;
+                if (typeof rawValue === 'number') {
+                    if (rawValue === 0 && !keepZero) return;
+                    next[key] = rawValue;
+                    return;
+                }
+                const text = String(rawValue).trim();
+                if (!text) return;
+                if (/^(not applicable|n\/a|none|null|undefined|无|暂无|不适用|未提供)$/i.test(text)) return;
+                next[key] = rawValue;
+            });
+            return next;
+        };
+        return JSON.stringify({
+            SYSTEM_REASONING: compactObject({
+                INTENT: normalized.systemReasoning?.intent || '',
+                ORIGINAL_SUBJECT: normalized.systemReasoning?.originalSubject || '',
+                EDIT_STRATEGY: normalized.systemReasoning?.editStrategy || ''
+            }),
+            COPYWRITING: compactObject({
+                HEADLINE: normalized.copywriting?.headline || '',
+                SUBHEADLINE: normalized.copywriting?.subheadline || '',
+                BODY: normalized.copywriting?.body || '',
+                CALL_TO_ACTION: normalized.copywriting?.callToAction || '',
+                BRAND_NAME: normalized.copywriting?.brandName || '',
+                LOGO_PLACEMENT: normalized.copywriting?.logoPlacement || ''
+            }),
+            API_PAYLOAD: compactObject({
+                COMPILED_PROMPT: normalized.apiPayload?.compiledPrompt || '',
+                EDIT_INSTRUCTION: normalized.apiPayload?.editInstruction || '',
+                NEGATIVE_PROMPT: normalized.apiPayload?.negativePrompt || '',
+                ASPECT_RATIO: normalized.apiPayload?.aspectRatio || defaults.aspectRatio || '1:1',
+                RESOLUTION: normalized.apiPayload?.resolution || defaults.resolution || '2K',
+                SAMPLE_COUNT: normalizeImageConcurrency(normalized.apiPayload?.sampleCount || defaults.imageCount || 1)
+            }, { keepZero: true })
+        }, null, 2);
+    }, [buildGeminiImageRenderPayload]);
+    const buildChatWorkflowPromptPayload = useCallback((entry, defaults = {}) => {
+        if (typeof entry === 'string') {
+            return extractActionablePromptFromChatMessage(entry);
+        }
+        if (!entry || typeof entry !== 'object') return '';
+        const directPayload = [
+            entry.promptSpec,
+            entry.promptJson,
+            entry.promptJSON,
+            entry.payload,
+            entry.workflow,
+            entry.spec,
+            entry.json,
+            entry.data
+        ].find((value) => (
+            typeof value === 'string'
+                ? value.trim()
+                : value && typeof value === 'object' && !Array.isArray(value)
+        ));
+        if (directPayload) return directPayload;
+        const structuredKeys = new Set([
+            'SYSTEM_REASONING',
+            'API_PAYLOAD',
+            'COPYWRITING',
+            'CREATIVE_GOAL',
+            'SUBJECT',
+            'SCENE',
+            'VISUAL_STYLE',
+            'CAMERA',
+            'OUTPUT',
+            'NEGATIVE_PROMPT',
+            'EDIT_NOTES'
+        ]);
+        if (Object.keys(entry).some((key) => structuredKeys.has(String(key).toUpperCase()))) {
+            return entry;
+        }
+        const promptText = [
+            entry.compiledPrompt,
+            entry.prompt,
+            entry.promptText,
+            entry.prompt_text,
+            entry.content,
+            entry.text,
+            entry.description,
+            entry.requirement,
+            entry.requirements
+        ].find((value) => typeof value === 'string' && value.trim());
+        const actionablePrompt = extractActionablePromptFromChatMessage(promptText || '');
+        const systemReasoning = entry.systemReasoning && typeof entry.systemReasoning === 'object' ? entry.systemReasoning : {};
+        const apiPayload = entry.apiPayload && typeof entry.apiPayload === 'object' ? entry.apiPayload : {};
+        const copywriting = entry.copywriting && typeof entry.copywriting === 'object' ? entry.copywriting : {};
+        return {
+            systemReasoning: {
+                intent: entry.intent || entry.goal || entry.title || entry.name || entry.label || systemReasoning.intent || '',
+                originalSubject: entry.originalSubject || systemReasoning.originalSubject || '',
+                editStrategy: entry.editStrategy || entry.instruction || entry.editNotes || systemReasoning.editStrategy || ''
+            },
+            copywriting: {
+                headline: entry.headline || copywriting.headline || '',
+                subheadline: entry.subheadline || copywriting.subheadline || '',
+                body: entry.body || copywriting.body || '',
+                callToAction: entry.callToAction || entry.cta || copywriting.callToAction || '',
+                brandName: entry.brandName || entry.brand || copywriting.brandName || '',
+                logoPlacement: entry.logoPlacement || copywriting.logoPlacement || ''
+            },
+            apiPayload: {
+                compiledPrompt: apiPayload.compiledPrompt || actionablePrompt || promptText || '',
+                negativePrompt: entry.negativePrompt || entry.negative || apiPayload.negativePrompt || '',
+                editInstruction: entry.editInstruction || entry.instruction || apiPayload.editInstruction || '',
+                aspectRatio: entry.aspectRatio || entry.ratio || apiPayload.aspectRatio || defaults.aspectRatio || '',
+                resolution: entry.resolution || apiPayload.resolution || defaults.resolution || '',
+                sampleCount: entry.sampleCount || entry.imageCount || apiPayload.sampleCount || defaults.imageCount || 1
+            }
+        };
+    }, [extractActionablePromptFromChatMessage]);
+    const parseChatImageWorkflowBlueprints = useCallback((assistantText, sourceFiles = [], defaults = {}) => {
+        const rawText = stripChatSourceFooter(assistantText);
+        if (!rawText) return [];
+        const sourceCount = Array.isArray(sourceFiles) ? sourceFiles.length : 0;
+        const allSourceIndexes = Array.from({ length: sourceCount }, (_, index) => index);
+        const tryParseJson = (value) => {
+            const candidate = String(value || '').trim();
+            if (!candidate) return null;
+            try {
+                return JSON.parse(candidate);
+            } catch {
+                return null;
+            }
+        };
+        const expandParsedEntries = (parsed) => {
+            if (!parsed) return [];
+            if (Array.isArray(parsed)) return parsed;
+            if (typeof parsed !== 'object') return [];
+            const rootSourceRefs = resolveChatWorkflowSourceIndexes(parsed, sourceCount);
+            const nestedArray = Object.entries(parsed).find(([key, value]) => (
+                Array.isArray(value)
+                && /^(workflows|items|prompts|variants|plans|results|outputs|schemes|scenes|images)$/i.test(String(key))
+            ));
+            if (nestedArray?.[1]?.length) {
+                return nestedArray[1].map((item) => {
+                    if (item && typeof item === 'object' && !Array.isArray(item)) {
+                        return {
+                            __rootSourceRefs: rootSourceRefs,
+                            ...item
+                        };
+                    }
+                    return {
+                        prompt: item,
+                        sourceRefs: rootSourceRefs
+                    };
+                });
+            }
+            return [parsed];
+        };
+        const splitTextBlocks = (value) => {
+            const blocks = [];
+            const lines = String(value || '').split(/\r?\n/);
+            const isBoundary = (line) => {
+                const normalized = String(line || '').trim();
+                if (!normalized) return false;
+                if (/^(?:方案|提示词|prompt|workflow)\s*#?\s*\d+\s*[:：-]?/i.test(normalized)) return true;
+                if (/^\d+[.)、]\s*(?:方案|提示词|prompt|workflow|素材#?\d+)/i.test(normalized)) return true;
+                return false;
+            };
+            let current = [];
+            lines.forEach((line) => {
+                if (isBoundary(line) && current.length > 0) {
+                    blocks.push(current.join('\n').trim());
+                    current = [line];
+                    return;
+                }
+                current.push(line);
+            });
+            if (current.length > 0) {
+                blocks.push(current.join('\n').trim());
+            }
+            return blocks.filter(Boolean);
+        };
+        const collectEntries = (() => {
+            const directParsedEntries = expandParsedEntries(tryParseJson(rawText));
+            if (directParsedEntries.length > 0) return directParsedEntries;
+            const fencedMatches = Array.from(rawText.matchAll(/```(?:json|prompt|text|markdown)?\s*([\s\S]*?)```/gi));
+            if (fencedMatches.length > 1) {
+                return fencedMatches.map((match, index) => {
+                    const previousMatch = fencedMatches[index - 1];
+                    const headerStart = previousMatch ? previousMatch.index + previousMatch[0].length : 0;
+                    const header = rawText.slice(headerStart, match.index).trim();
+                    const prompt = String(match[1] || '').trim();
+                    const title = header
+                        .split(/\r?\n/)
+                        .map((line) => line.trim())
+                        .filter(Boolean)
+                        .slice(-1)[0] || `方案#${index + 1}`;
+                    return {
+                        title,
+                        description: header,
+                        sourceRefs: extractChatSourceIndexesFromText(header || rawText, sourceCount),
+                        prompt
+                    };
+                }).filter((entry) => String(entry.prompt || '').trim());
+            }
+            const primaryPromptCandidate = extractActionablePromptFromChatMessage(rawText);
+            if (primaryPromptCandidate && primaryPromptCandidate !== rawText) {
+                const primaryParsedEntries = expandParsedEntries(tryParseJson(primaryPromptCandidate));
+                if (primaryParsedEntries.length > 0) return primaryParsedEntries;
+            }
+            const textBlocks = splitTextBlocks(rawText);
+            if (textBlocks.length > 1) {
+                return textBlocks.map((block) => ({
+                    prompt: block,
+                    description: block,
+                    sourceRefs: extractChatSourceIndexesFromText(block, sourceCount)
+                }));
+            }
+            return [rawText];
+        })();
+        const blueprintList = collectEntries.map((entry, index) => {
+            const promptPayload = buildChatWorkflowPromptPayload(entry, defaults);
+            if (!promptPayload) return null;
+            const normalizedPromptSpec = typeof promptPayload === 'string'
+                ? parseGeminiImagePromptSpec(promptPayload, defaults)
+                : normalizeGeminiImagePromptSpec(promptPayload, defaults);
+            const promptJson = stringifyGeminiImagePromptSpec(normalizedPromptSpec, defaults);
+            if (!promptJson) return null;
+            const promptSpec = parseGeminiImagePromptSpec(promptJson, defaults);
+            const hasMeaningfulPrompt = [
+                promptSpec?.apiPayload?.compiledPrompt,
+                promptSpec?.apiPayload?.editInstruction,
+                promptSpec?.apiPayload?.negativePrompt,
+                promptSpec?.systemReasoning?.intent,
+                promptSpec?.systemReasoning?.originalSubject
+            ].some((value) => String(value || '').trim());
+            if (!hasMeaningfulPrompt) return null;
+            const requirementsText = stripChatSourceFooter(
+                typeof entry === 'string'
+                    ? entry
+                    : [
+                        entry.title || entry.name || entry.label || '',
+                        entry.description || entry.notes || entry.comment || '',
+                        typeof promptPayload === 'string' ? promptPayload : ''
+                    ].filter(Boolean).join('\n')
+            );
+            return {
+                label: typeof entry === 'object' && entry
+                    ? String(entry.title || entry.name || entry.label || `方案#${index + 1}`).trim() || `方案#${index + 1}`
+                    : `方案#${index + 1}`,
+                promptSpec,
+                promptJson,
+                requirementsText,
+                sourceIndexes: resolveChatWorkflowSourceIndexes(entry, sourceCount)
+            };
+        }).filter(Boolean);
+        if (blueprintList.length === 0) return [];
+        const hasExplicitSourceRefs = blueprintList.some((item) => Array.isArray(item.sourceIndexes) && item.sourceIndexes.length > 0);
+        const explicitAssignedIndexes = new Set(
+            blueprintList.flatMap((item) => Array.isArray(item.sourceIndexes) ? item.sourceIndexes : [])
+        );
+        const missingBlueprintIndexes = blueprintList
+            .map((item, index) => (Array.isArray(item.sourceIndexes) && item.sourceIndexes.length > 0 ? null : index))
+            .filter((value) => value !== null);
+        return blueprintList.map((item, index) => {
+            let sourceIndexes = Array.isArray(item.sourceIndexes)
+                ? Array.from(new Set(item.sourceIndexes)).filter((sourceIndex) => sourceIndex >= 0 && sourceIndex < sourceCount)
+                : [];
+            if (sourceCount === 0) {
+                sourceIndexes = [];
+            } else if (sourceIndexes.length === 0) {
+                if (blueprintList.length === 1) {
+                    sourceIndexes = allSourceIndexes;
+                } else if (sourceCount === 1) {
+                    sourceIndexes = [0];
+                } else if (!hasExplicitSourceRefs && blueprintList.length === sourceCount) {
+                    sourceIndexes = [index];
+                } else {
+                    const remainingIndexes = allSourceIndexes.filter((sourceIndex) => !explicitAssignedIndexes.has(sourceIndex));
+                    if (hasExplicitSourceRefs && remainingIndexes.length === missingBlueprintIndexes.length) {
+                        const missingOrder = missingBlueprintIndexes.indexOf(index);
+                        const mappedIndex = missingOrder >= 0 ? remainingIndexes[missingOrder] : null;
+                        sourceIndexes = mappedIndex === null || mappedIndex === undefined ? remainingIndexes : [mappedIndex];
+                    } else if (hasExplicitSourceRefs && remainingIndexes.length > 0) {
+                        sourceIndexes = remainingIndexes;
+                    } else {
+                        sourceIndexes = allSourceIndexes;
+                    }
+                }
+            }
+            return {
+                ...item,
+                sourceIndexes
+            };
+        });
+    }, [
+        stripChatSourceFooter,
+        extractActionablePromptFromChatMessage,
+        extractChatSourceIndexesFromText,
+        resolveChatWorkflowSourceIndexes,
+        buildChatWorkflowPromptPayload,
+        parseGeminiImagePromptSpec,
+        normalizeGeminiImagePromptSpec,
+        stringifyGeminiImagePromptSpec
+    ]);
+    const getDefaultImagePromptConsoleState = useCallback((hasReferenceImage = false) => ({
+        stylePreset: '',
+        backgroundPreset: 'auto',
+        lightingPreset: 'auto',
+        shadowPreset: 'auto',
+        fidelity: hasReferenceImage ? 95 : 80,
+        negativeFlags: IMAGE_NEGATIVE_FLAG_DEFS.reduce((acc, item) => {
+            acc[item.id] = true;
+            return acc;
+        }, {})
+    }), []);
+    const estimateImageNodeDisplaySize = useCallback((content = {}) => {
+        const promptText = String(content.prompt || '').trim();
+        const extraRequirements = String(content.extraRequirements || '').trim();
+        const agentRequirements = String(content.agentRequirements || '').trim();
+        const previewText = String(content.previewText || '').trim();
+        const mergedText = [promptText, extraRequirements, agentRequirements, previewText].filter(Boolean).join('\n');
+        const rawLines = mergedText ? mergedText.split(/\r?\n/) : [];
+        const longestLine = rawLines.reduce((max, line) => Math.max(max, String(line || '').length), 0);
+        const wrappedLines = rawLines.reduce((sum, line) => sum + Math.max(1, Math.ceil(String(line || '').length / 96)), 0);
+        const contentDensity = Math.ceil((promptText.length + extraRequirements.length + agentRequirements.length + previewText.length) / 340);
+        let width = 660 + Math.max(0, Math.ceil((longestLine - 84) / 20) * 32);
+        if (content.previewOpen) width += 70;
+        if (content.jsonOpen) width += 120;
+        const resolvedWidth = Math.min(1120, Math.max(620, Math.round(width)));
+        let height = 500 + Math.max(0, (wrappedLines - 7) * 12) + Math.max(0, contentDensity - 2) * 8;
+        if (content.advancedOpen) height += content.hasReferenceImage ? 230 : 180;
+        if (content.previewOpen) height += 150;
+        if (content.jsonOpen) height += 180;
+        if (content.hasReferenceImage) height += 28;
+        return {
+            width: resolvedWidth,
+            height: Math.min(1480, Math.max(500, Math.round(height)))
+        };
+    }, []);
+    const getImageMaterialHint = useCallback((subjectText) => {
+        const normalized = String(subjectText || '').toLowerCase();
+        if (!normalized) return 'realistic product material texture';
+        if (/(pump|vacuum|industrial|metal|gauge|instrument|hardware|valve|compressor|五金|泵|真空|仪表|工业)/i.test(normalized)) {
+            return 'matte black plastic casing, brushed steel gauge, anodized aluminum fittings';
+        }
+        if (/(bottle|packaging|cosmetic|jar|box|包装|瓶|罐)/i.test(normalized)) {
+            return 'premium packaging material texture, clean label edges, realistic reflections';
+        }
+        return 'realistic product material texture, clean surface finish';
+    }, []);
+    const deriveImagePromptConsoleState = useCallback((spec, existingState = null, hasReferenceImage = false) => {
+        const defaults = getDefaultImagePromptConsoleState(hasReferenceImage);
+        const promptText = String(spec?.apiPayload?.compiledPrompt || '').toLowerCase();
+        const negativeText = String(spec?.apiPayload?.negativePrompt || '').toLowerCase();
+        const editText = String(spec?.apiPayload?.editInstruction || spec?.systemReasoning?.editStrategy || '').toLowerCase();
+        const inferBackgroundPreset = () => {
+            if (promptText.includes('marble')) return 'marble-table';
+            if (promptText.includes('workbench') || promptText.includes('workshop')) return 'industrial-workbench';
+            if (promptText.includes('gray') || promptText.includes('grey')) return 'luxury-gray';
+            return 'auto';
+        };
+        const inferLightingPreset = () => {
+            if (promptText.includes('rim light') || promptText.includes('rim lighting') || promptText.includes('contour highlights')) return 'hard-rim';
+            if (promptText.includes('sunlight') || promptText.includes('daylight')) return 'natural-sun';
+            return 'auto';
+        };
+        const inferShadowPreset = () => {
+            if (promptText.includes('no visible shadow')) return 'no-shadow';
+            if (promptText.includes('long directional side shadow')) return 'side-long';
+            return 'auto';
+        };
+        const inferStylePreset = () => {
+            if (promptText.includes('glossy white acrylic surface') || promptText.includes('mirror reflection beneath the product')) return 'white-reflection';
+            if (promptText.includes('neutral light gray background') || promptText.includes('diagonal drop shadow')) return 'gray-side-shadow';
+            if (promptText.includes('professional workshop environment') || promptText.includes('industrial metallic') || promptText.includes('85mm lens') || promptText.includes('f/1.8')) return 'pro-workbench-dof';
+            if (promptText.includes('pure white seamless background') || promptText.includes('contact shadow directly beneath the product')) return 'white-soft-shadow';
+            return '';
+        };
+        const inferFidelity = () => {
+            if (!hasReferenceImage) return defaults.fidelity;
+            if (editText.includes('completely intact and unchanged')) return 95;
+            if (editText.includes('subtle cleanup') || editText.includes('allow subtle')) return 60;
+            if (editText.includes('broader cleanup') || editText.includes('allow broader')) return 45;
+            return defaults.fidelity;
+        };
+        const next = {
+            stylePreset: existingState?.stylePreset ?? inferStylePreset(),
+            backgroundPreset: existingState?.backgroundPreset || inferBackgroundPreset(),
+            lightingPreset: existingState?.lightingPreset || inferLightingPreset(),
+            shadowPreset: existingState?.shadowPreset || inferShadowPreset(),
+            fidelity: Number.isFinite(Number(existingState?.fidelity)) ? Number(existingState.fidelity) : inferFidelity(),
+            negativeFlags: { ...defaults.negativeFlags }
+        };
+        IMAGE_NEGATIVE_FLAG_DEFS.forEach((flag) => {
+            if (typeof existingState?.negativeFlags?.[flag.id] === 'boolean') {
+                next.negativeFlags[flag.id] = existingState.negativeFlags[flag.id];
+                return;
+            }
+            if (flag.id === 'preserve-proportion') {
+                next.negativeFlags[flag.id] = /(proportion|structural|interface|distorted)/i.test(negativeText) || defaults.negativeFlags[flag.id];
+            } else if (flag.id === 'clean-background') {
+                next.negativeFlags[flag.id] = /(messy background|clutter|props)/i.test(negativeText) || defaults.negativeFlags[flag.id];
+            } else if (flag.id === 'no-extra-text') {
+                next.negativeFlags[flag.id] = /(extra text|watermark|label)/i.test(negativeText) || defaults.negativeFlags[flag.id];
+            } else if (flag.id === 'logical-shadow') {
+                next.negativeFlags[flag.id] = /(shadow)/i.test(negativeText) || defaults.negativeFlags[flag.id];
+            }
+        });
+        return next;
+    }, [getDefaultImagePromptConsoleState]);
+    const imagePromptRenderCacheRef = useRef(new Map());
+    const getCachedImagePromptRenderState = useCallback((node, connectedImageCount = 0) => {
+        if (!node || node.type !== 'gen-image') return null;
+        const defaults = {
+            aspectRatio: node.settings?.ratio || lastUsedRatio || '1:1',
+            resolution: node.settings?.resolution || lastUsedImageResolution || '2K',
+            imageCount: node.settings?.imageConcurrency || node.settings?.concurrentImages || 1
+        };
+        const promptSeed = String(node.settings?.prompt || '').trim();
+        const specSeed = promptSeed || JSON.stringify(node.settings?.geminiImagePromptSpec || {});
+        const consoleSeed = JSON.stringify(node.settings?.imagePromptConsole || {});
+        const cacheKey = [
+            node.settings?.model || '',
+            specSeed,
+            consoleSeed,
+            defaults.aspectRatio,
+            defaults.resolution,
+            defaults.imageCount,
+            connectedImageCount,
+            node.settings?.sourceEditPreset || ''
+        ].join('||');
+        const cached = imagePromptRenderCacheRef.current.get(node.id);
+        if (cached?.key === cacheKey) {
+            return cached.value;
+        }
+        const parsedSpec = node.settings?.geminiImagePromptSpec || parseGeminiImagePromptSpec(promptSeed, defaults);
+        const normalizedPromptSpec = normalizeGeminiImagePromptSpec(parsedSpec, defaults);
+        const imagePromptSpec = buildGeminiImageRenderPayload(parsedSpec, defaults, {
+            hasReferenceImage: connectedImageCount > 0,
+            sourceEditPreset: node.settings?.sourceEditPreset
+        });
+        const imagePromptConsole = deriveImagePromptConsoleState(imagePromptSpec, node.settings?.imagePromptConsole || null, connectedImageCount > 0);
+        const nextValue = {
+            defaults,
+            normalizedPromptSpec,
+            imagePromptSpec,
+            imagePromptConsole
+        };
+        imagePromptRenderCacheRef.current.set(node.id, { key: cacheKey, value: nextValue });
+        if (imagePromptRenderCacheRef.current.size > 80) {
+            const oldestKey = imagePromptRenderCacheRef.current.keys().next().value;
+            if (oldestKey) imagePromptRenderCacheRef.current.delete(oldestKey);
+        }
+        return nextValue;
+    }, [
+        lastUsedRatio,
+        lastUsedImageResolution,
+        parseGeminiImagePromptSpec,
+        normalizeGeminiImagePromptSpec,
+        buildGeminiImageRenderPayload,
+        deriveImagePromptConsoleState
+    ]);
+    const applyImagePromptTextToNodeRef = useRef(null);
+    const updateImagePromptConsole = useCallback((nodeId, patch = {}) => {
+        const targetNode = nodesMap.get(nodeId);
+        if (!targetNode || targetNode.type !== 'gen-image') return;
+        const defaults = {
+            aspectRatio: targetNode.settings?.ratio || lastUsedRatio || '1:1',
+            resolution: targetNode.settings?.resolution || lastUsedImageResolution || '2K',
+            imageCount: targetNode.settings?.imageConcurrency || targetNode.settings?.concurrentImages || 1
+        };
+        const currentSpec = parseGeminiImagePromptSpec(targetNode.settings?.prompt || '', defaults);
+        const hasReferenceImage = getConnectedInputImages(nodeId).length > 0;
+        const currentConsole = deriveImagePromptConsoleState(currentSpec, targetNode.settings?.imagePromptConsole || null, hasReferenceImage);
+        const nextConsole = {
+            ...currentConsole,
+            ...patch,
+            negativeFlags: {
+                ...currentConsole.negativeFlags,
+                ...(patch?.negativeFlags || {})
+            }
+        };
+        const stylePresetDef = IMAGE_ECOMMERCE_STYLE_PRESETS.find((item) => item.id === nextConsole.stylePreset) || null;
+        const getPresetPrompt = (collection, id) => {
+            if (!id || id === 'auto') return '';
+            return collection.find((item) => item.id === id)?.prompt || '';
+        };
+        const fidelity = Math.max(0, Math.min(100, Number(nextConsole.fidelity || currentConsole.fidelity || 80)));
+        const lockedSubject = String(
+            currentSpec.systemReasoning?.originalSubject
+            || currentSpec.subject?.main
+            || currentSpec.systemReasoning?.intent
+            || ''
+        ).trim();
+        const materialHint = getImageMaterialHint(lockedSubject || currentSpec.apiPayload?.compiledPrompt || '');
+        const fidelityInstruction = hasReferenceImage
+            ? fidelity >= 90
+                ? 'Keep the subject completely intact and unchanged, only update the background and lighting.'
+                : fidelity >= 70
+                    ? 'Preserve geometry, labels and interfaces, allow subtle cleanup and material enhancement.'
+                    : fidelity >= 50
+                        ? 'Preserve the core structure, allow visible cleanup and stronger material polishing.'
+                        : 'Preserve the main product identity, allow broader cleanup and stronger restaging.'
+            : '';
+        const normalizedCurrentNegative = splitPromptSegments(currentSpec.apiPayload?.negativePrompt || '');
+        const customNegativeSegments = normalizedCurrentNegative.filter((segment) => {
+            const lower = segment.toLowerCase();
+            if (IMAGE_ECOMMERCE_PRESET_NEGATIVE_SEGMENTS.some((presetSegment) => lower === presetSegment || lower.includes(presetSegment) || presetSegment.includes(lower))) {
+                return false;
+            }
+            return !IMAGE_NEGATIVE_FLAG_DEFS.some((flag) => lower.includes(flag.prompt.split(',')[0].trim().toLowerCase()));
+        });
+        const nextNegativeSegments = [
+            ...customNegativeSegments,
+            ...splitPromptSegments(stylePresetDef?.negativePromptAddon || ''),
+            ...IMAGE_NEGATIVE_FLAG_DEFS.filter((flag) => nextConsole.negativeFlags?.[flag.id]).map((flag) => flag.prompt)
+        ].filter(Boolean);
+        const hasConsoleStyleOverride = !!stylePresetDef
+            || (nextConsole.backgroundPreset && nextConsole.backgroundPreset !== 'auto')
+            || (nextConsole.lightingPreset && nextConsole.lightingPreset !== 'auto')
+            || (nextConsole.shadowPreset && nextConsole.shadowPreset !== 'auto');
+        const existingCompiledSegments = splitPromptSegments(currentSpec.apiPayload?.compiledPrompt || '');
+        const selectedConsoleSegments = [
+            ...(stylePresetDef ? splitPromptSegments(stylePresetDef.stylePrompt) : []),
+            ...(!stylePresetDef ? splitPromptSegments(getPresetPrompt(IMAGE_BACKGROUND_PRESETS, nextConsole.backgroundPreset)) : []),
+            ...(!stylePresetDef ? splitPromptSegments(getPresetPrompt(IMAGE_LIGHTING_PRESETS, nextConsole.lightingPreset)) : []),
+            ...(!stylePresetDef ? splitPromptSegments(getPresetPrompt(IMAGE_SHADOW_PRESETS, nextConsole.shadowPreset)) : [])
+        ];
+        const customCompiledSegments = existingCompiledSegments.filter((segment) => {
+            const lower = segment.toLowerCase();
+            if (lockedSubject && lower === lockedSubject.toLowerCase()) return false;
+            if (selectedConsoleSegments.some((item) => lower === item.toLowerCase())) return false;
+            if (IMAGE_CONSOLE_PRESET_PROMPT_SEGMENTS.some((item) => lower === item || lower.includes(item) || item.includes(lower))) {
+                return false;
+            }
+            return true;
+        });
+        const compiledSegments = hasConsoleStyleOverride
+            ? [
+                lockedSubject,
+                ...customCompiledSegments,
+                ...selectedConsoleSegments,
+                materialHint,
+                currentSpec.visualStyle?.style,
+                currentSpec.camera?.lens,
+                currentSpec.camera?.composition
+            ].map((item) => String(item || '').trim()).filter(Boolean).filter((item, index, items) => items.findIndex((entry) => entry.toLowerCase() === item.toLowerCase()) === index)
+            : existingCompiledSegments.length > 0
+                ? existingCompiledSegments
+                : [
+                    lockedSubject,
+                    materialHint,
+                    currentSpec.visualStyle?.style,
+                    currentSpec.camera?.lens,
+                    currentSpec.camera?.composition
+                ].map((item) => String(item || '').trim()).filter(Boolean).filter((item, index, items) => items.findIndex((entry) => entry.toLowerCase() === item.toLowerCase()) === index);
+        const nextSpec = {
+            ...currentSpec,
+            systemReasoning: {
+                ...currentSpec.systemReasoning,
+                originalSubject: lockedSubject || currentSpec.systemReasoning?.originalSubject || '',
+                editStrategy: [fidelityInstruction, currentSpec.systemReasoning?.editStrategy].filter(Boolean).filter((item, index, items) => items.findIndex((entry) => entry.toLowerCase() === item.toLowerCase()) === index).join(' ')
+            },
+            apiPayload: {
+                ...currentSpec.apiPayload,
+                compiledPrompt: compiledSegments.join(', '),
+                negativePrompt: nextNegativeSegments.filter((item, index, items) => items.findIndex((entry) => entry.toLowerCase() === item.toLowerCase()) === index).join(', '),
+                editInstruction: [fidelityInstruction, currentSpec.apiPayload?.editInstruction].filter(Boolean).filter((item, index, items) => items.findIndex((entry) => entry.toLowerCase() === item.toLowerCase()) === index).join(' '),
+                aspectRatio: currentSpec.output?.aspectRatio || defaults.aspectRatio,
+                resolution: currentSpec.output?.resolution || defaults.resolution,
+                sampleCount: currentSpec.output?.imageCount || defaults.imageCount
+            }
+        };
+        if (!applyImagePromptTextToNodeRef.current) return;
+        applyImagePromptTextToNodeRef.current(nodeId, stringifyGeminiImagePromptSpec(nextSpec, defaults), {
+            linkedPromptNodeId: targetNode.settings?.linkedPromptNodeId || undefined,
+            imagePromptConsole: {
+                ...nextConsole,
+                fidelity
+            }
+        });
+    }, [
+        nodesMap,
+        parseGeminiImagePromptSpec,
+        lastUsedRatio,
+        lastUsedImageResolution,
+        getConnectedInputImages,
+        deriveImagePromptConsoleState,
+        getImageMaterialHint,
+        stringifyGeminiImagePromptSpec
+    ]);
+    const isGeminiImageModelKey = useCallback((modelKey) => {
+        const config = getApiConfigByKey(modelKey);
+        if (!config || !isImageModelType(config.type)) return false;
+        const modelId = String(config.id || config.modelName || modelKey || '').toLowerCase();
+        return modelId.includes('gemini') || modelId.includes('imagen');
+    }, [getApiConfigByKey]);
+    const applyImagePromptTextToNode = useCallback((nodeId, promptText, extraUpdates = {}) => {
+        const targetNode = nodesMap.get(nodeId) || {
+            id: nodeId,
+            type: 'gen-image',
+            settings: {}
+        };
+        if (targetNode.type !== 'gen-image') return { applied: false };
+        const rawPrompt = String(promptText || '').trim();
+        if (!rawPrompt) return { applied: false };
+        const baseSettings = targetNode.settings || {};
+        const modelKey = extraUpdates.model || baseSettings.model || preferredGeminiImageModel;
+        const defaults = {
+            aspectRatio: extraUpdates.ratio || baseSettings.ratio || lastUsedRatio || '1:1',
+            resolution: extraUpdates.resolution || baseSettings.resolution || lastUsedImageResolution || '2K',
+            imageCount: extraUpdates.imageConcurrency || extraUpdates.concurrentImages || baseSettings.imageConcurrency || baseSettings.concurrentImages || 1
+        };
+        const modelConfig = getApiConfigByKey(modelKey);
+        const shouldUseStructuredPrompt = !!modelConfig
+            && isImageModelType(modelConfig.type)
+            && (
+                isGeminiImageModelKey(modelKey)
+                || rawPrompt.startsWith('{')
+                || rawPrompt.startsWith('[')
+                || !!baseSettings.geminiImagePromptSpec
+            );
+        const linkedPromptNodeId = Object.prototype.hasOwnProperty.call(extraUpdates, 'linkedPromptNodeId')
+            ? String(extraUpdates.linkedPromptNodeId || '').trim()
+            : String(baseSettings.linkedPromptNodeId || '').trim();
+        if (shouldUseStructuredPrompt) {
+            const fencedMatch = rawPrompt.match(/```(?:json)?\s*([\s\S]*?)```/i);
+            const jsonCandidate = (fencedMatch?.[1] || rawPrompt).trim();
+            const looksLikeJson = jsonCandidate.startsWith('{') || jsonCandidate.startsWith('[');
+            if (looksLikeJson) {
+                try {
+                    JSON.parse(jsonCandidate);
+                } catch {
+                    updateNodeSettings(nodeId, {
+                        ...extraUpdates,
+                        prompt: rawPrompt,
+                        linkedPromptNodeId: linkedPromptNodeId || undefined
+                    });
+                    if (linkedPromptNodeId) {
+                        updateNodeSettings(linkedPromptNodeId, { text: rawPrompt });
+                    }
+                    return { applied: true, promptText: rawPrompt, spec: baseSettings.geminiImagePromptSpec || null };
+                }
+            }
+            const promptSpec = parseGeminiImagePromptSpec(rawPrompt, defaults);
+            const promptJson = stringifyGeminiImagePromptSpec(promptSpec, defaults);
+            const imageCount = normalizeImageConcurrency(promptSpec.output?.imageCount || defaults.imageCount || 1);
+            const nextSizing = estimateImageNodeDisplaySize({
+                prompt: promptSpec.apiPayload?.compiledPrompt || promptSpec.renderPrompt || rawPrompt,
+                extraRequirements: extraUpdates.extraRequirements ?? baseSettings.extraRequirements,
+                agentRequirements: extraUpdates.agentRequirements ?? baseSettings.agentRequirements,
+                previewOpen: extraUpdates.imagePromptPreviewOpen ?? baseSettings.imagePromptPreviewOpen,
+                jsonOpen: extraUpdates.imagePromptJsonOpen ?? baseSettings.imagePromptJsonOpen,
+                advancedOpen: extraUpdates.imagePromptAdvancedOpen ?? baseSettings.imagePromptAdvancedOpen
+            });
+            updateNodeSettings(nodeId, {
+                ...extraUpdates,
+                prompt: promptJson,
+                geminiImagePromptSpec: promptSpec,
+                linkedPromptNodeId: linkedPromptNodeId || undefined,
+                ratio: promptSpec.output?.aspectRatio || defaults.aspectRatio,
+                resolution: normalizeImageResolution(promptSpec.output?.resolution || defaults.resolution) || defaults.resolution,
+                imageConcurrency: imageCount,
+                concurrentImages: imageCount
+            });
+            ensureNodeMinimumSize(nodeId, nextSizing.width, nextSizing.height);
+            if (linkedPromptNodeId) {
+                updateNodeSettings(linkedPromptNodeId, { text: promptJson });
+            }
+            return { applied: true, promptText: promptJson, spec: promptSpec };
+        }
+        const nextSizing = estimateImageNodeDisplaySize({
+            prompt: rawPrompt,
+            extraRequirements: extraUpdates.extraRequirements ?? baseSettings.extraRequirements,
+            agentRequirements: extraUpdates.agentRequirements ?? baseSettings.agentRequirements,
+            previewOpen: extraUpdates.imagePromptPreviewOpen ?? baseSettings.imagePromptPreviewOpen,
+            jsonOpen: extraUpdates.imagePromptJsonOpen ?? baseSettings.imagePromptJsonOpen,
+            advancedOpen: extraUpdates.imagePromptAdvancedOpen ?? baseSettings.imagePromptAdvancedOpen
+        });
+        updateNodeSettings(nodeId, {
+            ...extraUpdates,
+            prompt: rawPrompt,
+            linkedPromptNodeId: linkedPromptNodeId || undefined
+        });
+        ensureNodeMinimumSize(nodeId, nextSizing.width, nextSizing.height);
+        if (linkedPromptNodeId) {
+            updateNodeSettings(linkedPromptNodeId, { text: rawPrompt });
+        }
+        return { applied: true, promptText: rawPrompt, spec: null };
+    }, [
+        nodesMap,
+        updateNodeSettings,
+        ensureNodeMinimumSize,
+        estimateImageNodeDisplaySize,
+        getApiConfigByKey,
+        isImageModelType,
+        isGeminiImageModelKey,
+        parseGeminiImagePromptSpec,
+        stringifyGeminiImagePromptSpec,
+        preferredGeminiImageModel,
+        lastUsedRatio,
+        lastUsedImageResolution
+    ]);
+    useEffect(() => {
+        applyImagePromptTextToNodeRef.current = applyImagePromptTextToNode;
+    }, [applyImagePromptTextToNode]);
+    const updateGeminiImagePromptField = useCallback((nodeId, section, field, value) => {
+        const targetNode = nodesMap.get(nodeId);
+        if (!targetNode || targetNode.type !== 'gen-image') return;
+        const baseSettings = targetNode.settings || {};
+        const currentSpec = normalizeGeminiImagePromptSpec(baseSettings.geminiImagePromptSpec || {}, {
+            aspectRatio: baseSettings.ratio || lastUsedRatio || '1:1',
+            resolution: baseSettings.resolution || lastUsedImageResolution || '2K',
+            imageCount: baseSettings.imageConcurrency || baseSettings.concurrentImages || 1
+        });
+        const nextSpec = {
+            ...currentSpec,
+            subject: { ...currentSpec.subject },
+            scene: { ...currentSpec.scene },
+            visualStyle: { ...currentSpec.visualStyle },
+            camera: { ...currentSpec.camera },
+            copywriting: { ...currentSpec.copywriting },
+            systemReasoning: { ...currentSpec.systemReasoning },
+            apiPayload: { ...currentSpec.apiPayload },
+            output: { ...currentSpec.output }
+        };
+        if (section === 'root') {
+            nextSpec[field] = String(value || '');
+        } else if (section === 'output') {
+            nextSpec.output[field] = field === 'imageCount'
+                ? normalizeImageConcurrency(value || nextSpec.output.imageCount || 1)
+                : field === 'resolution'
+                    ? (normalizeImageResolution(value || nextSpec.output.resolution || '2K') || nextSpec.output.resolution || '2K')
+                    : String(value || '');
+            if (field === 'aspectRatio') nextSpec.apiPayload.aspectRatio = nextSpec.output.aspectRatio;
+            if (field === 'resolution') nextSpec.apiPayload.resolution = nextSpec.output.resolution;
+            if (field === 'imageCount') nextSpec.apiPayload.sampleCount = nextSpec.output.imageCount;
+        } else if (section === 'apiPayload') {
+            nextSpec.apiPayload[field] = field === 'sampleCount'
+                ? normalizeImageConcurrency(value || nextSpec.apiPayload.sampleCount || nextSpec.output.imageCount || 1)
+                : field === 'resolution'
+                    ? (normalizeImageResolution(value || nextSpec.apiPayload.resolution || nextSpec.output.resolution || '2K') || nextSpec.apiPayload.resolution || nextSpec.output.resolution || '2K')
+                    : String(value || '');
+            if (field === 'aspectRatio') nextSpec.output.aspectRatio = String(nextSpec.apiPayload.aspectRatio || nextSpec.output.aspectRatio || '1:1');
+            if (field === 'resolution') nextSpec.output.resolution = nextSpec.apiPayload.resolution;
+            if (field === 'sampleCount') nextSpec.output.imageCount = nextSpec.apiPayload.sampleCount;
+        } else if (nextSpec[section] && typeof nextSpec[section] === 'object') {
+            nextSpec[section][field] = String(value || '');
+        }
+        applyImagePromptTextToNode(nodeId, stringifyGeminiImagePromptSpec(nextSpec), {
+            linkedPromptNodeId: baseSettings.linkedPromptNodeId || undefined
+        });
+    }, [
+        nodesMap,
+        normalizeGeminiImagePromptSpec,
+        stringifyGeminiImagePromptSpec,
+        applyImagePromptTextToNode,
+        lastUsedRatio,
+        lastUsedImageResolution
+    ]);
+    const optimizeImagePromptWithAI = useCallback(async (nodeId) => {
+        const targetNode = nodesMap.get(nodeId);
+        if (!targetNode || targetNode.type !== 'gen-image') return;
+
+        const currentPrompt = String(targetNode.settings?.prompt || '').trim();
+        const extraRequirements = String(targetNode.settings?.extraRequirements || '').trim();
+        if (!currentPrompt && !extraRequirements) {
+            showToast('请先填写提示词或额外要求', 'warning', 2400);
+            return;
+        }
+
+        const optimizerModelId = resolveModelKey(chatModel || preferredGeminiAgentModel || lastUsedExtractModel || '');
+        if (!optimizerModelId) {
+            showToast('请先选择文本模型', 'warning', 2600);
+            return;
+        }
+
+        const credentials = getApiCredentials(optimizerModelId);
+        if (!credentials.key) {
+            showToast('请先在设置中配置文本模型 API Key', 'error', 3200);
+            setSettingsOpen(true);
+            return;
+        }
+
+        const optimizerConfig = getApiConfigByKey(optimizerModelId);
+        const baseUrl = String(credentials.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
+        const modelName = optimizerConfig?.modelName || optimizerModelId;
+        const providerApiType = String(optimizerConfig?.apiType || providers?.[optimizerConfig?.provider]?.apiType || '').toLowerCase();
+        const usesOfficialGemini = providerApiType === 'gemini' && isOfficialGeminiProvider(optimizerConfig?.provider);
+        const expectsJson = currentPrompt.startsWith('{')
+            || currentPrompt.startsWith('[')
+            || isGeminiImageModelKey(targetNode.settings?.model);
+        const systemPrompt = expectsJson
+            ? '你是 AI 绘图提示词优化专家。请基于当前提示词和额外要求，直接返回一个精简且可执行的 JSON 对象，不要输出解释、标题、Markdown 或代码块。输出结构固定为 SYSTEM_REASONING + API_PAYLOAD，并且 API_PAYLOAD 内必须提供 COMPILED_PROMPT、NEGATIVE_PROMPT（可选）、EDIT_INSTRUCTION（图生图时优先）、ASPECT_RATIO、RESOLUTION、SAMPLE_COUNT。所有键名使用全大写下划线格式，空值字段不要输出，不要出现 Not applicable。'
+            : '你是 AI 绘图提示词优化专家。请基于当前提示词和额外要求，直接返回一段可执行的高质量生图提示词，不要输出解释、标题、Markdown 或代码块。';
+        const userPrompt = [
+            expectsJson ? '当前 JSON 提示词：' : '当前提示词：',
+            currentPrompt || '(空)',
+            '',
+            '额外要求：',
+            extraRequirements || '(无)',
+            '',
+            expectsJson
+                ? '请补全缺失细节、整理描述顺序，并把最终给图像模型的内容压缩到 API_PAYLOAD.COMPILED_PROMPT / EDIT_INSTRUCTION 中。'
+                : '请补全主体、场景、风格、镜头、光效、版式与限制条件，让它更适合直接生图。'
+        ].join('\n');
+
+        updateNodeSettings(nodeId, {
+            isPromptOptimizing: true,
+            promptOptimizeModel: optimizerModelId
+        });
+
+        try {
+            let optimizedText = '';
+
+            if (usesOfficialGemini) {
+                const requestUrl = `${baseUrl}/v1beta/models/${encodeURIComponent(stripGoogleModelPrefix(modelName))}:generateContent?key=${encodeURIComponent(credentials.key)}`;
+                const targetUrl = optimizerConfig?.provider ? buildProxyUrl(requestUrl, optimizerConfig.provider) : requestUrl;
+                const response = await fetch(targetUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Accept: 'application/json'
+                    },
+                    body: JSON.stringify({
+                        systemInstruction: {
+                            parts: [{ text: systemPrompt }]
+                        },
+                        contents: [
+                            {
+                                role: 'user',
+                                parts: [{ text: userPrompt }]
+                            }
+                        ]
+                    })
+                });
+                const rawText = await response.text();
+                let data = null;
+                try {
+                    data = rawText ? JSON.parse(rawText) : null;
+                } catch {
+                    data = null;
+                }
+                if (!response.ok) {
+                    throw new Error(
+                        data?.error?.message
+                        || data?.message
+                        || rawText
+                        || `API Error: ${response.status || 0}`
+                    );
+                }
+                optimizedText = parseGeminiAssistantPayload(data).text || '';
+            } else {
+                const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${credentials.key}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        model: modelName,
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt }
+                        ],
+                        temperature: expectsJson ? 0.3 : 0.7
+                    })
+                });
+                if (!response.ok) {
+                    let detail = '';
+                    try {
+                        const err = await response.json();
+                        detail = err?.error?.message || err?.message || '';
+                    } catch { }
+                    throw new Error(`API Error: ${response.status}${detail ? ` - ${detail}` : ''}`);
+                }
+                const data = await response.json();
+                const content = data?.choices?.[0]?.message?.content ?? data?.content ?? data?.text ?? '';
+                optimizedText = Array.isArray(content)
+                    ? content.map((part) => (typeof part?.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
+                    : String(content || '');
+            }
+
+            const cleaned = extractActionablePromptFromChatMessage(
+                String(optimizedText || '')
+                    .replace(/^```(?:json)?\s*/i, '')
+                    .replace(/```$/i, '')
+                    .trim()
+            );
+
+            if (!cleaned) {
+                showToast('AI 优化未返回有效内容，请重试', 'warning', 2600);
+                return;
+            }
+
+            applyImagePromptTextToNode(nodeId, cleaned, {
+                linkedPromptNodeId: targetNode.settings?.linkedPromptNodeId || undefined,
+                extraRequirements
+            });
+            showToast('提示词已 AI 优化', 'success', 2200);
+        } catch (error) {
+            console.error('[AI 优化提示词失败]', error);
+            showToast(`AI 优化失败: ${error?.message || '未知错误'}`, 'error', 3600);
+        } finally {
+            updateNodeSettings(nodeId, {
+                isPromptOptimizing: false,
+                promptOptimizeModel: optimizerModelId
+            });
+        }
+    }, [
+        nodesMap,
+        showToast,
+        resolveModelKey,
+        chatModel,
+        preferredGeminiAgentModel,
+        lastUsedExtractModel,
+        getApiCredentials,
+        getApiConfigByKey,
+        providers,
+        isOfficialGeminiProvider,
+        isGeminiImageModelKey,
+        updateNodeSettings,
+        stripGoogleModelPrefix,
+        parseGeminiAssistantPayload,
+        extractActionablePromptFromChatMessage,
+        applyImagePromptTextToNode,
+        setSettingsOpen
+    ]);
+    const getDefaultImageEditWorkbench = useCallback((preset = 'inpaint') => ({
+        preset,
+        instruction: '',
+        headline: '',
+        subheadline: '',
+        body: '',
+        callToAction: '',
+        brandName: '',
+        backgroundMode: preset === 'cutout' ? 'pure-white' : 'keep-original'
+    }), []);
+    const openInputImageEditWorkbench = useCallback((nodeId, preset = 'inpaint') => {
+        const targetNode = nodesMap.get(nodeId);
+        if (!targetNode || targetNode.type !== 'input-image') return;
+        const currentWorkbench = targetNode.settings?.editWorkbench || {};
+        const nextWorkbench = {
+            ...getDefaultImageEditWorkbench(preset),
+            ...currentWorkbench,
+            preset
+        };
+        updateNodeSettings(nodeId, {
+            editWorkbench: nextWorkbench
+        });
+        setImageEditModal({ nodeId, isMasking: false });
+    }, [nodesMap, updateNodeSettings, getDefaultImageEditWorkbench, setImageEditModal]);
+    const buildImageEditPromptSpec = useCallback((preset, workbench = {}, defaults = {}) => {
+        const instruction = String(workbench.instruction || '').trim();
+        const copywriting = {
+            headline: String(workbench.headline || '').trim(),
+            subheadline: String(workbench.subheadline || '').trim(),
+            body: String(workbench.body || '').trim(),
+            callToAction: String(workbench.callToAction || '').trim(),
+            brandName: String(workbench.brandName || '').trim(),
+            logoPlacement: ''
+        };
+        const baseSpec = {
+            creativeGoal: '',
+            subject: {},
+            scene: {},
+            visualStyle: {},
+            camera: {},
+            copywriting,
+            systemReasoning: {
+                intent: '',
+                originalSubject: '',
+                editStrategy: ''
+            },
+            apiPayload: {
+                compiledPrompt: '',
+                negativePrompt: '',
+                editInstruction: '',
+                aspectRatio: defaults.aspectRatio || 'Auto',
+                resolution: defaults.resolution || '2K',
+                sampleCount: 1
+            },
+            output: {
+                aspectRatio: defaults.aspectRatio || 'Auto',
+                resolution: defaults.resolution || '2K',
+                imageCount: 1
+            },
+            negativePrompt: '',
+            editNotes: ''
+        };
+
+        if (preset === 'upscale') {
+            baseSpec.creativeGoal = '图生图：高清还原与无损放大';
+            baseSpec.systemReasoning = {
+                intent: '图生图：高清还原与无损放大',
+                originalSubject: '保留原图主体、边缘和材质',
+                editStrategy: '只做清晰化、去噪、锐化与细节恢复，不改变主体结构'
+            };
+            baseSpec.visualStyle = {
+                style: 'premium commercial product photography',
+                lighting: 'clean studio lighting',
+                material: 'preserve real materials, metallic edges and matte surfaces'
+            };
+            baseSpec.apiPayload = {
+                compiledPrompt: 'highly detailed restoration, premium commercial product photography, clean studio lighting, edge-to-edge clarity, preserve real materials and textures',
+                negativePrompt: 'blurry, over sharpened, plastic texture, structural distortion, AI artifacts',
+                editInstruction: `Upscale and restore details, keep the subject completely intact and unchanged, reduce noise, preserve real materials.${instruction ? ` ${instruction}` : ''}`.trim(),
+                aspectRatio: defaults.aspectRatio || 'Auto',
+                resolution: '4K',
+                sampleCount: 1
+            };
+            baseSpec.output.resolution = '4K';
+            baseSpec.output.aspectRatio = defaults.aspectRatio || 'Auto';
+            baseSpec.editNotes = [UPSCALE_PROMPT_TEXT, instruction].filter(Boolean).join('\n');
+        } else if (preset === 'text-rewrite') {
+            const textTargets = [
+                copywriting.headline ? `Headline: ${copywriting.headline}` : '',
+                copywriting.subheadline ? `Subheadline: ${copywriting.subheadline}` : '',
+                copywriting.body ? `Body: ${copywriting.body}` : '',
+                copywriting.callToAction ? `CTA: ${copywriting.callToAction}` : '',
+                copywriting.brandName ? `Brand: ${copywriting.brandName}` : ''
+            ].filter(Boolean).join('; ');
+            baseSpec.creativeGoal = '图生图：无痕修改画面中的文案与排版';
+            baseSpec.systemReasoning = {
+                intent: '图生图：无痕修改画面中的文案与排版',
+                originalSubject: '保留原画面主体、版式层级和背景结构',
+                editStrategy: '只修改遮罩内文案内容与字形表现，未遮罩区域保持不变'
+            };
+            baseSpec.visualStyle = {
+                style: 'premium poster layout',
+                lighting: 'keep original lighting',
+                material: 'preserve paper, packaging or screen texture'
+            };
+            baseSpec.copywriting.logoPlacement = '保持与原稿协调';
+            baseSpec.apiPayload = {
+                compiledPrompt: 'clean premium poster layout, keep original composition, preserve paper and packaging texture, realistic typography rendering',
+                negativePrompt: 'unmasked area changes, layout collapse, extra text, warped letters, distorted product shape',
+                editInstruction: `Rewrite only the masked text area, keep the product, layout and background structure intact.${textTargets ? ` ${textTargets}.` : ''}${instruction ? ` ${instruction}` : ''}`.trim(),
+                aspectRatio: defaults.aspectRatio || 'Auto',
+                resolution: defaults.resolution || '2K',
+                sampleCount: 1
+            };
+            baseSpec.editNotes = [TEXT_RETOUCH_PROMPT_TEXT, instruction].filter(Boolean).join('\n');
+            baseSpec.negativePrompt = '不要改动未遮罩区域，不要改变主体姿态，不要新增无关文字';
+        } else if (preset === 'cutout') {
+            const backgroundText = workbench.backgroundMode === 'transparent-look'
+                ? 'clean transparent-looking backdrop for compositing'
+                : workbench.backgroundMode === 'studio-gray'
+                    ? 'clean neutral gray studio backdrop'
+                    : 'pure white seamless backdrop';
+            baseSpec.creativeGoal = '智能抠图 / 换底准备';
+            baseSpec.systemReasoning = {
+                intent: '图生图：智能抠图 / 换底准备',
+                originalSubject: '保留主体轮廓、发丝、透明材质和自然投影',
+                editStrategy: '只简化背景并强化主体边缘，不改变主体比例与材质'
+            };
+            baseSpec.scene = {
+                background: backgroundText
+            };
+            baseSpec.visualStyle = {
+                style: 'e-commerce retouching',
+                lighting: 'keep original shadows and edge transitions',
+                material: 'preserve hair strands, transparent materials and reflective edges'
+            };
+            baseSpec.apiPayload = {
+                compiledPrompt: `${backgroundText}, premium e-commerce cutout, clean edge separation, natural shadow transition, preserve reflective details`,
+                negativePrompt: 'dirty edges, halo, jagged cutout, extra props, changed proportions',
+                editInstruction: `Simplify the background and separate the main subject cleanly, keep the subject shape, scale and material realism intact.${instruction ? ` ${instruction}` : ''}`.trim(),
+                aspectRatio: defaults.aspectRatio || 'Auto',
+                resolution: defaults.resolution || '2K',
+                sampleCount: 1
+            };
+            baseSpec.editNotes = [CUTOUT_PROMPT_TEXT, instruction].filter(Boolean).join('\n');
+            baseSpec.negativePrompt = '不要新增道具，不要改变主体比例，不要出现脏边或锯齿';
+        } else {
+            baseSpec.creativeGoal = '图生图：基于遮罩进行局部重绘';
+            baseSpec.systemReasoning = {
+                intent: '图生图：基于遮罩进行局部重绘',
+                originalSubject: '保留主体几何结构、边缘、反光与原始材质',
+                editStrategy: '只修改遮罩覆盖区域，其余区域保持完整不变'
+            };
+            baseSpec.visualStyle = {
+                style: 'continue original visual style',
+                lighting: 'keep original lighting',
+                material: 'preserve real materials, metallic edges and matte surfaces'
+            };
+            baseSpec.apiPayload = {
+                compiledPrompt: 'photorealistic product edit, preserve geometry, maintain original lighting, realistic metallic and matte material texture, edge-to-edge clarity',
+                negativePrompt: 'structural changes, inaccurate textures, dirty background, harsh shadows, AI artifacts',
+                editInstruction: `Edit only the masked area, keep the subject completely intact and unchanged, preserve geometry, edges and material realism.${instruction ? ` ${instruction}` : ''}`.trim(),
+                aspectRatio: defaults.aspectRatio || 'Auto',
+                resolution: defaults.resolution || '2K',
+                sampleCount: 1
+            };
+            baseSpec.editNotes = [INPAINT_PROMPT_TEXT, instruction].filter(Boolean).join('\n');
+            baseSpec.negativePrompt = '不要改动未遮罩区域，不要破坏构图，不要新增无关元素';
+        }
+
+        return normalizeGeminiImagePromptSpec(baseSpec, defaults);
+    }, [normalizeGeminiImagePromptSpec]);
+    const launchInputImageEditWorkflow = useCallback((sourceNodeId) => {
+        const sourceNode = nodesMap.get(sourceNodeId);
+        if (!sourceNode || sourceNode.type !== 'input-image') return null;
+        const sourceImage = String(sourceNode.content || '').trim();
+        if (!sourceImage || isVideoUrl(sourceImage)) {
+            showToast('请先准备一张图片素材', 'warning', 2200);
+            return null;
+        }
+        const workbench = sourceNode.settings?.editWorkbench || getDefaultImageEditWorkbench('inpaint');
+        const preset = String(workbench.preset || 'inpaint');
+        const requiresMask = preset === 'inpaint' || preset === 'text-rewrite';
+        if (requiresMask && !sourceNode.maskContent) {
+            setImageEditModal({ nodeId: sourceNodeId, isMasking: true });
+            showToast('请先涂抹需要编辑的区域', 'info', 2600);
+            return null;
+        }
+
+        const imageModelKey = resolveModelKey(preferredGeminiImageModel || lastUsedImageModel || apiConfigs.find(config => isImageModelType(config.type))?.id || '');
+        const defaultRatio = getPreferredModelRatio(imageModelKey, 'image') || 'Auto';
+        const defaultResolution = preset === 'upscale'
+            ? '4K'
+            : (getPreferredImageResolutionForModel(imageModelKey) || '2K');
+        const promptSpec = buildImageEditPromptSpec(preset, workbench, {
+            aspectRatio: defaultRatio,
+            resolution: defaultResolution,
+            imageCount: 1
+        });
+        const promptJson = stringifyGeminiImagePromptSpec(promptSpec, {
+            aspectRatio: defaultRatio,
+            resolution: defaultResolution,
+            imageCount: 1
+        });
+        const targetX = sourceNode.x + sourceNode.width + 280;
+        const targetY = sourceNode.y + (sourceNode.height / 2);
+        const imageNode = addNode('gen-image', targetX, targetY, sourceNodeId);
+        applyImagePromptTextToNode(imageNode.id, promptJson, {
+            model: imageModelKey,
+            linkedPromptNodeId: '',
+            ratio: promptSpec.output?.aspectRatio || defaultRatio,
+            resolution: promptSpec.output?.resolution || defaultResolution,
+            sourceEditPreset: preset,
+            sourceEditNodeId: sourceNodeId
+        });
+        setImageEditModal({ nodeId: null, isMasking: false });
+        setSelectedNodeId(imageNode.id);
+        setSelectedNodeIds(new Set([imageNode.id]));
+        touchNodeSelectionPriority(imageNode.id);
+        markInteraction('canvas');
+        const actionLabel = preset === 'upscale'
+            ? '高清还原'
+            : preset === 'text-rewrite'
+                ? '文字无痕修改'
+                : preset === 'cutout'
+                    ? '智能抠图 / 换底'
+                    : '局部重绘';
+        showToast(`已创建${actionLabel}工作流`, 'success', 2400);
+        return imageNode.id;
+    }, [
+        nodesMap,
+        showToast,
+        getDefaultImageEditWorkbench,
+        setImageEditModal,
+        preferredGeminiImageModel,
+        lastUsedImageModel,
+        apiConfigs,
+        resolveModelKey,
+        getPreferredModelRatio,
+        getPreferredImageResolutionForModel,
+        buildImageEditPromptSpec,
+        stringifyGeminiImagePromptSpec,
+        addNode,
+        applyImagePromptTextToNode,
+        touchNodeSelectionPriority,
+        markInteraction
+    ]);
+    const createImageWorkflowFromChatMessage = useCallback(async (sessionId, assistantMessageId) => {
+        const session = chatSessions.find(item => item.id === sessionId) || currentSession;
+        if (!session?.messages?.length) {
+            showToast('未找到对应的聊天记录', 'warning', 2400);
+            return null;
+        }
+        const assistantIndex = session.messages.findIndex(message => message.id === assistantMessageId);
+        if (assistantIndex < 0) {
+            showToast('未找到对应的 Agent 回复', 'warning', 2400);
+            return null;
+        }
+        const assistantMessage = session.messages[assistantIndex];
+        const sourceUserMessage = [...session.messages.slice(0, assistantIndex)].reverse().find(message => message.role === 'user') || null;
+        const sourceImageFiles = (sourceUserMessage?.files || []).filter(file => file?.isImage);
+        const imageModelKey = resolveModelKey(preferredGeminiImageModel || lastUsedImageModel || apiConfigs.find(config => isImageModelType(config.type))?.id || '');
+        const imageModelConfig = getApiConfigByKey(imageModelKey);
+        const defaultRatio = getPreferredModelRatio(imageModelKey || imageModelConfig?.id || '', 'image') || lastUsedRatio || '1:1';
+        const defaultResolution = getPreferredImageResolutionForModel(imageModelKey || imageModelConfig?.id || '') || lastUsedImageResolution || '2K';
+        const workflowBlueprints = parseChatImageWorkflowBlueprints(assistantMessage?.content || '', sourceImageFiles, {
+            aspectRatio: defaultRatio,
+            resolution: defaultResolution,
+            imageCount: 1
+        });
+        if (workflowBlueprints.length === 0) {
+            showToast('该条回复没有可创建的提示词', 'warning', 2600);
+            return null;
+        }
+        const normalizedBlueprints = workflowBlueprints.map((item) => {
+            const promptSpec = sourceUserMessage?.content && !item.promptSpec?.editNotes
+                ? {
+                    ...item.promptSpec,
+                    editNotes: stripChatSourceFooter(sourceUserMessage.content)
+                }
+                : item.promptSpec;
+            const promptJson = stringifyGeminiImagePromptSpec(promptSpec, {
+                aspectRatio: defaultRatio,
+                resolution: defaultResolution,
+                imageCount: 1
+            });
+            return {
+                ...item,
+                promptSpec: parseGeminiImagePromptSpec(promptJson, {
+                    aspectRatio: defaultRatio,
+                    resolution: defaultResolution,
+                    imageCount: 1
+                }),
+                promptJson
+            };
+        });
+        const rect = canvasRef.current?.getBoundingClientRect();
+        const anchor = rect
+            ? screenToWorld(rect.left + Math.max(260, rect.width * 0.58), rect.top + rect.height * 0.48)
+            : { x: 960, y: 640 };
+        const promptCount = normalizedBlueprints.length;
+        const columns = promptCount <= 2 ? 1 : promptCount <= 6 ? 2 : 3;
+        const columnSpacing = 760;
+        const rowSpacing = 540;
+        const leftOffset = ((columns - 1) * columnSpacing) / 2;
+        const imageNodeBlueprints = normalizedBlueprints.map((item, index) => {
+            const column = index % columns;
+            const row = Math.floor(index / columns);
+            const rowsInColumn = Math.ceil((promptCount - column) / columns);
+            const centeredRow = row - ((rowsInColumn - 1) / 2);
+            return {
+                ...item,
+                worldX: anchor.x + (column * columnSpacing) - leftOffset,
+                worldY: anchor.y + centeredRow * rowSpacing
+            };
+        });
+        const imageNodes = imageNodeBlueprints.map((item) => {
+            const imageNode = addNode('gen-image', item.worldX, item.worldY);
+            applyImagePromptTextToNode(imageNode.id, item.promptJson, {
+                model: imageModelKey,
+                linkedPromptNodeId: '',
+                agentSourceChatId: session.id,
+                agentSourceMessageId: assistantMessage.id,
+                agentSourceUserMessageId: sourceUserMessage?.id || '',
+                agentRequirements: item.requirementsText || item.label || '',
+                ratio: item.promptSpec.output?.aspectRatio || defaultRatio,
+                resolution: item.promptSpec.output?.resolution || defaultResolution
+            });
+            return {
+                ...item,
+                nodeId: imageNode.id
+            };
+        });
+        const usedSourceIndexes = Array.from(new Set(
+            imageNodes.flatMap((item) => Array.isArray(item.sourceIndexes) ? item.sourceIndexes : [])
+        )).sort((left, right) => left - right);
+        const leftColumnX = imageNodes.reduce((minX, item) => Math.min(minX, item.worldX), anchor.x) - 560;
+        const sourceNodeDrafts = await Promise.all(usedSourceIndexes.map(async (sourceIndex) => {
+            const file = sourceImageFiles[sourceIndex];
+            if (!file?.content) return null;
+            let dims = { w: 320, h: 220 };
+            try {
+                const actual = await getImageDimensions(file.content);
+                const scale = Math.min(1, 320 / Math.max(1, actual.w || 320));
+                dims = {
+                    w: Math.max(180, Math.round((actual.w || 320) * scale)),
+                    h: Math.max(140, Math.round((actual.h || 220) * scale))
+                };
+            } catch (error) { }
+            const linkedImageNodes = imageNodes.filter((item) => item.sourceIndexes.includes(sourceIndex));
+            const desiredY = linkedImageNodes.length > 0
+                ? linkedImageNodes.reduce((sum, item) => sum + item.worldY, 0) / linkedImageNodes.length
+                : anchor.y;
+            return {
+                sourceIndex,
+                file,
+                dims,
+                desiredY
+            };
+        }));
+        const sourceNodeDefs = sourceNodeDrafts
+            .filter(Boolean)
+            .sort((left, right) => left.desiredY - right.desiredY)
+            .reduce((acc, item) => {
+                const minGap = 190;
+                const previous = acc[acc.length - 1];
+                const worldY = previous ? Math.max(item.desiredY, previous.worldY + minGap) : item.desiredY;
+                acc.push({
+                    ...item,
+                    worldY
+                });
+                return acc;
+            }, []);
+        const sourceNodes = sourceNodeDefs.map((item) => {
+            const sourceNode = addNode('input-image', leftColumnX, item.worldY, null, item.file.content, item.dims);
+            return {
+                ...item,
+                nodeId: sourceNode.id
+            };
+        });
+        if (sourceNodes.length > 0) {
+            setConnections((prev) => {
+                const next = [...prev];
+                sourceNodes.forEach((sourceNode) => {
+                    imageNodes
+                        .filter((item) => item.sourceIndexes.includes(sourceNode.sourceIndex))
+                        .forEach((targetNode, connectionIndex) => {
+                            if (next.some((connection) => connection.from === sourceNode.nodeId && connection.to === targetNode.nodeId)) {
+                                return;
+                            }
+                            next.push({
+                                id: `conn - chat-batch - ${sourceNode.sourceIndex} - ${connectionIndex} - ${Date.now()} - ${next.length}`,
+                                from: sourceNode.nodeId,
+                                to: targetNode.nodeId
+                            });
+                        });
+                });
+                return next;
+            });
+        }
+        const selectedIds = new Set(imageNodes.map((item) => item.nodeId).filter(Boolean));
+        const primaryImageNodeId = imageNodes[0]?.nodeId || null;
+        if (primaryImageNodeId) {
+            setSelectedNodeId(primaryImageNodeId);
+            touchNodeSelectionPriority(primaryImageNodeId);
+        }
+        setSelectedNodeIds(selectedIds);
+        markInteraction('canvas');
+        if (imageNodes.length > 1) {
+            showToast(
+                sourceNodes.length > 0
+                    ? `已从 Chat 创建 ${imageNodes.length} 个图生图节点`
+                    : `已从 Chat 创建 ${imageNodes.length} 个提示词节点`,
+                'success',
+                2800
+            );
+        } else {
+            showToast(sourceNodes.length > 0 ? '已从 Chat 创建图生图工作流' : '已从 Chat 创建提示词工作流', 'success', 2600);
+        }
+        return {
+            imageNodeId: primaryImageNodeId || '',
+            imageNodeIds: imageNodes.map((item) => item.nodeId).filter(Boolean)
+        };
+    }, [
+        chatSessions,
+        currentSession,
+        showToast,
+        stripChatSourceFooter,
+        parseChatImageWorkflowBlueprints,
+        preferredGeminiImageModel,
+        lastUsedImageModel,
+        apiConfigs,
+        resolveModelKey,
+        getApiConfigByKey,
+        getPreferredModelRatio,
+        getPreferredImageResolutionForModel,
+        lastUsedRatio,
+        lastUsedImageResolution,
+        parseGeminiImagePromptSpec,
+        stringifyGeminiImagePromptSpec,
+        canvasRef,
+        screenToWorld,
+        addNode,
+        applyImagePromptTextToNode,
+        getImageDimensions,
+        setConnections,
+        touchNodeSelectionPriority,
+        markInteraction
+    ]);
+    useEffect(() => {
+        const activeIds = new Set([
+            selectedNodeId,
+            ...(selectedNodeIds ? Array.from(selectedNodeIds) : [])
+        ].filter(Boolean));
+        if (activeIds.size === 0) return;
+        activeIds.forEach((nodeId) => {
+            const node = nodesMap.get(nodeId);
+            if (!node || node.type !== 'gen-image') return;
+            const promptSpec = node.settings?.geminiImagePromptSpec
+                || parseGeminiImagePromptSpec(node.settings?.prompt || '', {
+                    aspectRatio: node.settings?.ratio || lastUsedRatio || '1:1',
+                    resolution: node.settings?.resolution || lastUsedImageResolution || '2K',
+                    imageCount: node.settings?.imageConcurrency || node.settings?.concurrentImages || 1
+                });
+            const nextSize = estimateImageNodeDisplaySize({
+                prompt: promptSpec?.apiPayload?.compiledPrompt || promptSpec?.renderPrompt || node.settings?.prompt || '',
+                extraRequirements: node.settings?.extraRequirements || '',
+                agentRequirements: node.settings?.agentRequirements || '',
+                previewOpen: !!node.settings?.imagePromptPreviewOpen,
+                jsonOpen: !!node.settings?.imagePromptJsonOpen,
+                advancedOpen: !!node.settings?.imagePromptAdvancedOpen,
+                hasReferenceImage: getConnectedInputImages(nodeId).length > 0
+            });
+            ensureNodeMinimumSize(nodeId, nextSize.width, nextSize.height);
+        });
+    }, [selectedNodeId, selectedNodeIds, nodesMap, ensureNodeMinimumSize, estimateImageNodeDisplaySize, getConnectedInputImages, parseGeminiImagePromptSpec, lastUsedRatio, lastUsedImageResolution]);
 
     const applyHistoryPromptToNode = (targetNodeId, promptText) => {
         if (!targetNodeId || !promptText) return { applied: false };
@@ -25391,6 +28358,10 @@ ${inputText.substring(0, 15000)} ... (截断)
         if (targetNode.type === 'novel-input') {
             updateNodeSettings(targetNode.id, { content: normalizedPrompt });
             return { applied: true, target: 'node' };
+        }
+        if (targetNode.type === 'gen-image') {
+            const result = applyImagePromptTextToNode(targetNode.id, normalizedPrompt);
+            return { applied: !!result.applied, target: 'node' };
         }
         if (Object.prototype.hasOwnProperty.call(settings, 'prompt')) {
             updateNodeSettings(targetNode.id, { prompt: normalizedPrompt });
@@ -26316,6 +29287,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                 <div
                     key={node.id}
                     data-node-id={node.id}
+                    data-node-type={node.type}
                     className={`absolute node-wrapper flex flex-col ${isSelected
                         ? 'ring-1 ring-blue-500'
                         : theme === 'dark'
@@ -26336,7 +29308,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                         boxShadow: 'none',
                         borderRadius: '0',
                         transform: 'translateZ(0)',
-                        backfaceVisibility: 'hidden'
+                        backfaceVisibility: 'hidden',
+                        contain: 'layout paint style'
                     }}
                     onDragOver={enableSmartDrop ? handleCanvasDragOver : undefined}
                     onDrop={enableSmartDrop ? (e) => handleGenNodeDrop(node.id, e) : undefined}
@@ -26585,6 +29558,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             <div
                 key={node.id}
                 data-node-id={node.id}
+                data-node-type={node.type}
                 className={`absolute rounded-xl shadow-xl transition-shadow duration-150 group flex flex-col node-wrapper ${isSelected
                     ? 'ring-1 ring-blue-500 shadow-blue-500/20'
                     : isAdjacent
@@ -26607,7 +29581,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                     MozOsxFontSmoothing: 'grayscale',
                     textRendering: 'optimizeLegibility',
                     transform: 'translateZ(0)',
-                    backfaceVisibility: 'hidden'
+                    backfaceVisibility: 'hidden',
+                    contain: 'layout paint style'
                 }}
                 onDragOver={enableSmartDrop ? handleCanvasDragOver : undefined}
                 onDrop={enableSmartDrop ? (e) => handleGenNodeDrop(node.id, e) : undefined}
@@ -26716,7 +29691,32 @@ ${inputText.substring(0, 15000)} ... (截断)
                 >
                     <X size={12} />
                 </button>
-                <div className="absolute bottom-1 right-1 w-4 h-4 z-[100] resize-handle flex items-end justify-end p-0.5" onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); setResizingNodeId(node.id); }}><svg width="6" height="6" viewBox="0 0 8 8" fill="none" className="text-zinc-600"><path d="M8 0L8 8L0 8" stroke="currentColor" strokeWidth="2" /></svg></div>
+                {[
+                    { direction: 'top-left', className: '-left-1 -top-1 w-3 h-3 rounded-sm', cursor: 'nwse-resize', accent: true },
+                    { direction: 'top', className: 'left-4 right-4 -top-1 h-1.5 rounded-full', cursor: 'ns-resize', accent: true },
+                    { direction: 'top-right', className: '-right-1 -top-1 w-3 h-3 rounded-sm', cursor: 'nesw-resize', accent: true },
+                    { direction: 'right', className: '-right-1 top-4 bottom-4 w-1.5 rounded-full', cursor: 'ew-resize', accent: true },
+                    { direction: 'bottom-right', className: '-right-1 -bottom-1 w-4 h-4 rounded-sm flex items-end justify-end p-0.5', cursor: 'nwse-resize', accent: true, showIcon: true },
+                    { direction: 'bottom', className: 'left-4 right-4 -bottom-1 h-1.5 rounded-full', cursor: 'ns-resize', accent: true },
+                    { direction: 'bottom-left', className: '-left-1 -bottom-1 w-3 h-3 rounded-sm', cursor: 'nesw-resize', accent: true },
+                    { direction: 'left', className: '-left-1 top-4 bottom-4 w-1.5 rounded-full', cursor: 'ew-resize', accent: true }
+                ].map((handle) => (
+                    <div
+                        key={handle.direction}
+                        className={`absolute z-[100] resize-handle ${handle.className} ${handle.accent
+                            ? (theme === 'dark' ? 'bg-zinc-700/70' : 'bg-zinc-300/80')
+                            : ''
+                            }`}
+                        style={{ cursor: handle.cursor }}
+                        onMouseDown={(e) => beginNodeResize(node.id, handle.direction, e)}
+                    >
+                        {handle.showIcon && (
+                            <svg width="6" height="6" viewBox="0 0 8 8" fill="none" className="text-zinc-600">
+                                <path d="M8 0L8 8L0 8" stroke="currentColor" strokeWidth="2" />
+                            </svg>
+                        )}
+                    </div>
+                ))}
 
                 {node.type !== 'input-image' && node.type !== 'video-input' && node.type !== 'video-analyze' && node.type !== 'preview' && (
                     node.type === 'image-compare' ? (
@@ -28315,8 +31315,317 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             {t('上游引用')}
                                         </div>
                                     )}
+                                    {imageEditModal.nodeId === node.id && !isVideoUrl(inputImageDisplayContent) && (() => {
+                                        const workbench = {
+                                            ...getDefaultImageEditWorkbench(node.settings?.editWorkbench?.preset || 'inpaint'),
+                                            ...(node.settings?.editWorkbench || {})
+                                        };
+                                        const currentPreset = String(workbench.preset || 'inpaint');
+                                        const requiresMask = currentPreset === 'inpaint' || currentPreset === 'text-rewrite';
+                                        const presetOptions = [
+                                            { id: 'inpaint', label: '局部重绘', icon: Brush, desc: '局部替换 / 修瑕 / 局部改稿' },
+                                            { id: 'upscale', label: '高清还原', icon: Sparkles, desc: '放大 / 锐化 / 去噪' },
+                                            { id: 'text-rewrite', label: '文字无痕修改', icon: Edit3, desc: '改标题 / 副标题 / 排版文案' },
+                                            { id: 'cutout', label: '智能抠图 / 换底', icon: Scissors, desc: '主体分离 / 换底 / 电商精修' }
+                                        ];
+                                        return createPortal(
+                                            <div
+                                                className="fixed inset-0 z-[2500] bg-black/70 backdrop-blur-sm p-4 sm:p-6"
+                                                onMouseDown={(e) => e.stopPropagation()}
+                                            >
+                                                <div
+                                                    className={`mx-auto flex h-full w-full max-w-[1600px] flex-col rounded-2xl border shadow-2xl ${theme === 'dark'
+                                                        ? 'border-zinc-800 bg-zinc-950 text-zinc-100'
+                                                        : 'border-zinc-200 bg-white text-zinc-800'
+                                                        }`}
+                                                >
+                                                    <div className={`flex items-center justify-between gap-3 border-b px-5 py-4 ${theme === 'dark' ? 'border-zinc-800' : 'border-zinc-200'}`}>
+                                                        <div>
+                                                            <div className="text-sm font-semibold">素材编辑台</div>
+                                                            <div className={`text-[11px] ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'}`}>
+                                                                参考 ai-image-edit 的独立编辑页：预览、遮罩、局部改稿、抠图与工作流创建放在同一处完成
+                                                            </div>
+                                                        </div>
+                                                        <button
+                                                            className={`p-2 rounded-lg border ${theme === 'dark'
+                                                                ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                                                : 'border-zinc-300 text-zinc-700 hover:bg-zinc-100'
+                                                                }`}
+                                                            onClick={() => setImageEditModal({ nodeId: null, isMasking: false })}
+                                                        >
+                                                            <X size={14} />
+                                                        </button>
+                                                    </div>
+
+                                                    <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1.45fr)_380px] gap-0">
+                                                        <div className={`min-h-0 border-r p-5 ${theme === 'dark' ? 'border-zinc-800' : 'border-zinc-200'}`}>
+                                                            <div className="flex items-center justify-between gap-3 mb-3">
+                                                                <div>
+                                                                    <div className="text-xs font-semibold">编辑预览</div>
+                                                                    <div className={`text-[11px] ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'}`}>
+                                                                        支持画笔和框选，多处区域可连续修改
+                                                                    </div>
+                                                                </div>
+                                                                <div className="flex items-center gap-2">
+                                                                    {requiresMask && (
+                                                                        <button
+                                                                            className={`px-3 py-1.5 rounded-lg text-xs border ${theme === 'dark'
+                                                                                ? 'border-purple-400/30 text-purple-200 hover:bg-purple-900/20'
+                                                                                : 'border-purple-200 text-purple-700 hover:bg-purple-50'
+                                                                                }`}
+                                                                            onClick={() => setImageEditModal({ nodeId: node.id, isMasking: true })}
+                                                                        >
+                                                                            {node.maskContent ? '重画遮罩' : '开始绘制遮罩'}
+                                                                        </button>
+                                                                    )}
+                                                                    {node.maskContent && (
+                                                                        <button
+                                                                            className={`px-3 py-1.5 rounded-lg text-xs border ${theme === 'dark'
+                                                                                ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                                                                : 'border-zinc-300 text-zinc-700 hover:bg-zinc-100'
+                                                                                }`}
+                                                                            onClick={() => {
+                                                                                setNodes((prev) => prev.map((item) => (
+                                                                                    item.id === node.id
+                                                                                        ? { ...item, maskContent: '' }
+                                                                                        : item
+                                                                                )));
+                                                                            }}
+                                                                        >
+                                                                            清空遮罩
+                                                                        </button>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+
+                                                            <div className={`relative h-[calc(100%-2.75rem)] min-h-[520px] rounded-2xl overflow-hidden ${theme === 'dark' ? 'bg-black' : 'bg-zinc-100'}`}>
+                                                                <LazyBase64Image
+                                                                    src={inputImageDisplayContent}
+                                                                    className="w-full h-full object-contain"
+                                                                    draggable={false}
+                                                                />
+                                                                {node.maskContent && (
+                                                                    <div
+                                                                        className="absolute inset-0 pointer-events-none"
+                                                                        style={{
+                                                                            background: 'rgba(255, 0, 0, 0.32)',
+                                                                            mixBlendMode: 'multiply',
+                                                                            WebkitMaskImage: `url(${node.maskContent})`,
+                                                                            maskImage: `url(${node.maskContent})`,
+                                                                            WebkitMaskSize: '100% 100%',
+                                                                            maskSize: '100% 100%',
+                                                                            WebkitMaskRepeat: 'no-repeat',
+                                                                            maskRepeat: 'no-repeat'
+                                                                        }}
+                                                                    />
+                                                                )}
+                                                                <div className="absolute left-3 bottom-3 flex items-center gap-2">
+                                                                    {node.dimensions && (
+                                                                        <div className={`text-[10px] px-2 py-1 rounded-full backdrop-blur-sm border ${theme === 'dark'
+                                                                            ? 'bg-black/70 text-white border-white/10'
+                                                                            : 'bg-white/90 text-zinc-800 border-zinc-200'
+                                                                            }`}>
+                                                                            {node.dimensions.w} x {node.dimensions.h}
+                                                                        </div>
+                                                                    )}
+                                                                    {requiresMask && (
+                                                                        <div className={`text-[10px] px-2 py-1 rounded-full border ${theme === 'dark'
+                                                                            ? node.maskContent
+                                                                                ? 'bg-purple-500/20 text-purple-200 border-purple-400/30'
+                                                                                : 'bg-zinc-900/80 text-zinc-400 border-zinc-700'
+                                                                            : node.maskContent
+                                                                                ? 'bg-purple-50 text-purple-700 border-purple-200'
+                                                                                : 'bg-white/90 text-zinc-500 border-zinc-200'
+                                                                            }`}>
+                                                                            {node.maskContent ? '遮罩已准备，可直接生成' : '请先框选或涂抹需要修改的区域'}
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                                {imageEditModal.isMasking && (
+                                                                    <MaskEditor
+                                                                        nodeId={node.id}
+                                                                        imageUrl={inputImageDisplayContent}
+                                                                        imageDimensions={node.dimensions}
+                                                                        isActive={imageEditModal.isMasking}
+                                                                        onClose={() => setImageEditModal({ nodeId: node.id, isMasking: false })}
+                                                                        onSave={() => { }}
+                                                                        onUpdateNode={(nodeId, updates) => {
+                                                                            setNodes((prev) => prev.map((item) => (
+                                                                                item.id === nodeId
+                                                                                    ? { ...item, ...updates }
+                                                                                    : item
+                                                                            )));
+                                                                        }}
+                                                                        theme={theme}
+                                                                        view={view}
+                                                                        maskContent={node.maskContent}
+                                                                    />
+                                                                )}
+                                                            </div>
+                                                        </div>
+
+                                                        <div className="min-h-0 overflow-y-auto custom-scrollbar p-5 space-y-4">
+                                                            <div className="grid grid-cols-2 gap-2">
+                                                                {presetOptions.map((option) => {
+                                                                    const Icon = option.icon;
+                                                                    const active = currentPreset === option.id;
+                                                                    return (
+                                                                        <button
+                                                                            key={option.id}
+                                                                            onClick={() => openInputImageEditWorkbench(node.id, option.id)}
+                                                                            className={`text-left rounded-xl border px-3 py-3 transition-colors ${active
+                                                                                ? theme === 'dark'
+                                                                                    ? 'bg-blue-600/20 border-blue-500/40 text-blue-200'
+                                                                                    : 'bg-blue-50 border-blue-300 text-blue-700'
+                                                                                : theme === 'dark'
+                                                                                    ? 'bg-zinc-900/80 border-zinc-800 text-zinc-300 hover:bg-zinc-800'
+                                                                                    : 'bg-zinc-50 border-zinc-200 text-zinc-700 hover:bg-zinc-100'
+                                                                                }`}
+                                                                        >
+                                                                            <div className="flex items-center gap-2 mb-1">
+                                                                                <Icon size={13} />
+                                                                                <span className="text-[11px] font-medium">{option.label}</span>
+                                                                            </div>
+                                                                            <div className="text-[10px] opacity-75 leading-5">{option.desc}</div>
+                                                                        </button>
+                                                                    );
+                                                                })}
+                                                            </div>
+
+                                                            <label className="flex flex-col gap-1.5">
+                                                                <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>编辑说明</span>
+                                                                <textarea
+                                                                    value={workbench.instruction || ''}
+                                                                    onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, instruction: e.target.value } })}
+                                                                    rows={4}
+                                                                    className={`px-3 py-2 rounded-xl text-[12px] border outline-none resize-none ${theme === 'dark'
+                                                                        ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100 placeholder-zinc-600'
+                                                                        : 'bg-white border-zinc-200 text-zinc-800 placeholder-zinc-400'
+                                                                        }`}
+                                                                    placeholder={currentPreset === 'upscale'
+                                                                        ? '例如：保持原包装质感，只做清晰化、去噪和边缘锐化'
+                                                                        : currentPreset === 'cutout'
+                                                                            ? '例如：保留人物发丝和边缘投影，方便后续海报合成'
+                                                                            : currentPreset === 'text-rewrite'
+                                                                                ? '例如：把标题改成春季新品发布，副标题更高级，排版更商业化'
+                                                                                : '例如：只修改产品标签区域，换成更高级的材质与颜色'}
+                                                                />
+                                                            </label>
+
+                                                            {currentPreset === 'text-rewrite' && (
+                                                                <div className="grid grid-cols-2 gap-2">
+                                                                    <label className="flex flex-col gap-1">
+                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>大标题</span>
+                                                                        <input
+                                                                            value={workbench.headline || ''}
+                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, headline: e.target.value } })}
+                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                    </label>
+                                                                    <label className="flex flex-col gap-1">
+                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>副标题</span>
+                                                                        <input
+                                                                            value={workbench.subheadline || ''}
+                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, subheadline: e.target.value } })}
+                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                    </label>
+                                                                    <label className="flex flex-col gap-1 col-span-2">
+                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>正文 / 说明文案</span>
+                                                                        <textarea
+                                                                            value={workbench.body || ''}
+                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, body: e.target.value } })}
+                                                                            rows={3}
+                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none resize-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                    </label>
+                                                                    <label className="flex flex-col gap-1">
+                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>CTA</span>
+                                                                        <input
+                                                                            value={workbench.callToAction || ''}
+                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, callToAction: e.target.value } })}
+                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                    </label>
+                                                                    <label className="flex flex-col gap-1">
+                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>品牌名</span>
+                                                                        <input
+                                                                            value={workbench.brandName || ''}
+                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, brandName: e.target.value } })}
+                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                    </label>
+                                                                </div>
+                                                            )}
+
+                                                            {currentPreset === 'cutout' && (
+                                                                <label className="flex flex-col gap-1.5">
+                                                                    <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>背景模式</span>
+                                                                    <select
+                                                                        value={workbench.backgroundMode || 'pure-white'}
+                                                                        onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, backgroundMode: e.target.value } })}
+                                                                        className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                            ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                            : 'bg-white border-zinc-200 text-zinc-800'
+                                                                            }`}
+                                                                    >
+                                                                        <option value="pure-white">纯白背景</option>
+                                                                        <option value="studio-gray">中性灰背景</option>
+                                                                        <option value="transparent-look">透明感背景</option>
+                                                                    </select>
+                                                                </label>
+                                                            )}
+
+                                                            <div className={`rounded-xl border px-3 py-3 text-[11px] ${theme === 'dark'
+                                                                ? 'border-zinc-800 bg-zinc-900/70 text-zinc-300'
+                                                                : 'border-zinc-200 bg-zinc-50 text-zinc-600'
+                                                                }`}>
+                                                                {requiresMask
+                                                                    ? (node.maskContent ? '当前遮罩已生效，生成后会优先做局部编辑。' : '当前模式需要先绘制遮罩，才能只改局部区域。')
+                                                                    : '当前模式不强制遮罩，可直接创建编辑工作流。'}
+                                                            </div>
+
+                                                            <div className="flex gap-2 pt-1">
+                                                                <button
+                                                                    className={`flex-1 px-4 py-2.5 rounded-xl text-xs font-medium ${theme === 'dark'
+                                                                        ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+                                                                        : 'bg-zinc-100 text-zinc-700 hover:bg-zinc-200'
+                                                                        }`}
+                                                                    onClick={() => setImageEditModal({ nodeId: null, isMasking: false })}
+                                                                >
+                                                                    关闭编辑器
+                                                                </button>
+                                                                <button
+                                                                    className="flex-1 px-4 py-2.5 rounded-xl text-xs font-medium bg-blue-600 text-white hover:bg-blue-500"
+                                                                    onClick={() => launchInputImageEditWorkflow(node.id)}
+                                                                >
+                                                                    创建编辑工作流
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>,
+                                            document.body
+                                        );
+                                    })()}
                                     {/* 悬浮菜单：当 isMasking 为 true 时强制隐藏 */}
-                                    {!node.isMasking && (
+                                    {!node.isMasking && imageEditModal.nodeId !== node.id && (
                                         <div className="absolute inset-0 bg-black/40 transition-opacity gap-2 opacity-0 group-hover:opacity-100 flex flex-col items-center justify-center">
                                             <div className="flex items-center gap-2">
                                                 <label
@@ -28332,24 +31641,16 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     <button
                                                         onClick={(e) => {
                                                             e.stopPropagation();
-                                                            setNodes((prev) => prev.map((n) =>
-                                                                n.id === node.id
-                                                                    ? { ...n, isMasking: !n.isMasking }
-                                                                    : n
-                                                            ));
+                                                            openInputImageEditWorkbench(node.id, node.maskContent ? 'inpaint' : 'upscale');
                                                         }}
                                                         className={`px-3 py-1.5 rounded-lg text-xs backdrop-blur-sm border transition-colors flex items-center gap-1 ${theme === 'dark'
-                                                            ? node.isMasking
-                                                                ? 'bg-red-500/80 hover:bg-red-500 text-white border-red-400'
-                                                                : 'bg-white/10 hover:bg-white/20 text-white border-white/10'
-                                                            : node.isMasking
-                                                                ? 'bg-red-500 hover:bg-red-600 text-white border-red-400'
-                                                                : 'bg-white hover:bg-zinc-100 text-zinc-800 border-zinc-300'
+                                                            ? 'bg-white/10 hover:bg-white/20 text-white border-white/10'
+                                                            : 'bg-white hover:bg-zinc-100 text-zinc-800 border-zinc-300'
                                                             }`}
                                                         onMouseDown={(e) => e.stopPropagation()}
                                                     >
-                                                        <Brush size={12} />
-                                                        {t('局部重绘')}
+                                                        <Settings size={12} />
+                                                        编辑工具
                                                     </button>
                                                 )}
                                             </div>
@@ -29276,8 +32577,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                                             type: 'gen-image',
                                                                                                             x: world.x - 180,
                                                                                                             y: world.y - 170,
-                                                                                                            width: 360,
-                                                                                                            height: 340,
+                                                                                                            width: 620,
+                                                                                                            height: 520,
                                                                                                              settings: {
                                                                                                                  model: 'mj-v6',
                                                                                                                  prompt: kf.mj_prompt,
@@ -32712,6 +36013,115 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 ? (activeTask.durationMs / 1000).toFixed(1)
                                 : null;
                             const elapsedSeconds = nodeTimers[node.id] || 0;
+                            const currentImageModelConfig = node.type === 'gen-image'
+                                ? getApiConfigByKey(node.settings?.model)
+                                : null;
+                            const isGeminiImageNode = node.type === 'gen-image' && isGeminiImageModelKey(node.settings?.model);
+                            const cachedImagePromptState = node.type === 'gen-image'
+                                ? getCachedImagePromptRenderState(node, connectedImages.length)
+                                : null;
+                            const geminiPromptSpec = isGeminiImageNode
+                                ? cachedImagePromptState?.normalizedPromptSpec || null
+                                : null;
+                            const agentSourceSession = node.settings?.agentSourceChatId
+                                ? chatSessions.find(session => session.id === node.settings.agentSourceChatId)
+                                : null;
+                            const agentSourceMessage = agentSourceSession?.messages?.find(message => message.id === node.settings?.agentSourceMessageId) || null;
+                            const structuredPromptDefaults = cachedImagePromptState?.defaults || {
+                                aspectRatio: node.settings?.ratio || lastUsedRatio || '1:1',
+                                resolution: node.settings?.resolution || lastUsedImageResolution || '2K',
+                                imageCount: node.settings?.imageConcurrency || node.settings?.concurrentImages || 1
+                            };
+                            const imagePromptSpec = node.type === 'gen-image'
+                                ? cachedImagePromptState?.imagePromptSpec || null
+                                : null;
+                            const imagePromptConsole = node.type === 'gen-image'
+                                ? cachedImagePromptState?.imagePromptConsole || null
+                                : null;
+                            const stylePresetDef = node.type === 'gen-image'
+                                ? (IMAGE_ECOMMERCE_STYLE_PRESETS.find((item) => item.id === imagePromptConsole?.stylePreset) || null)
+                                : null;
+                            const backgroundPresetDef = node.type === 'gen-image'
+                                ? (IMAGE_BACKGROUND_PRESETS.find((item) => item.id === imagePromptConsole?.backgroundPreset) || IMAGE_BACKGROUND_PRESETS[0])
+                                : null;
+                            const lightingPresetDef = node.type === 'gen-image'
+                                ? (IMAGE_LIGHTING_PRESETS.find((item) => item.id === imagePromptConsole?.lightingPreset) || IMAGE_LIGHTING_PRESETS[0])
+                                : null;
+                            const shadowPresetDef = node.type === 'gen-image'
+                                ? (IMAGE_SHADOW_PRESETS.find((item) => item.id === imagePromptConsole?.shadowPreset) || IMAGE_SHADOW_PRESETS[0])
+                                : null;
+                            const lockedSubjectText = node.type === 'gen-image'
+                                ? String(imagePromptSpec?.systemReasoning?.originalSubject || imagePromptSpec?.systemReasoning?.intent || '等待系统锁定主体').trim()
+                                : '';
+                            const fidelityValue = Number(imagePromptConsole?.fidelity || 80);
+                            const fidelityLabel = connectedImages.length > 0
+                                ? fidelityValue >= 90
+                                    ? '几乎只换底和打光'
+                                    : fidelityValue >= 70
+                                        ? '允许轻微修瑕和材质增强'
+                                        : fidelityValue >= 50
+                                            ? '允许中等强度修复'
+                                            : '允许较大幅度重绘'
+                                : '当前为文生图模式';
+                            const incomingImageConn = node.type === 'gen-image'
+                                ? (connections.find((item) => item.to === node.id && (!item.inputType || item.inputType === 'default'))
+                                    || connections.find((item) => item.to === node.id))
+                                : null;
+                            const sourceImageNode = incomingImageConn ? nodesMap.get(incomingImageConn.from) : null;
+                            const canOpenMaskGuide = !!(sourceImageNode && sourceImageNode.type === 'input-image' && !isVideoUrl(sourceImageNode.content || ''));
+                            const manualPresetLabels = node.type === 'gen-image'
+                                ? [
+                                    backgroundPresetDef?.id !== 'auto' ? backgroundPresetDef?.label : '',
+                                    lightingPresetDef?.id !== 'auto' ? lightingPresetDef?.label : '',
+                                    shadowPresetDef?.id !== 'auto' ? shadowPresetDef?.label : ''
+                                ].filter(Boolean)
+                                : [];
+                            const presetLayerText = node.type === 'gen-image'
+                                ? [
+                                    stylePresetDef ? `一键预设：${stylePresetDef.label}` : '',
+                                    ...(!stylePresetDef ? manualPresetLabels : [])
+                                ].filter(Boolean).join(' / ')
+                                    || '智能跟随 Chat / 当前提示词'
+                                : '';
+                            const isImageAdvancedOpen = node.type === 'gen-image'
+                                ? !!node.settings?.imagePromptAdvancedOpen
+                                : false;
+                            const quickPromptText = node.type === 'gen-image'
+                                ? String(imagePromptSpec?.apiPayload?.compiledPrompt || imagePromptSpec?.compiledPrompt || '').trim()
+                                : '';
+                            const quickRatioOptions = node.type === 'gen-image'
+                                ? getRatiosForModel(node.settings?.model)
+                                : [];
+                            const quickResolutionOptions = node.type === 'gen-image'
+                                ? getResolutionsForModel(node.settings?.model)
+                                : [];
+                            const quickRatioValue = node.type === 'gen-image'
+                                ? (quickRatioOptions.includes(String(imagePromptSpec?.output?.aspectRatio || structuredPromptDefaults.aspectRatio || '1:1').trim())
+                                    ? String(imagePromptSpec?.output?.aspectRatio || structuredPromptDefaults.aspectRatio || '1:1').trim()
+                                    : (quickRatioOptions[0] || '1:1'))
+                                : '1:1';
+                            const quickResolutionValue = node.type === 'gen-image'
+                                ? (() => {
+                                    const resolved = normalizeImageResolution(imagePromptSpec?.output?.resolution || structuredPromptDefaults.resolution || '2K') || '2K';
+                                    return quickResolutionOptions.includes(resolved) ? resolved : (quickResolutionOptions[0] || '2K');
+                                })()
+                                : '2K';
+                            const quickImageCountValue = node.type === 'gen-image'
+                                ? normalizeImageConcurrency(imagePromptSpec?.output?.imageCount || structuredPromptDefaults.imageCount || 1)
+                                : 1;
+                            const previewPromptText = node.type === 'gen-image'
+                                ? [
+                                    `[锁定层] ${lockedSubjectText || '等待识别主体'}`,
+                                    `[预设层] ${[presetLayerText, connectedImages.length > 0 ? `结构保持 ${Math.round(fidelityValue)}%` : '文生图模式'].filter(Boolean).join(' / ')}`,
+                                    `[微调层] ${(node.settings?.extraRequirements || '').trim() || '（暂未填写）'}`,
+                                    '',
+                                    'Preview Prompt:',
+                                    [
+                                        imagePromptSpec?.renderPrompt || imagePromptSpec?.compiledPrompt || '',
+                                        String(node.settings?.extraRequirements || '').trim() || ''
+                                    ].filter(Boolean).join('. ')
+                                ].filter(Boolean).join('\n')
+                                : '';
 
                             return (
                                 <div className="p-3 flex flex-col h-full pointer-events-auto">
@@ -32789,7 +36199,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         </div>
                                     )}
                                     <div
-                                        className={`rounded-lg p-3 mb-2 border focus-within:border-blue-500/30 transition-colors flex-1 flex flex-col ${theme === 'dark'
+                                        className={`rounded-lg p-3 mb-2 border focus-within:border-blue-500/30 transition-colors flex-1 flex flex-col overflow-y-auto custom-scrollbar min-h-0 ${theme === 'dark'
                                             ? 'bg-zinc-950/50 border-zinc-800'
                                             : theme === 'solarized'
                                                 ? 'bg-[#fdf6e3] border-[#eee8d5]'
@@ -32826,35 +36236,439 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             }
                                             return null;
                                         })()}
-                                        <div className="flex items-start gap-2 mb-1 flex-1 h-full min-h-0">
-                                            <textarea
-                                                className={`flex-1 h-full bg-transparent text-xs outline-none resize-none custom-scrollbar ${theme === 'dark'
-                                                    ? 'text-zinc-300 placeholder-zinc-600'
-                                                    : 'text-zinc-800 placeholder-zinc-400'
-                                                    }`}
-                                                placeholder={t('输入提示词...')}
-                                                value={node.type === 'gen-image' ? (node.settings?.prompt || '') : (node.settings?.videoPrompt || '')}
-                                                onChange={(e) => updateNodeSettings(node.id, node.type === 'gen-image' ? { prompt: e.target.value } : { videoPrompt: e.target.value })}
-                                                onMouseDown={(e) => e.stopPropagation()}
-                                            />
-                                            {(node.type === 'gen-video' && (node.settings?.model === 'sora-2' || node.settings?.model === 'sora-2-pro')) && characterLibrary.length > 0 && (
-                                                <div className="relative shrink-0">
-                                                    <button
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            setCharactersOpen(true);
-                                                        }}
-                                                        className={`p-1.5 rounded transition-colors ${theme === 'dark'
-                                                            ? 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800'
-                                                            : 'text-zinc-500 hover:text-zinc-700 hover:bg-zinc-200'
-                                                            }`}
-                                                        title={t('插入角色')}
-                                                    >
-                                                        <Users size={14} />
-                                                    </button>
+                                        {node.type === 'gen-image' ? (
+                                            <div className="flex-1 flex flex-col gap-3 min-h-0">
+                                                <div className="flex items-start justify-between gap-3">
+                                                    <div>
+                                                        <div className={`text-[11px] font-semibold ${theme === 'dark' ? 'text-zinc-200' : 'text-zinc-700'}`}>
+                                                            AI 绘图控制台
+                                                        </div>
+                                                        <div className={`text-[10px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                                            默认只保留主提示词和关键输出参数；更多风格微调收进折叠区
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex items-center gap-2">
+                                                        {node.settings?.linkedPromptNodeId && (
+                                                            <button
+                                                                className={`px-2 py-1 rounded text-[10px] border ${theme === 'dark'
+                                                                    ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                                                    : 'border-zinc-300 text-zinc-700 hover:bg-white'
+                                                                    }`}
+                                                                onMouseDown={(e) => e.stopPropagation()}
+                                                                onClick={() => {
+                                                                    const linkedId = node.settings?.linkedPromptNodeId;
+                                                                    if (!linkedId) return;
+                                                                    setSelectedNodeId(linkedId);
+                                                                    setSelectedNodeIds(new Set([linkedId]));
+                                                                    touchNodeSelectionPriority(linkedId);
+                                                                }}
+                                                            >
+                                                                {t('定位提示词节点')}
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            className={`px-3 py-1.5 rounded text-[11px] border transition-colors ${theme === 'dark'
+                                                                ? 'border-blue-500/30 text-blue-200 hover:bg-blue-500/10 disabled:border-zinc-800 disabled:text-zinc-600'
+                                                                : 'border-blue-200 text-blue-700 hover:bg-white disabled:border-zinc-200 disabled:text-zinc-400'
+                                                                }`}
+                                                            disabled={!!node.settings?.isPromptOptimizing || (!node.settings?.prompt && !node.settings?.extraRequirements)}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            onClick={() => optimizeImagePromptWithAI(node.id)}
+                                                        >
+                                                            {node.settings?.isPromptOptimizing ? 'AI 优化中...' : 'AI 优化'}
+                                                        </button>
+                                                    </div>
                                                 </div>
-                                            )}
-                                        </div>
+
+                                                <div className={`rounded-xl border px-3 py-3 space-y-3 ${theme === 'dark'
+                                                    ? 'border-zinc-800 bg-zinc-900/70'
+                                                    : 'border-zinc-200 bg-white/80'
+                                                    }`}>
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] ${theme === 'dark'
+                                                            ? 'bg-zinc-950 text-zinc-300 border border-zinc-800'
+                                                            : 'bg-zinc-50 text-zinc-700 border border-zinc-200'
+                                                            }`}>
+                                                            主体：{lockedSubjectText || '等待系统锁定主体'}
+                                                        </span>
+                                                        <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] ${theme === 'dark'
+                                                            ? 'bg-blue-950/40 text-blue-200 border border-blue-900/60'
+                                                            : 'bg-blue-50 text-blue-700 border border-blue-200'
+                                                            }`}>
+                                                            风格：{presetLayerText}
+                                                        </span>
+                                                        {connectedImages.length > 0 && (
+                                                            <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] ${theme === 'dark'
+                                                                ? 'bg-emerald-950/30 text-emerald-200 border border-emerald-900/50'
+                                                                : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                                                }`}>
+                                                                结构保持 {Math.round(fidelityValue)}%
+                                                            </span>
+                                                        )}
+                                                    </div>
+
+                                                    <label className="flex flex-col gap-1">
+                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>主提示词</span>
+                                                        <textarea
+                                                            value={quickPromptText}
+                                                            onChange={(e) => updateGeminiImagePromptField(node.id, 'apiPayload', 'compiledPrompt', e.target.value)}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            rows={3}
+                                                            placeholder={t('Chat 丢来的主提示词会显示在这里，也可以直接手改')}
+                                                            className={`px-2 py-2 rounded text-[11px] border outline-none resize-none focus:border-blue-500/50 custom-scrollbar ${theme === 'dark'
+                                                                ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200 placeholder-zinc-600'
+                                                                : 'bg-white border-zinc-200 text-zinc-800 placeholder-zinc-400'
+                                                                }`}
+                                                        />
+                                                    </label>
+
+                                                    <div className="grid grid-cols-3 gap-2">
+                                                        <label className="flex flex-col gap-1">
+                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>比例</span>
+                                                            <select
+                                                                value={quickRatioValue}
+                                                                onChange={(e) => {
+                                                                    updateGeminiImagePromptField(node.id, 'output', 'aspectRatio', e.target.value);
+                                                                    setLastUsedRatio(e.target.value);
+                                                                    try { localStorage.setItem('tapnow_last_ratio', e.target.value); } catch { }
+                                                                }}
+                                                                onMouseDown={(e) => e.stopPropagation()}
+                                                                className={`px-2 py-1.5 rounded text-[11px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
+                                                                    ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200'
+                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                    }`}
+                                                            >
+                                                                {quickRatioOptions.map((ratioOption) => (
+                                                                    <option key={ratioOption} value={ratioOption}>
+                                                                        {ratioOption === 'Auto'
+                                                                            ? 'Auto'
+                                                                            : getValueLabelWithNotes(ratioOption, !!currentImageModelConfig?.ratioNotesEnabled, currentImageModelConfig?.ratioNotes || {})}
+                                                                    </option>
+                                                                ))}
+                                                            </select>
+                                                        </label>
+
+                                                        <label className="flex flex-col gap-1">
+                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>分辨率</span>
+                                                            <select
+                                                                value={quickResolutionValue}
+                                                                onChange={(e) => {
+                                                                    updateGeminiImagePromptField(node.id, 'output', 'resolution', e.target.value);
+                                                                    setLastUsedImageResolution(e.target.value);
+                                                                    try { localStorage.setItem('tapnow_last_image_res', e.target.value); } catch { }
+                                                                }}
+                                                                onMouseDown={(e) => e.stopPropagation()}
+                                                                className={`px-2 py-1.5 rounded text-[11px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
+                                                                    ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200'
+                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                    }`}
+                                                            >
+                                                                {quickResolutionOptions.map((resolutionOption) => (
+                                                                    <option key={resolutionOption} value={resolutionOption}>
+                                                                        {getValueLabelWithNotes(
+                                                                            resolutionOption,
+                                                                            !!currentImageModelConfig?.resolutionNotesEnabled,
+                                                                            currentImageModelConfig?.resolutionNotes || {}
+                                                                        )}
+                                                                    </option>
+                                                                ))}
+                                                            </select>
+                                                        </label>
+
+                                                        <label className="flex flex-col gap-1">
+                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>输出张数</span>
+                                                            <select
+                                                                value={String(quickImageCountValue)}
+                                                                onChange={(e) => updateGeminiImagePromptField(node.id, 'output', 'imageCount', Number(e.target.value))}
+                                                                onMouseDown={(e) => e.stopPropagation()}
+                                                                className={`px-2 py-1.5 rounded text-[11px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
+                                                                    ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200'
+                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                    }`}
+                                                            >
+                                                                {[1, 2, 4, 9].map((count) => (
+                                                                    <option key={count} value={count}>{count} 张</option>
+                                                                ))}
+                                                            </select>
+                                                        </label>
+                                                    </div>
+
+                                                    <label className="flex flex-col gap-1">
+                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>额外要求</span>
+                                                        <textarea
+                                                            value={node.settings?.extraRequirements || ''}
+                                                            onChange={(e) => updateNodeSettings(node.id, { extraRequirements: e.target.value })}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            rows={2}
+                                                            placeholder={t('例如：文字更清晰、背景更冷、金属反光更高级')}
+                                                            className={`px-2 py-1.5 rounded text-[11px] border outline-none resize-none focus:border-blue-500/50 custom-scrollbar ${theme === 'dark'
+                                                                ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200 placeholder-zinc-600'
+                                                                : 'bg-white border-zinc-200 text-zinc-800 placeholder-zinc-400'
+                                                                }`}
+                                                        />
+                                                    </label>
+
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        <button
+                                                            className={`px-2 py-1 rounded text-[10px] border ${theme === 'dark'
+                                                                ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                                                : 'border-zinc-300 text-zinc-700 hover:bg-white'
+                                                                }`}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            onClick={() => updateNodeSettings(node.id, { imagePromptAdvancedOpen: !isImageAdvancedOpen })}
+                                                        >
+                                                            {isImageAdvancedOpen ? '收起更多选项' : '更多选项'}
+                                                        </button>
+                                                        <button
+                                                            className={`px-2 py-1 rounded text-[10px] border ${theme === 'dark'
+                                                                ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                                                : 'border-zinc-300 text-zinc-700 hover:bg-white'
+                                                                }`}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            onClick={() => updateNodeSettings(node.id, { imagePromptPreviewOpen: !node.settings?.imagePromptPreviewOpen })}
+                                                        >
+                                                            {node.settings?.imagePromptPreviewOpen ? '收起完整提示词' : '预览完整提示词'}
+                                                        </button>
+                                                        <button
+                                                            className={`px-2 py-1 rounded text-[10px] border ${theme === 'dark'
+                                                                ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                                                : 'border-zinc-300 text-zinc-700 hover:bg-white'
+                                                                }`}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            onClick={() => updateNodeSettings(node.id, { imagePromptJsonOpen: !node.settings?.imagePromptJsonOpen })}
+                                                        >
+                                                            {node.settings?.imagePromptJsonOpen ? '收起 JSON' : '查看 JSON'}
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                {isImageAdvancedOpen && (
+                                                    <div className={`rounded-xl border px-3 py-3 space-y-3 ${theme === 'dark'
+                                                        ? 'border-zinc-800 bg-zinc-900/70'
+                                                        : 'border-zinc-200 bg-white/80'
+                                                        }`}>
+                                                        <div className="grid grid-cols-2 xl:grid-cols-4 gap-2">
+                                                            <label className="flex flex-col gap-1">
+                                                                <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>风格捷径</span>
+                                                                <select
+                                                                    value={imagePromptConsole?.stylePreset || ''}
+                                                                    onChange={(e) => {
+                                                                        const presetId = e.target.value;
+                                                                        const preset = IMAGE_ECOMMERCE_STYLE_PRESETS.find((item) => item.id === presetId) || null;
+                                                                        updateImagePromptConsole(node.id, {
+                                                                            stylePreset: presetId,
+                                                                            backgroundPreset: preset?.backgroundPreset || 'auto',
+                                                                            lightingPreset: preset?.lightingPreset || 'auto',
+                                                                            shadowPreset: preset?.shadowPreset || 'auto'
+                                                                        });
+                                                                    }}
+                                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                                    className={`px-2 py-1.5 rounded text-[11px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
+                                                                        ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200'
+                                                                        : 'bg-white border-zinc-200 text-zinc-800'
+                                                                        }`}
+                                                                >
+                                                                    <option value="">跟随 Chat / 当前提示词</option>
+                                                                    {IMAGE_ECOMMERCE_STYLE_PRESETS.map((preset) => (
+                                                                        <option key={preset.id} value={preset.id}>{preset.label}</option>
+                                                                    ))}
+                                                                </select>
+                                                            </label>
+                                                            <label className="flex flex-col gap-1">
+                                                                <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>背景</span>
+                                                                <select
+                                                                    value={imagePromptConsole?.backgroundPreset || 'auto'}
+                                                                    onChange={(e) => updateImagePromptConsole(node.id, { stylePreset: '', backgroundPreset: e.target.value })}
+                                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                                    className={`px-2 py-1.5 rounded text-[11px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
+                                                                        ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200'
+                                                                        : 'bg-white border-zinc-200 text-zinc-800'
+                                                                        }`}
+                                                                >
+                                                                    {IMAGE_BACKGROUND_PRESETS.map((item) => (
+                                                                        <option key={item.id} value={item.id}>{item.label}</option>
+                                                                    ))}
+                                                                </select>
+                                                            </label>
+                                                            <label className="flex flex-col gap-1">
+                                                                <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>光影</span>
+                                                                <select
+                                                                    value={imagePromptConsole?.lightingPreset || 'auto'}
+                                                                    onChange={(e) => updateImagePromptConsole(node.id, { stylePreset: '', lightingPreset: e.target.value })}
+                                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                                    className={`px-2 py-1.5 rounded text-[11px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
+                                                                        ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200'
+                                                                        : 'bg-white border-zinc-200 text-zinc-800'
+                                                                        }`}
+                                                                >
+                                                                    {IMAGE_LIGHTING_PRESETS.map((item) => (
+                                                                        <option key={item.id} value={item.id}>{item.label}</option>
+                                                                    ))}
+                                                                </select>
+                                                            </label>
+                                                            <label className="flex flex-col gap-1">
+                                                                <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>阴影</span>
+                                                                <select
+                                                                    value={imagePromptConsole?.shadowPreset || 'auto'}
+                                                                    onChange={(e) => updateImagePromptConsole(node.id, { stylePreset: '', shadowPreset: e.target.value })}
+                                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                                    className={`px-2 py-1.5 rounded text-[11px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
+                                                                        ? 'bg-zinc-950/70 border-zinc-800 text-zinc-200'
+                                                                        : 'bg-white border-zinc-200 text-zinc-800'
+                                                                        }`}
+                                                                >
+                                                                    {IMAGE_SHADOW_PRESETS.map((item) => (
+                                                                        <option key={item.id} value={item.id}>{item.label}</option>
+                                                                    ))}
+                                                                </select>
+                                                            </label>
+                                                        </div>
+
+                                                        {connectedImages.length > 0 && (
+                                                            <div className={`rounded-lg border px-3 py-3 space-y-2 ${theme === 'dark'
+                                                                ? 'border-zinc-800 bg-zinc-950/50'
+                                                                : 'border-zinc-200 bg-zinc-50'
+                                                                }`}>
+                                                                <div className="flex items-center justify-between gap-3">
+                                                                    <div>
+                                                                        <div className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>保持原图结构</div>
+                                                                        <div className={`text-[10px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>{fidelityLabel}</div>
+                                                                    </div>
+                                                                    <div className={`text-[10px] font-mono ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>{Math.round(fidelityValue)}%</div>
+                                                                </div>
+                                                                <input
+                                                                    type="range"
+                                                                    min="0"
+                                                                    max="100"
+                                                                    step="1"
+                                                                    value={Math.round(fidelityValue)}
+                                                                    onChange={(e) => updateImagePromptConsole(node.id, { fidelity: Number(e.target.value) })}
+                                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                                    className="w-full accent-blue-500"
+                                                                />
+                                                            </div>
+                                                        )}
+
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {IMAGE_NEGATIVE_FLAG_DEFS.map((flag) => {
+                                                                const active = !!imagePromptConsole?.negativeFlags?.[flag.id];
+                                                                return (
+                                                                    <button
+                                                                        key={flag.id}
+                                                                        type="button"
+                                                                        className={`px-2 py-1 rounded-full border text-[10px] transition-colors ${active
+                                                                            ? theme === 'dark'
+                                                                                ? 'border-blue-500/40 bg-blue-500/10 text-blue-200'
+                                                                                : 'border-blue-300 bg-blue-50 text-blue-700'
+                                                                            : theme === 'dark'
+                                                                                ? 'border-zinc-800 bg-zinc-950/60 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                                                                                : 'border-zinc-200 bg-zinc-50 text-zinc-600 hover:border-zinc-300 hover:text-zinc-800'
+                                                                            }`}
+                                                                        onMouseDown={(e) => e.stopPropagation()}
+                                                                        onClick={() => updateImagePromptConsole(node.id, {
+                                                                            negativeFlags: { [flag.id]: !active }
+                                                                        })}
+                                                                    >
+                                                                        {flag.label}
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                        </div>
+
+                                                        {canOpenMaskGuide && (
+                                                            <div className={`rounded-lg border px-3 py-2 flex items-center justify-between gap-3 ${theme === 'dark'
+                                                                ? 'border-purple-500/20 bg-purple-950/20 text-purple-200'
+                                                                : 'border-purple-200 bg-purple-50 text-purple-700'
+                                                                }`}>
+                                                                <div>
+                                                                    <div className="text-[10px] font-medium">局部重绘引导</div>
+                                                                    <div className="text-[10px] opacity-80">需要只改背景、标签或局部材质时，先去上游素材节点画遮罩。</div>
+                                                                </div>
+                                                                <button
+                                                                    className={`px-3 py-1.5 rounded-lg text-[10px] border ${theme === 'dark'
+                                                                        ? 'border-purple-400/30 hover:bg-purple-900/30'
+                                                                        : 'border-purple-200 hover:bg-white'
+                                                                        }`}
+                                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                                    onClick={() => setImageEditModal({ nodeId: sourceImageNode.id, isMasking: true })}
+                                                                >
+                                                                    去画遮罩
+                                                                </button>
+                                                            </div>
+                                                        )}
+
+                                                        {(agentSourceMessage || node.settings?.agentRequirements) && (
+                                                            <div className={`rounded border px-2 py-2 text-[10px] ${theme === 'dark'
+                                                                ? 'border-zinc-800 bg-zinc-950/60 text-zinc-400'
+                                                                : 'border-zinc-200 bg-white/80 text-zinc-600'
+                                                                }`}>
+                                                                <div className="font-semibold mb-1">Chat Agent 输出</div>
+                                                                <div className="line-clamp-4 whitespace-pre-wrap break-words">
+                                                                    {stripChatSourceFooter(agentSourceMessage?.content || node.settings?.agentRequirements || '')}
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+
+                                                {node.settings?.imagePromptPreviewOpen && (
+                                                    <textarea
+                                                        readOnly
+                                                        value={previewPromptText}
+                                                        onMouseDown={(e) => e.stopPropagation()}
+                                                        rows={7}
+                                                        className={`w-full rounded-xl border px-3 py-2 text-[11px] outline-none resize-none custom-scrollbar ${theme === 'dark'
+                                                            ? 'bg-zinc-950/80 border-zinc-800 text-zinc-200'
+                                                            : 'bg-white border-zinc-200 text-zinc-800'
+                                                            }`}
+                                                    />
+                                                )}
+
+                                                {node.settings?.imagePromptJsonOpen && (
+                                                    <textarea
+                                                        className={`w-full min-h-[150px] bg-transparent text-xs outline-none resize-none custom-scrollbar rounded-xl border px-3 py-2 ${theme === 'dark'
+                                                            ? 'text-zinc-300 placeholder-zinc-600 border-zinc-800 bg-zinc-950/70'
+                                                            : 'text-zinc-800 placeholder-zinc-400 border-zinc-200 bg-white/90'
+                                                            } font-mono`}
+                                                        placeholder={t('输入提示词或粘贴 JSON Prompt...')}
+                                                        value={node.settings?.prompt
+                                                            || (node.settings?.geminiImagePromptSpec ? stringifyGeminiImagePromptSpec(node.settings.geminiImagePromptSpec) : '')}
+                                                        onChange={(e) => applyImagePromptTextToNode(node.id, e.target.value)}
+                                                        onMouseDown={(e) => e.stopPropagation()}
+                                                    />
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <div className="flex items-start gap-2 mb-1 flex-1 h-full min-h-0">
+                                                <textarea
+                                                    className={`flex-1 h-full bg-transparent text-xs outline-none resize-none custom-scrollbar ${theme === 'dark'
+                                                        ? 'text-zinc-300 placeholder-zinc-600'
+                                                        : 'text-zinc-800 placeholder-zinc-400'
+                                                        }`}
+                                                    placeholder={t('输入提示词...')}
+                                                    value={node.settings?.videoPrompt || ''}
+                                                    onChange={(e) => updateNodeSettings(node.id, { videoPrompt: e.target.value })}
+                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                />
+                                                {(node.settings?.model === 'sora-2' || node.settings?.model === 'sora-2-pro') && characterLibrary.length > 0 && (
+                                                    <div className="relative shrink-0">
+                                                        <button
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setCharactersOpen(true);
+                                                            }}
+                                                            className={`p-1.5 rounded transition-colors ${theme === 'dark'
+                                                                ? 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800'
+                                                                : 'text-zinc-500 hover:text-zinc-700 hover:bg-zinc-200'
+                                                                }`}
+                                                            title={t('插入角色')}
+                                                        >
+                                                            <Users size={14} />
+                                                        </button>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
                                     </div>
 
                                     {/* 角色引用栏 (仅 Sora 模型) */}
@@ -33243,7 +37057,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         );
                                     })()}
                                     <div
-                                        className={`mt-auto pt-2 flex items-center justify-between shrink-0 relative gap-2 border-t ${theme === 'dark' ? 'border-zinc-800/50' : 'border-zinc-200'
+                                        className={`mt-auto sticky bottom-0 z-10 pt-2 flex items-center justify-between shrink-0 relative gap-2 border-t ${theme === 'dark' ? 'border-zinc-800/50 bg-[#18181b]/95' : theme === 'solarized' ? 'border-[#d7cfb2] bg-[#eee8d5]/95' : 'border-zinc-200 bg-white/95'
                                             }`}
                                     >
                                         <div className="relative flex-1 min-w-0">
@@ -33385,58 +37199,64 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             )}
 
                                         <div className="flex gap-1 shrink-0">
-                                            <div className="relative">
-                                                <button
-                                                    onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'ratio' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'ratio' }); }}
-                                                    className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${theme === 'dark'
-                                                        ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                        : theme === 'solarized'
-                                                            ? 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-600 border-[#d7cfb2]'
-                                                            : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
-                                                        }`}
-                                                >
-                                                    {(() => {
-                                                        const ratioValue = node.settings?.ratio || 'Auto';
-                                                        const ratioConfig = getApiConfigByKey(node.settings?.model);
-                                                        return ratioValue === 'Auto'
-                                                            ? 'Auto'
-                                                            : getValueLabelWithNotes(ratioValue, !!ratioConfig?.ratioNotesEnabled, ratioConfig?.ratioNotes || {});
-                                                    })()}
-                                                </button>
-                                                {activeDropdown?.nodeId === node.id && activeDropdown.type === 'ratio' && (
-                                                    <div
-                                                        className={`absolute bottom-full left-1/2 -translate-x-1/2 mb-1 w-20 rounded-lg shadow-xl p-1 z-[60] border ${theme === 'dark'
-                                                            ? 'bg-[#18181b] border-zinc-700'
-                                                            : theme === 'solarized' ? 'bg-[#eee8d5] border-[#d7cfb2]' : 'bg-white border-zinc-200'
+                                            {!(node.type === 'gen-image' && isGeminiImageNode) && (
+                                                <div className="relative">
+                                                    <button
+                                                        onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'ratio' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'ratio' }); }}
+                                                        className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${theme === 'dark'
+                                                            ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
+                                                            : theme === 'solarized'
+                                                                ? 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-600 border-[#d7cfb2]'
+                                                                : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
                                                             }`}
-                                                        onMouseDown={e => e.stopPropagation()}
                                                     >
-                                                        {getRatiosForModel(node.settings?.model).map(r => {
+                                                        {(() => {
+                                                            const ratioValue = node.settings?.ratio || 'Auto';
                                                             const ratioConfig = getApiConfigByKey(node.settings?.model);
-                                                            const label = r === 'Auto'
+                                                            return ratioValue === 'Auto'
                                                                 ? 'Auto'
-                                                                : getValueLabelWithNotes(r, !!ratioConfig?.ratioNotesEnabled, ratioConfig?.ratioNotes || {});
-                                                            return (
-                                                                <button
-                                                                    key={r}
-                                                                    onClick={() => {
-                                                                        updateNodeSettings(node.id, { ratio: r });
-                                                                        setLastUsedRatio(r);
-                                                                        try { localStorage.setItem('tapnow_last_ratio', r); } catch { }
-                                                                        setActiveDropdown(null);
-                                                                    }}
-                                                                    className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
-                                                                        ? 'text-zinc-300 hover:bg-zinc-800'
-                                                                        : theme === 'solarized' ? 'text-zinc-700 hover:bg-[#fdf6e3]' : 'text-zinc-700 hover:bg-zinc-100'
-                                                                        }`}
-                                                                >
-                                                                    {label}
-                                                                </button>
-                                                            );
-                                                        })}
-                                                    </div>
-                                                )}
-                                            </div>
+                                                                : getValueLabelWithNotes(ratioValue, !!ratioConfig?.ratioNotesEnabled, ratioConfig?.ratioNotes || {});
+                                                        })()}
+                                                    </button>
+                                                    {activeDropdown?.nodeId === node.id && activeDropdown.type === 'ratio' && (
+                                                        <div
+                                                            className={`absolute bottom-full left-1/2 -translate-x-1/2 mb-1 w-20 rounded-lg shadow-xl p-1 z-[60] border ${theme === 'dark'
+                                                                ? 'bg-[#18181b] border-zinc-700'
+                                                                : theme === 'solarized' ? 'bg-[#eee8d5] border-[#d7cfb2]' : 'bg-white border-zinc-200'
+                                                                }`}
+                                                            onMouseDown={e => e.stopPropagation()}
+                                                        >
+                                                            {getRatiosForModel(node.settings?.model).map(r => {
+                                                                const ratioConfig = getApiConfigByKey(node.settings?.model);
+                                                                const label = r === 'Auto'
+                                                                    ? 'Auto'
+                                                                    : getValueLabelWithNotes(r, !!ratioConfig?.ratioNotesEnabled, ratioConfig?.ratioNotes || {});
+                                                                return (
+                                                                    <button
+                                                                        key={r}
+                                                                        onClick={() => {
+                                                                            if (isGeminiImageNode) {
+                                                                                updateGeminiImagePromptField(node.id, 'output', 'aspectRatio', r);
+                                                                            } else {
+                                                                                updateNodeSettings(node.id, { ratio: r });
+                                                                            }
+                                                                            setLastUsedRatio(r);
+                                                                            try { localStorage.setItem('tapnow_last_ratio', r); } catch { }
+                                                                            setActiveDropdown(null);
+                                                                        }}
+                                                                        className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
+                                                                            ? 'text-zinc-300 hover:bg-zinc-800'
+                                                                            : theme === 'solarized' ? 'text-zinc-700 hover:bg-[#fdf6e3]' : 'text-zinc-700 hover:bg-zinc-100'
+                                                                            }`}
+                                                                    >
+                                                                        {label}
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
 
                                             {node.type === 'gen-video' && (() => {
                                                 const currentModel = getApiConfigByKey(node.settings?.model);
@@ -33446,11 +37266,6 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 const currentResolution = normalizeVideoResolution(node.settings?.resolution || lastUsedVideoResolution || '720P');
                                                 const fallbackResolution = resolutionOptions.find((res) => res !== 'Auto') || '720P';
                                                 const resolvedResolution = resolutionOptions.includes(currentResolution) ? currentResolution : fallbackResolution;
-                                                if (resolvedResolution !== currentResolution) {
-                                                    setTimeout(() => {
-                                                        updateNodeSettings(node.id, { resolution: resolvedResolution });
-                                                    }, 0);
-                                                }
                                                 return (
                                                     <div className="relative">
                                                         <button
@@ -33509,188 +37324,171 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 );
                                             })()}
 
-                                            {node.type === 'gen-image' && (() => {
+                                            {node.type === 'gen-image' && !isGeminiImageNode && (() => {
                                                 const currentModel = getApiConfigByKey(node.settings?.model);
                                                 const isMidjourney = currentModel && (currentModel.id.includes('mj') || currentModel.provider.toLowerCase().includes('midjourney'));
-                                                return !isMidjourney;
-                                            })() ? (
-                                                <div className="relative">
-                                                    <button
-                                                        onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'res' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'res' }); }}
-                                                        className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${theme === 'dark'
-                                                            ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                            : theme === 'solarized'
-                                                                ? 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-600 border-[#d7cfb2]'
-                                                                : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
-                                                            }`}
-                                                    >
-                                                        {(() => {
+                                                if (isMidjourney) return null;
+                                                return (
+                                                    <div className="relative">
+                                                        <button
+                                                            onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'res' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'res' }); }}
+                                                            className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${theme === 'dark'
+                                                                ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
+                                                                : theme === 'solarized'
+                                                                    ? 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-600 border-[#d7cfb2]'
+                                                                    : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                }`}
+                                                        >
+                                                            {(() => {
+                                                                const currentModel = getApiConfigByKey(node.settings?.model);
+                                                                const modelId = currentModel?.id || currentModel?.modelName || '';
+                                                                const availableResolutions = getResolutionsForModel(modelId);
+                                                                const currentResolution = node.settings?.resolution || '2K';
+                                                                const normalizedResolution = normalizeImageResolution(currentResolution);
+                                                                const displayResolution = availableResolutions.includes(normalizedResolution)
+                                                                    ? normalizedResolution
+                                                                    : (availableResolutions[0] || '2K');
+                                                                return getValueLabelWithNotes(
+                                                                    displayResolution,
+                                                                    !!currentModel?.resolutionNotesEnabled,
+                                                                    currentModel?.resolutionNotes || {}
+                                                                );
+                                                            })()}
+                                                        </button>
+                                                        {activeDropdown?.nodeId === node.id && activeDropdown.type === 'res' && (() => {
                                                             const currentModel = getApiConfigByKey(node.settings?.model);
                                                             const modelId = currentModel?.id || currentModel?.modelName || '';
                                                             const availableResolutions = getResolutionsForModel(modelId);
-                                                            const currentResolution = node.settings?.resolution || '2K';
-                                                            const normalizedResolution = normalizeImageResolution(currentResolution);
-                                                            // 如果当前分辨率不在可用选项中，使用第一个可用选项作为显示值
-                                                            const displayResolution = availableResolutions.includes(normalizedResolution)
-                                                                ? normalizedResolution
-                                                                : (availableResolutions[0] || '2K');
-                                                            const displayLabel = getValueLabelWithNotes(
-                                                                displayResolution,
-                                                                !!currentModel?.resolutionNotesEnabled,
-                                                                currentModel?.resolutionNotes || {}
-                                                            );
-                                                            // 如果当前分辨率不在可用选项中，自动更新
-                                                            if (currentResolution !== normalizedResolution && availableResolutions.includes(normalizedResolution)) {
-                                                                setTimeout(() => {
-                                                                    updateNodeSettings(node.id, { resolution: normalizedResolution });
-                                                                }, 0);
-                                                            } else if (!availableResolutions.includes(normalizedResolution) && availableResolutions.length > 0) {
-                                                                setTimeout(() => {
-                                                                    updateNodeSettings(node.id, { resolution: availableResolutions[0] });
-                                                                }, 0);
-                                                            }
-                                                            return displayLabel;
-                                                        })()}
-                                                    </button>
-                                                    {activeDropdown?.nodeId === node.id && activeDropdown.type === 'res' && (() => {
-                                                        const currentModel = getApiConfigByKey(node.settings?.model);
-                                                        const modelId = currentModel?.id || currentModel?.modelName || '';
-                                                        const availableResolutions = getResolutionsForModel(modelId);
-                                                        return (
-                                                            <div
-                                                                className={`absolute bottom-full right-0 mb-1 w-24 rounded-lg shadow-xl p-1 z-[60] border ${theme === 'dark'
-                                                                    ? 'bg-[#18181b] border-zinc-700'
-                                                                    : theme === 'solarized' ? 'bg-[#eee8d5] border-[#d7cfb2]' : 'bg-white border-zinc-200'
-                                                                    }`}
-                                                                onMouseDown={e => e.stopPropagation()}
-                                                            >
-                                                                {availableResolutions.map(r => (
-                                                                    <button
-                                                                        key={r}
-                                                                        onClick={() => {
-                                                                            updateNodeSettings(node.id, { resolution: r });
-                                                                            setLastUsedImageResolution(r);
-                                                                            try { localStorage.setItem('tapnow_last_image_res', r); } catch { }
-                                                                            setActiveDropdown(null);
-                                                                        }}
-                                                                        className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
-                                                                            ? 'text-zinc-300 hover:bg-zinc-800'
-                                                                            : theme === 'solarized' ? 'text-zinc-700 hover:bg-[#fdf6e3]' : 'text-zinc-700 hover:bg-zinc-100'
-                                                                            }`}
-                                                                    >
-                                                                        {getValueLabelWithNotes(r, !!currentModel?.resolutionNotesEnabled, currentModel?.resolutionNotes || {})}
-                                                                    </button>
-                                                                ))}
-                                                            </div>
-                                                        );
-                                                    })()}
-                                                </div>
-                                            ) : (
-                                                (() => {
-                                                    const currentModel = getApiConfigByKey(node.settings?.model);
-                                                    const isMidjourney = currentModel && (currentModel.id.includes('mj') || currentModel.provider.toLowerCase().includes('midjourney'));
-                                                    const durationOptions = getDefaultDurationsForModel(node.settings?.model);
-                                                    const storedDuration = node.settings?.duration;
-                                                    const currentDuration = durationOptions.includes(storedDuration)
-                                                        ? storedDuration
-                                                        : (durationOptions[0] || '5s');
-                                                    if (!storedDuration || !durationOptions.includes(storedDuration)) {
-                                                        setTimeout(() => {
-                                                            updateNodeSettings(node.id, { duration: durationOptions[0] || '5s' });
-                                                        }, 0);
-                                                    }
-                                                    return !isMidjourney ? (
-                                                        <>
-                                                            <div className="relative">
-                                                                <button
-                                                                    onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'duration' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'duration' }); }}
-                                                                    className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${theme === 'dark'
-                                                                        ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                        : theme === 'solarized'
-                                                                            ? 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
-                                                                            : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                            return (
+                                                                <div
+                                                                    className={`absolute bottom-full right-0 mb-1 w-24 rounded-lg shadow-xl p-1 z-[60] border ${theme === 'dark'
+                                                                        ? 'bg-[#18181b] border-zinc-700'
+                                                                        : theme === 'solarized' ? 'bg-[#eee8d5] border-[#d7cfb2]' : 'bg-white border-zinc-200'
                                                                         }`}
+                                                                    onMouseDown={e => e.stopPropagation()}
                                                                 >
-                                                                    {getValueLabelWithNotes(currentDuration, !!currentModel?.durationNotesEnabled, currentModel?.durationNotes || {})}
-                                                                </button>
-                                                                {activeDropdown?.nodeId === node.id && activeDropdown.type === 'duration' && (
-                                                                    <div
-                                                                        className={`absolute bottom-full left-1/2 -translate-x-1/2 mb-1 w-20 rounded-lg shadow-xl p-1 z-[60] border ${theme === 'dark'
-                                                                            ? 'bg-[#18181b] border-zinc-700'
-                                                                            : theme === 'solarized' ? 'bg-[#eee8d5] border-[#d7cfb2]' : 'bg-white border-zinc-200'
-                                                                            }`}
-                                                                        onMouseDown={e => e.stopPropagation()}
-                                                                    >
-                                                                        {(durationOptions.length > 0 ? durationOptions : ['5s', '10s']).map(d => (
-                                                                            <button
-                                                                                key={d}
-                                                                                onClick={() => {
-                                                                                    updateNodeSettings(node.id, { duration: d });
-                                                                                    setActiveDropdown(null);
-                                                                                }}
-                                                                                className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
-                                                                                    ? 'text-zinc-300 hover:bg-zinc-800'
-                                                                                    : theme === 'solarized' ? 'text-zinc-700 hover:bg-[#fdf6e3]' : 'text-zinc-700 hover:bg-zinc-100'
-                                                                                    }`}
-                                                                            >
-                                                                                {getValueLabelWithNotes(d, !!currentModel?.durationNotesEnabled, currentModel?.durationNotes || {})}
-                                                                            </button>
-                                                                        ))}
-                                                                    </div>
-                                                                )}
-                                                            </div>
+                                                                    {availableResolutions.map(r => (
+                                                                        <button
+                                                                            key={r}
+                                                                            onClick={() => {
+                                                                                updateNodeSettings(node.id, { resolution: r });
+                                                                                setLastUsedImageResolution(r);
+                                                                                try { localStorage.setItem('tapnow_last_image_res', r); } catch { }
+                                                                                setActiveDropdown(null);
+                                                                            }}
+                                                                            className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
+                                                                                ? 'text-zinc-300 hover:bg-zinc-800'
+                                                                                : theme === 'solarized' ? 'text-zinc-700 hover:bg-[#fdf6e3]' : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                }`}
+                                                                        >
+                                                                            {getValueLabelWithNotes(r, !!currentModel?.resolutionNotesEnabled, currentModel?.resolutionNotes || {})}
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            );
+                                                        })()}
+                                                    </div>
+                                                );
+                                            })()}
 
-                                                            {node.type === 'gen-video' && currentModel?.supportsHD && (
-                                                                <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
-                                                                    ? node.settings?.isHD ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
+                                            {node.type === 'gen-video' && (() => {
+                                                const currentModel = getApiConfigByKey(node.settings?.model);
+                                                const durationOptions = getDefaultDurationsForModel(node.settings?.model);
+                                                const storedDuration = String(node.settings?.duration || '').trim();
+                                                const currentDuration = durationOptions.includes(storedDuration)
+                                                    ? storedDuration
+                                                    : (getDefaultDurationForModel(node.settings?.model) || durationOptions[0] || '5s');
+                                                return (
+                                                    <>
+                                                        <div className="relative">
+                                                            <button
+                                                                onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'duration' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'duration' }); }}
+                                                                className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${theme === 'dark'
+                                                                    ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
                                                                     : theme === 'solarized'
-                                                                        ? node.settings?.isHD ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
-                                                                        : node.settings?.isHD ? 'bg-blue-500/30 border-blue-400 text-blue-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
-                                                                    }`} onClick={e => e.stopPropagation()}>
-                                                                    <input
-                                                                        type="checkbox"
-                                                                        checked={node.settings?.isHD || false}
-                                                                        onChange={(e) => {
-                                                                            e.stopPropagation();
-                                                                            updateNodeSettings(node.id, { isHD: e.target.checked });
-                                                                        }}
-                                                                        className="w-3 h-3 cursor-pointer"
-                                                                        onMouseDown={e => e.stopPropagation()}
+                                                                        ? 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                        : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                    }`}
+                                                            >
+                                                                {getValueLabelWithNotes(currentDuration, !!currentModel?.durationNotesEnabled, currentModel?.durationNotes || {})}
+                                                            </button>
+                                                            {activeDropdown?.nodeId === node.id && activeDropdown.type === 'duration' && (
+                                                                <div
+                                                                    className={`absolute bottom-full left-1/2 -translate-x-1/2 mb-1 w-20 rounded-lg shadow-xl p-1 z-[60] border ${theme === 'dark'
+                                                                        ? 'bg-[#18181b] border-zinc-700'
+                                                                        : theme === 'solarized' ? 'bg-[#eee8d5] border-[#d7cfb2]' : 'bg-white border-zinc-200'
+                                                                        }`}
+                                                                    onMouseDown={e => e.stopPropagation()}
+                                                                >
+                                                                    {(durationOptions.length > 0 ? durationOptions : ['5s', '10s']).map(d => (
+                                                                        <button
+                                                                            key={d}
+                                                                            onClick={() => {
+                                                                                updateNodeSettings(node.id, { duration: d });
+                                                                                setActiveDropdown(null);
+                                                                            }}
+                                                                            className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
+                                                                                ? 'text-zinc-300 hover:bg-zinc-800'
+                                                                                : theme === 'solarized' ? 'text-zinc-700 hover:bg-[#fdf6e3]' : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                }`}
+                                                                        >
+                                                                            {getValueLabelWithNotes(d, !!currentModel?.durationNotesEnabled, currentModel?.durationNotes || {})}
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+
+                                                        {currentModel?.supportsHD && (
+                                                            <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
+                                                                ? node.settings?.isHD ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
+                                                                : theme === 'solarized'
+                                                                    ? node.settings?.isHD ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                    : node.settings?.isHD ? 'bg-blue-500/30 border-blue-400 text-blue-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                }`} onClick={e => e.stopPropagation()}>
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={node.settings?.isHD || false}
+                                                                    onChange={(e) => {
+                                                                        e.stopPropagation();
+                                                                        updateNodeSettings(node.id, { isHD: e.target.checked });
+                                                                    }}
+                                                                    className="w-3 h-3 cursor-pointer"
+                                                                    onMouseDown={e => e.stopPropagation()}
                                                                 />
                                                                 <span>HD</span>
                                                             </label>
-                                                            )}
-                                                            {node.type === 'gen-video' && (() => {
-                                                                const supportsFirstLastFrame = !!currentModel?.supportsFirstLastFrame;
-                                                                const useFirstLastFrame = !!(node.settings?.useFirstLastFrame || node.settings?.veoFramesMode);
-                                                                if (!supportsFirstLastFrame) return null;
-                                                                return (
-                                                                    <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
-                                                                        ? useFirstLastFrame ? 'bg-emerald-600/25 border-emerald-500 text-emerald-200' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                        : theme === 'solarized'
-                                                                            ? useFirstLastFrame ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
-                                                                            : useFirstLastFrame ? 'bg-emerald-500/20 border-emerald-300 text-emerald-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
-                                                                        }`} onClick={e => e.stopPropagation()}>
-                                                                        <input
-                                                                            type="checkbox"
-                                                                            checked={useFirstLastFrame}
-                                                                            onChange={(e) => {
-                                                                                e.stopPropagation();
-                                                                                updateNodeSettings(node.id, { useFirstLastFrame: e.target.checked, veoFramesMode: e.target.checked });
-                                                                            }}
-                                                                            className="w-3 h-3 cursor-pointer"
-                                                                            onMouseDown={e => e.stopPropagation()}
-                                                                        />
-                                                                        <span>{t('首尾帧')}</span>
-                                                                    </label>
-                                                                );
-                                                            })()}
-                                                        </>
-                                                    ) : null;
-                                                })()
-                                            )}
+                                                        )}
+                                                        {(() => {
+                                                            const supportsFirstLastFrame = !!currentModel?.supportsFirstLastFrame;
+                                                            const useFirstLastFrame = !!(node.settings?.useFirstLastFrame || node.settings?.veoFramesMode);
+                                                            if (!supportsFirstLastFrame) return null;
+                                                            return (
+                                                                <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
+                                                                    ? useFirstLastFrame ? 'bg-emerald-600/25 border-emerald-500 text-emerald-200' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
+                                                                    : theme === 'solarized'
+                                                                        ? useFirstLastFrame ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                        : useFirstLastFrame ? 'bg-emerald-500/20 border-emerald-300 text-emerald-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                    }`} onClick={e => e.stopPropagation()}>
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked={useFirstLastFrame}
+                                                                        onChange={(e) => {
+                                                                            e.stopPropagation();
+                                                                            updateNodeSettings(node.id, { useFirstLastFrame: e.target.checked, veoFramesMode: e.target.checked });
+                                                                        }}
+                                                                        className="w-3 h-3 cursor-pointer"
+                                                                        onMouseDown={e => e.stopPropagation()}
+                                                                    />
+                                                                    <span>{t('首尾帧')}</span>
+                                                                </label>
+                                                            );
+                                                        })()}
+                                                    </>
+                                                );
+                                            })()}
 
-                                            {node.type === 'gen-image' && (
+                                            {node.type === 'gen-image' && !isGeminiImageNode && (
                                                 <div className="relative">
                                                     <button
                                                         onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'imgConcurrency' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'imgConcurrency' }); }}
@@ -33721,7 +37519,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                 <button
                                                                     key={count}
                                                                     onClick={() => {
-                                                                        updateNodeSettings(node.id, { imageConcurrency: count, concurrentImages: count });
+                                                                        if (isGeminiImageNode) {
+                                                                            updateGeminiImagePromptField(node.id, 'output', 'imageCount', count);
+                                                                        } else {
+                                                                            updateNodeSettings(node.id, { imageConcurrency: count, concurrentImages: count });
+                                                                        }
                                                                         setActiveDropdown(null);
                                                                     }}
                                                                     className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
@@ -33739,17 +37541,55 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         </div>
                                         <button onClick={() => {
                                             const basePrompt = node.type === 'gen-image' ? node.settings?.prompt || '' : node.settings?.videoPrompt || '';
+                                            const userTweaks = node.type === 'gen-image' ? String(node.settings?.extraRequirements || '').trim() : '';
                                             const connectedTexts = getConnectedTextNodes(node.id);
-                                            const finalPrompt = connectedTexts.length > 0 ? connectedTexts.join(' ') + (basePrompt ? ' ' + basePrompt : '') : basePrompt;
-                                            startGeneration(finalPrompt, node.type === 'gen-image' ? 'image' : 'video', connectedImages, node.id, {
+                                            const normalizedBasePrompt = String(basePrompt || '').trim();
+                                            const normalizedConnectedTexts = connectedTexts
+                                                .map((text) => String(text || '').trim())
+                                                .filter(Boolean)
+                                                .filter((text, index, items) => items.findIndex(item => item.replace(/\s+/g, ' ') === text.replace(/\s+/g, ' ')) === index)
+                                                .filter((text) => !normalizedBasePrompt || text.replace(/\s+/g, ' ') !== normalizedBasePrompt.replace(/\s+/g, ' '));
+                                            const defaultImageCount = normalizeImageConcurrency(
+                                                node.settings?.imageConcurrency
+                                                || node.settings?.concurrentImages
+                                                || getApiConfigByKey(node.settings?.model)?.defaultImageConcurrency
+                                                || 1
+                                            );
+                                            const generationOptions = {
                                                 customParams: node.settings?.customParams,
-                                                imageConcurrency: normalizeImageConcurrency(
-                                                    node.settings?.imageConcurrency
-                                                    || node.settings?.concurrentImages
-                                                    || getApiConfigByKey(node.settings?.model)?.defaultImageConcurrency
-                                                    || 1
-                                                )
-                                            });
+                                                imageConcurrency: defaultImageCount
+                                            };
+                                            let finalPrompt = [...normalizedConnectedTexts, normalizedBasePrompt, userTweaks].filter(Boolean).join(' ');
+
+                                            if (node.type === 'gen-image' && (normalizedBasePrompt.startsWith('{') || normalizedBasePrompt.startsWith('[') || node.settings?.geminiImagePromptSpec)) {
+                                                const compiled = buildGeminiImageRenderPayload(
+                                                    parseGeminiImagePromptSpec(normalizedBasePrompt, {
+                                                        aspectRatio: node.settings?.ratio || lastUsedRatio || '1:1',
+                                                        resolution: node.settings?.resolution || lastUsedImageResolution || '2K',
+                                                        imageCount: defaultImageCount
+                                                    }),
+                                                    {
+                                                        aspectRatio: node.settings?.ratio || lastUsedRatio || '1:1',
+                                                        resolution: node.settings?.resolution || lastUsedImageResolution || '2K',
+                                                        imageCount: defaultImageCount
+                                                    },
+                                                    {
+                                                        hasReferenceImage: connectedImages.length > 0,
+                                                        sourceEditPreset: node.settings?.sourceEditPreset
+                                                    }
+                                                );
+                                                finalPrompt = [...normalizedConnectedTexts, compiled.renderPrompt || compiled.compiledPrompt || normalizedBasePrompt, userTweaks].filter(Boolean).join('. ');
+                                                generationOptions.ratio = compiled.output?.aspectRatio || node.settings?.ratio || generationOptions.ratio;
+                                                generationOptions.resolution = compiled.output?.resolution || node.settings?.resolution || generationOptions.resolution;
+                                                generationOptions.imageConcurrency = compiled.output?.imageCount || defaultImageCount;
+                                                generationOptions.concurrentImages = compiled.output?.imageCount || defaultImageCount;
+                                                generationOptions.compiledPrompt = compiled.compiledPrompt || '';
+                                                generationOptions.negativePrompt = compiled.negativePrompt || '';
+                                                generationOptions.editInstruction = compiled.editInstruction || '';
+                                                generationOptions.renderPrompt = compiled.renderPrompt || finalPrompt;
+                                            }
+
+                                            startGeneration(finalPrompt, node.type === 'gen-image' ? 'image' : 'video', connectedImages, node.id, generationOptions);
                                         }} className="bg-blue-600 hover:bg-blue-500 text-white p-1.5 rounded-md shadow-lg active:scale-95 transition-transform shrink-0" title={t('生成')}>
                                             <Play size={12} fill="currentColor" />
                                         </button>
@@ -33761,7 +37601,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                 </div>
             </div >
         );
-    }, [selectedNodeId, selectedNodeIds, hoverTargetId, nodeConnectedStatus, adjacentNodesCache, apiConfigsMap, getConnectedInputImages, theme, view, dragNodeId, connectingSource, connectingTarget, connectingInputType, deleteNode, handleNodeMouseUp, screenToWorld, setDragNodeId, setSelectedNodeId, setSelectedNodeIds, setActiveDropdown, setHoverTargetId, setConnectingSource, setConnectingTarget, setConnectingInputType, setResizingNodeId, setLightboxItem, isVideoUrl, updateNodeSettings, getConnectedTextNodes, startGeneration, getDefaultDurationForModel, getDefaultDurationsForModel, getConnectedGenNodes, getConnectedVideoInputNode, getConnectedVideoAnalyzeNode, handleCanvasDragOver, handleGenNodeDrop, importStoryboardMarkdownTable, importStoryboardTableFromFile, mutateStoryboardTable, normalizeStoryboardTableData, openStoryboardTableCellEditor, runStoryboardTablePromptMerge, markInteraction, resolveNodeRenderZIndex, touchNodeSelectionPriority]);
+    }, [selectedNodeId, selectedNodeIds, hoverTargetId, nodeConnectedStatus, adjacentNodesCache, apiConfigsMap, getConnectedInputImages, theme, view.zoom, dragNodeId, connectingSource, connectingTarget, connectingInputType, deleteNode, handleNodeMouseUp, screenToWorld, setDragNodeId, setSelectedNodeId, setSelectedNodeIds, setActiveDropdown, setHoverTargetId, setConnectingSource, setConnectingTarget, setConnectingInputType, beginNodeResize, setLightboxItem, isVideoUrl, updateNodeSettings, getConnectedTextNodes, startGeneration, getDefaultDurationForModel, getDefaultDurationsForModel, getConnectedGenNodes, getConnectedVideoInputNode, getConnectedVideoAnalyzeNode, handleCanvasDragOver, handleGenNodeDrop, importStoryboardMarkdownTable, importStoryboardTableFromFile, mutateStoryboardTable, normalizeStoryboardTableData, openStoryboardTableCellEditor, runStoryboardTablePromptMerge, markInteraction, resolveNodeRenderZIndex, touchNodeSelectionPriority, buildGeminiImageRenderPayload, parseGeminiImagePromptSpec, lastUsedRatio, lastUsedImageResolution, updateImagePromptConsole, getCachedImagePromptRenderState]);
 
     // 高性能模式：当节点数量超过 50 或手动开启时启用
     const isPerfMode = nodes.length > 50 || globalPerformanceMode !== 'off';
@@ -35351,14 +39191,19 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 backfaceVisibility: 'hidden'
                             }}>
                             <div className="absolute origin-top-left will-change-transform" style={{
-                                transform: `translate3d(${view.x}px, ${view.y}px, 0) scale(${view.zoom})`,
+                                transform: supportsCssZoom
+                                    ? `translate3d(${Math.round(view.x)}px, ${Math.round(view.y)}px, 0)`
+                                    : `translate3d(${Math.round(view.x)}px, ${Math.round(view.y)}px, 0) scale(${view.zoom})`,
                                 width: VIRTUAL_CANVAS_WIDTH,
                                 height: VIRTUAL_CANVAS_HEIGHT,
+                                zoom: supportsCssZoom ? view.zoom : undefined,
                                 WebkitFontSmoothing: 'antialiased',
                                 MozOsxFontSmoothing: 'grayscale',
                                 textRendering: 'optimizeLegibility',
+                                WebkitTextSizeAdjust: '100%',
                                 transformOrigin: 'top left',
-                                imageRendering: view.zoom >= 1 ? 'auto' : 'crisp-edges'
+                                imageRendering: 'auto',
+                                filter: 'none'
                             }}>
                                 <ConnectionLayer
                                     connections={connections}
@@ -35574,6 +39419,73 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     </button>
                                 </div>
                             </div>
+                            <div className={`px-3 py-2 border-b ${theme === 'dark' ? 'border-zinc-800 bg-[#151518]' : theme === 'solarized' ? 'border-[#d7cfb2] bg-[#f5efdc]' : 'border-zinc-200 bg-zinc-50'}`}>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className={`text-[10px] px-2 py-0.5 rounded-full ${currentChatSupportsDesignAgent
+                                        ? theme === 'dark' ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30' : 'bg-blue-100 text-blue-700 border border-blue-200'
+                                        : theme === 'dark' ? 'bg-zinc-800 text-zinc-400 border border-zinc-700' : 'bg-zinc-200 text-zinc-600 border border-zinc-300'
+                                        }`}>
+                                        {currentChatSupportsDesignAgent ? 'Gemini 设计 Agent' : '通用对话'}
+                                    </span>
+                                    {currentChatUsesOfficialGemini && (
+                                        <span className={`text-[10px] px-2 py-0.5 rounded-full ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
+                                            官方 Gemini API
+                                        </span>
+                                    )}
+                                    {chatCanvasContextPreview && (
+                                        <span className={`text-[10px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                            当前上下文 {chatCanvasContextPreview.nodes?.length || 0} 节点 / {chatCanvasContextPreview.assets?.length || 0} 素材
+                                        </span>
+                                    )}
+                                </div>
+                                <div className="flex flex-wrap gap-1.5 mt-2">
+                                    <button
+                                        onClick={() => setChatCanvasContextEnabled(prev => !prev)}
+                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 transition-colors ${chatCanvasContextEnabled
+                                            ? theme === 'dark' ? 'bg-blue-600/20 text-blue-300 border-blue-500/30' : 'bg-blue-100 text-blue-700 border-blue-200'
+                                            : theme === 'dark' ? 'bg-zinc-900 text-zinc-500 border-zinc-700 hover:text-zinc-300' : 'bg-white text-zinc-600 border-zinc-300 hover:text-zinc-800'
+                                            }`}
+                                    >
+                                        <Layers size={10} /> 画布上下文
+                                    </button>
+                                    <button
+                                        onClick={() => chatCanvasContextEnabled && setChatAutoAttachCanvasMedia(prev => !prev)}
+                                        disabled={!chatCanvasContextEnabled}
+                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 transition-colors ${!chatCanvasContextEnabled
+                                            ? 'opacity-40 cursor-not-allowed'
+                                            : chatAutoAttachCanvasMedia
+                                                ? theme === 'dark' ? 'bg-blue-600/20 text-blue-300 border-blue-500/30' : 'bg-blue-100 text-blue-700 border-blue-200'
+                                                : theme === 'dark' ? 'bg-zinc-900 text-zinc-500 border-zinc-700 hover:text-zinc-300' : 'bg-white text-zinc-600 border-zinc-300 hover:text-zinc-800'
+                                            }`}
+                                    >
+                                        <ImageIcon size={10} /> 自动附图
+                                    </button>
+                                    <button
+                                        onClick={() => currentChatUsesOfficialGemini && setChatGeminiThinkingEnabled(prev => !prev)}
+                                        disabled={!currentChatUsesOfficialGemini}
+                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 transition-colors ${!currentChatUsesOfficialGemini
+                                            ? 'opacity-40 cursor-not-allowed'
+                                            : chatGeminiThinkingEnabled
+                                                ? theme === 'dark' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                                : theme === 'dark' ? 'bg-zinc-900 text-zinc-500 border-zinc-700 hover:text-zinc-300' : 'bg-white text-zinc-600 border-zinc-300 hover:text-zinc-800'
+                                            }`}
+                                    >
+                                        <Sparkles size={10} /> 深度思考
+                                    </button>
+                                    <button
+                                        onClick={() => currentChatUsesOfficialGemini && setChatGeminiSearchEnabled(prev => !prev)}
+                                        disabled={!currentChatUsesOfficialGemini}
+                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 transition-colors ${!currentChatUsesOfficialGemini
+                                            ? 'opacity-40 cursor-not-allowed'
+                                            : chatGeminiSearchEnabled
+                                                ? theme === 'dark' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                                : theme === 'dark' ? 'bg-zinc-900 text-zinc-500 border-zinc-700 hover:text-zinc-300' : 'bg-white text-zinc-600 border-zinc-300 hover:text-zinc-800'
+                                            }`}
+                                    >
+                                        <FileSearch size={10} /> 联网搜索
+                                    </button>
+                                </div>
+                            </div>
                             <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4 select-text">
                                 {currentSession?.messages.map((msg) => (
                                     <div key={msg.id || msg.timestamp || `msg-${Math.random()}`} className={`flex gap-3 select-text ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
@@ -35652,6 +39564,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     </span>
                                                                 </div>
                                                             )}
+                                                            {f.canvasRef && (
+                                                                <span className={`text-[8px] px-1 rounded ${theme === 'dark' ? 'bg-blue-600/20 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                                                                    {f.canvasRef}
+                                                                </span>
+                                                            )}
                                                         </div>
                                                     ))}
                                                 </div>
@@ -35673,6 +39590,49 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     ) : msg.content ? (
                                                         <div className="markdown-body" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(msg.content)) }} style={{ userSelect: 'text', cursor: 'text' }}></div>
                                                     ) : null}
+                                                </div>
+                                            )}
+                                            {msg.role === 'assistant' && msg.content && msg.content.trim() && !msg.isError && (
+                                                <div className="flex flex-wrap gap-2 pt-1">
+                                                    <button
+                                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 ${theme === 'dark'
+                                                            ? 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
+                                                            : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
+                                                            }`}
+                                                        onMouseDown={(e) => e.stopPropagation()}
+                                                        onClick={() => createImageWorkflowFromChatMessage(currentSession.id, msg.id)}
+                                                    >
+                                                        <Workflow size={10} />
+                                                        {t('创建到画布')}
+                                                    </button>
+                                                    <button
+                                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 ${theme === 'dark'
+                                                            ? 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
+                                                            : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
+                                                            }`}
+                                                        onMouseDown={(e) => e.stopPropagation()}
+                                                        onClick={() => {
+                                                            const targetNodeId = resolvePrimarySelectedNodeId();
+                                                            if (!targetNodeId) {
+                                                                showToast('请先选中一个画布节点', 'warning', 2200);
+                                                                return;
+                                                            }
+                                                            const actionablePrompt = extractActionablePromptFromChatMessage(msg.content);
+                                                            if (!actionablePrompt) {
+                                                                showToast('这条回复里没有可直接同步的提示词', 'warning', 2400);
+                                                                return;
+                                                            }
+                                                            const result = applyHistoryPromptToNode(targetNodeId, actionablePrompt);
+                                                            if (result.applied) {
+                                                                showToast('已同步到当前节点', 'success', 2200);
+                                                            } else {
+                                                                showToast('当前节点不支持接收该提示词', 'warning', 2400);
+                                                            }
+                                                        }}
+                                                    >
+                                                        <ArrowRightSquare size={10} />
+                                                        {t('同步到当前节点')}
+                                                    </button>
                                                 </div>
                                             )}
                                         </div>
@@ -37189,6 +41149,19 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         <div className={`text-[10px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('模型')}</div>
                                                         <div className="flex items-center gap-2">
                                                             <button
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    refreshProviderModels(providerKey).catch(() => { });
+                                                                }}
+                                                                disabled={providerRefreshState[providerKey]?.status === 'loading'}
+                                                                className={`text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'} ${providerRefreshState[providerKey]?.status === 'loading' ? 'opacity-70 cursor-wait' : ''}`}
+                                                            >
+                                                                {providerRefreshState[providerKey]?.status === 'loading'
+                                                                    ? <Loader2 size={10} className="animate-spin" />
+                                                                    : <RefreshCw size={10} />}
+                                                                {t('刷新模型')}
+                                                            </button>
+                                                            <button
                                                                 onClick={() => importApiModelConfigs(providerKey)}
                                                                 className={`text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'}`}
                                                             >
@@ -37212,6 +41185,18 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             </button>
                                                         </div>
                                                     </div>
+                                                    {providerRefreshState[providerKey]?.message && (
+                                                        <div className={`mb-2 text-[9px] ${providerRefreshState[providerKey]?.status === 'error'
+                                                            ? 'text-red-500'
+                                                            : providerRefreshState[providerKey]?.status === 'success'
+                                                                ? 'text-green-500'
+                                                                : theme === 'dark'
+                                                                    ? 'text-zinc-500'
+                                                                    : 'text-zinc-500'
+                                                            }`}>
+                                                            {providerRefreshState[providerKey].message}
+                                                        </div>
+                                                    )}
                                                     <div className="space-y-1.5">
                                                         {group.models.map(api => {
                                                             const isEditing = editingApiModels.has(api._uid);

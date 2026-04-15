@@ -11,12 +11,69 @@
     <div id="root"></div>
     <script>
         (function () {
+            var shouldSilenceConsoleMessage = function (args) {
+                var message = Array.prototype.slice.call(args || []).join(' ');
+                return message.indexOf('Download the React DevTools for a better development experience') !== -1;
+            };
+            ['info', 'log', 'debug'].forEach(function (method) {
+                if (typeof console === 'undefined' || typeof console[method] !== 'function') return;
+                var original = console[method];
+                console[method] = function () {
+                    if (shouldSilenceConsoleMessage(arguments)) return;
+                    return original.apply(console, arguments);
+                };
+            });
             if (window.__APP_BOOT_GUARD__) return;
             window.__APP_BOOT_GUARD__ = true;
             window.__APP_BOOTED__ = false;
+            window.__APP_BOOTSTRAP_STARTED__ = false;
             window.__APP_ERRORS__ = window.__APP_ERRORS__ || [];
             var MAX_ERRORS = 50;
-            var BOOT_TIMEOUT_MS = 5000;
+            var BOOT_TIMEOUT_MS = 20000;
+            var APP_STORAGE_PREFIX = 'tapnow_';
+            var clearAppStorage = function () {
+                try {
+                    var localKeys = [];
+                    for (var i = 0; i < localStorage.length; i += 1) {
+                        var localKey = localStorage.key(i);
+                        if (localKey && localKey.indexOf(APP_STORAGE_PREFIX) === 0) {
+                            localKeys.push(localKey);
+                        }
+                    }
+                    localKeys.forEach(function (key) { localStorage.removeItem(key); });
+                } catch (e) { }
+                try {
+                    var sessionKeys = [];
+                    for (var j = 0; j < sessionStorage.length; j += 1) {
+                        var sessionKey = sessionStorage.key(j);
+                        if (sessionKey && sessionKey.indexOf(APP_STORAGE_PREFIX) === 0) {
+                            sessionKeys.push(sessionKey);
+                        }
+                    }
+                    sessionKeys.forEach(function (key) { sessionStorage.removeItem(key); });
+                } catch (e) { }
+                if (!(window.indexedDB && indexedDB.deleteDatabase)) {
+                    return Promise.resolve();
+                }
+                return new Promise(function (resolve) {
+                    try {
+                        var request = indexedDB.deleteDatabase('tapnow_autosave_db');
+                        request.onsuccess = function () { resolve(true); };
+                        request.onerror = function () { resolve(false); };
+                        request.onblocked = function () { resolve(false); };
+                    } catch (e) {
+                        resolve(false);
+                    }
+                });
+            };
+            window.__TAPNOW_RESET_STORAGE__ = function (shouldReload) {
+                var reloadAfter = shouldReload !== false;
+                return Promise.resolve(clearAppStorage()).finally(function () {
+                    if (reloadAfter) {
+                        window.location.reload();
+                    }
+                });
+            };
             var recordError = function (error, meta) {
                 var entry = {
                     time: new Date().toISOString(),
@@ -62,16 +119,19 @@
                     '<div style="background:#0f0f12;border:1px solid #2a2a2d;border-radius:8px;padding:12px;font-size:12px;white-space:pre-wrap;max-height:240px;overflow:auto;">' +
                     payload.replace(/</g, '&lt;') +
                     '</div>' +
-                    '<div style="display:flex;gap:10px;margin-top:16px;">' +
+                    '<div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;">' +
                     '<button id="tapnow-boot-reload" style="background:#2563eb;color:#fff;border:none;border-radius:8px;padding:8px 12px;font-size:12px;cursor:pointer;">重新加载</button>' +
                     '<button id="tapnow-boot-copy" style="background:#27272a;color:#fff;border:1px solid #3f3f46;border-radius:8px;padding:8px 12px;font-size:12px;cursor:pointer;">复制错误详情</button>' +
+                    '<button id="tapnow-boot-reset" style="background:#7c2d12;color:#fff;border:1px solid #ea580c;border-radius:8px;padding:8px 12px;font-size:12px;cursor:pointer;">清空本地数据并重启</button>' +
                     '</div>' +
                     '</div>' +
                     '</div>';
                 var reloadBtn = document.getElementById('tapnow-boot-reload');
                 var copyBtn = document.getElementById('tapnow-boot-copy');
+                var resetBtn = document.getElementById('tapnow-boot-reset');
                 if (reloadBtn) reloadBtn.onclick = function () { window.location.reload(); };
                 if (copyBtn) copyBtn.onclick = function () { copyText(payload); };
+                if (resetBtn) resetBtn.onclick = function () { window.__TAPNOW_RESET_STORAGE__(); };
             };
             window.addEventListener('error', function (event) {
                 recordError(event && event.error ? event.error : event && event.message, {
@@ -84,9 +144,9 @@
             window.addEventListener('unhandledrejection', function (event) {
                 recordError(event && event.reason ? event.reason : 'UnhandledRejection', { type: 'unhandledrejection' });
             });
-            window.setTimeout(function () {
-                if (!window.__APP_BOOTED__) {
-                    renderFallback(new Error('APP_BOOT_TIMEOUT'), { type: 'boot_timeout' });
+            window.__APP_INLINE_BOOT_TIMER__ = window.setTimeout(function () {
+                if (!window.__APP_BOOTSTRAP_STARTED__) {
+                    renderFallback(new Error('APP_BOOT_TIMEOUT'), { type: 'boot_timeout', phase: 'bootstrap_pending' });
                 }
             }, BOOT_TIMEOUT_MS);
         })();
