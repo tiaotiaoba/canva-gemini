@@ -69,6 +69,205 @@ import i18n from './i18n';
 const DEFAULT_VIEW = { x: 0, y: 0, zoom: 1 };
 const t = i18n.t.bind(i18n);
 
+const TEXT_REWRITE_ROLE_LABELS = Object.freeze({
+    brandName: '品牌名',
+    headline: '大标题',
+    subheadline: '副标题',
+    body: '正文',
+    callToAction: 'CTA',
+    other: '其他'
+});
+
+const clampNumber = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const normalizeTextRewriteRole = (value) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return 'other';
+    if (['brand', 'brandname', 'logo', '品牌', '品牌名', '商标'].includes(normalized)) return 'brandName';
+    if (['headline', 'title', 'heading', '主标题', '标题', '大标题'].includes(normalized)) return 'headline';
+    if (['subheadline', 'subtitle', 'subheading', '副标题', '副文案', '副标'].includes(normalized)) return 'subheadline';
+    if (['body', 'bodycopy', 'copy', 'text', 'paragraph', '正文', '文案', '说明', '内容'].includes(normalized)) return 'body';
+    if (['cta', 'calltoaction', 'button', 'action', '按钮', '行动按钮'].includes(normalized)) return 'callToAction';
+    return 'other';
+};
+
+const normalizeTextRewriteUnit = (value) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 0;
+    const absolute = Math.abs(numeric);
+    if (absolute <= 1) return numeric * 1000;
+    if (absolute <= 100) return numeric * 10;
+    return numeric;
+};
+
+const normalizeTextRewriteBBox = (rawBox = {}) => {
+    if (!rawBox || typeof rawBox !== 'object') return null;
+    const left = rawBox.left ?? rawBox.x ?? rawBox.x1 ?? rawBox.l ?? 0;
+    const top = rawBox.top ?? rawBox.y ?? rawBox.y1 ?? rawBox.t ?? 0;
+    const width = rawBox.width ?? rawBox.w ?? rawBox.boxWidth ?? rawBox.bboxWidth;
+    const height = rawBox.height ?? rawBox.h ?? rawBox.boxHeight ?? rawBox.bboxHeight;
+    const right = rawBox.right ?? rawBox.x2;
+    const bottom = rawBox.bottom ?? rawBox.y2;
+    const normalizedX = clampNumber(Math.round(normalizeTextRewriteUnit(left)), 0, 1000);
+    const normalizedY = clampNumber(Math.round(normalizeTextRewriteUnit(top)), 0, 1000);
+    const normalizedRight = Number.isFinite(Number(right))
+        ? clampNumber(Math.round(normalizeTextRewriteUnit(right)), 0, 1000)
+        : null;
+    const normalizedBottom = Number.isFinite(Number(bottom))
+        ? clampNumber(Math.round(normalizeTextRewriteUnit(bottom)), 0, 1000)
+        : null;
+    const normalizedW = Number.isFinite(Number(width))
+        ? clampNumber(Math.round(normalizeTextRewriteUnit(width)), 0, 1000)
+        : (normalizedRight !== null ? clampNumber(normalizedRight - normalizedX, 0, 1000) : 0);
+    const normalizedH = Number.isFinite(Number(height))
+        ? clampNumber(Math.round(normalizeTextRewriteUnit(height)), 0, 1000)
+        : (normalizedBottom !== null ? clampNumber(normalizedBottom - normalizedY, 0, 1000) : 0);
+    if (normalizedW <= 0 || normalizedH <= 0) return null;
+    return {
+        x: normalizedX,
+        y: normalizedY,
+        w: normalizedW,
+        h: normalizedH
+    };
+};
+
+const normalizeTextRewriteBlocks = (rawBlocks = []) => {
+    if (!Array.isArray(rawBlocks)) return [];
+    return rawBlocks
+        .map((block, index) => {
+            if (!block || typeof block !== 'object') return null;
+            const text = String(
+                block.text
+                ?? block.content
+                ?? block.value
+                ?? block.label
+                ?? block.copy
+                ?? ''
+            )
+                .replace(/\r/g, '')
+                .replace(/[ \t]+\n/g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+            const bbox = normalizeTextRewriteBBox(
+                block.bbox
+                || block.box
+                || block.rect
+                || block.bounds
+                || {
+                    x: block.x,
+                    y: block.y,
+                    w: block.w ?? block.width,
+                    h: block.h ?? block.height,
+                    left: block.left,
+                    top: block.top,
+                    right: block.right,
+                    bottom: block.bottom
+                }
+            );
+            if (!text || !bbox) return null;
+            const order = Number.isFinite(Number(block.order))
+                ? Number(block.order)
+                : (bbox.y * 1000 + bbox.x + index);
+            return {
+                id: String(block.id || `text-block-${index + 1}`),
+                text,
+                role: normalizeTextRewriteRole(block.role || block.kind || block.type),
+                order,
+                bbox
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.order - b.order);
+};
+
+const buildTextRewriteCopyDraft = (blocks = []) => {
+    const list = Array.isArray(blocks) ? blocks : [];
+    const getFirstByRole = (role) => list.find((item) => item.role === role)?.text || '';
+    const bodyBlocks = list
+        .filter((item) => item.role === 'body')
+        .map((item) => item.text)
+        .filter(Boolean);
+    return {
+        brandName: getFirstByRole('brandName'),
+        headline: getFirstByRole('headline'),
+        subheadline: getFirstByRole('subheadline'),
+        body: bodyBlocks.join('\n'),
+        callToAction: getFirstByRole('callToAction')
+    };
+};
+
+const parseLooseJsonObject = (rawText) => {
+    const source = String(rawText || '').trim();
+    if (!source) return null;
+    const candidates = [];
+    const fencedJson = source.match(/```json\s*([\s\S]*?)```/i);
+    if (fencedJson?.[1]?.trim()) candidates.push(fencedJson[1].trim());
+    const fencedAny = source.match(/```(?:javascript|js|text)?\s*([\s\S]*?)```/i);
+    if (fencedAny?.[1]?.trim()) candidates.push(fencedAny[1].trim());
+    candidates.push(source);
+    const objectWindow = source.match(/\{[\s\S]*\}/);
+    if (objectWindow?.[0]) candidates.push(objectWindow[0]);
+    for (const candidate of candidates) {
+        const cleaned = String(candidate || '').trim();
+        if (!cleaned) continue;
+        try {
+            return JSON.parse(cleaned);
+        } catch (error) {
+            try {
+                const repaired = cleaned
+                    .replace(/```json/gi, '')
+                    .replace(/```/g, '')
+                    .replace(/\/\*[\s\S]*?\*\//g, '')
+                    .replace(/^\s*\/\/.*$/gm, '')
+                    .replace(/,(\s*[}\]])/g, '$1')
+                    .trim();
+                if (!repaired) continue;
+                return JSON.parse(repaired);
+            } catch (repairError) { }
+        }
+    }
+    return null;
+};
+
+const extractModelTextContent = (payload) => {
+    if (!payload || typeof payload !== 'object') return '';
+    const primaryMessage = payload?.choices?.[0]?.message || payload?.data?.choices?.[0]?.message;
+    if (primaryMessage?.content !== undefined) {
+        if (Array.isArray(primaryMessage.content)) {
+            return primaryMessage.content
+                .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+                .filter(Boolean)
+                .join('\n');
+        }
+        return String(primaryMessage.content || '');
+    }
+    if (payload.content !== undefined) return String(payload.content || '');
+    if (payload.text !== undefined) return String(payload.text || '');
+    if (payload.message !== undefined) {
+        return typeof payload.message === 'string'
+            ? payload.message
+            : String(payload.message?.content || '');
+    }
+    if (payload.result !== undefined) {
+        return typeof payload.result === 'string'
+            ? payload.result
+            : String(payload.result?.content || '');
+    }
+    if (payload.data?.content !== undefined) return String(payload.data.content || '');
+    if (payload.data?.text !== undefined) return String(payload.data.text || '');
+    if (payload.data?.message !== undefined) {
+        return typeof payload.data.message === 'string'
+            ? payload.data.message
+            : String(payload.data.message?.content || '');
+    }
+    if (payload.data?.result !== undefined) {
+        return typeof payload.data.result === 'string'
+            ? payload.data.result
+            : String(payload.data.result?.content || '');
+    }
+    return '';
+};
+
 
 // --- MaskVisualFeedback 组件：蒙版视觉反馈层 ---
 const MaskVisualFeedback = ({ canvasRef, isDrawing }) => {
@@ -1936,25 +2135,247 @@ const CHAT_CANVAS_CONTEXT_MAX_NODES = 18;
 const CHAT_CANVAS_CONTEXT_MAX_MEDIA = 8;
 const CHAT_CANVAS_CONTEXT_MAX_SHOTS = 6;
 const CHAT_CANVAS_CONTEXT_TEXT_LIMIT = 320;
-const GEMINI_DESIGN_AGENT_SYSTEM_PROMPT = `你是 TapNow 内置的 Gemini 设计 Agent。
+const PROVIDER_MODEL_RENDER_STEP = 80;
+const MODEL_LIBRARY_RENDER_STEP = 60;
+const CHAT_AGENT_INTENT_MODES = Object.freeze({
+    CONVERSATION: 'conversation',
+    IDEATION: 'ideation',
+    MATERIAL: 'material',
+    TEXT: 'text',
+    PLANNING: 'planning',
+    EXECUTION: 'execution'
+});
+const CHAT_AGENT_INTENT_MODE_LABELS = Object.freeze({
+    [CHAT_AGENT_INTENT_MODES.CONVERSATION]: '思考对话',
+    [CHAT_AGENT_INTENT_MODES.IDEATION]: '创意共创',
+    [CHAT_AGENT_INTENT_MODES.MATERIAL]: '素材分析',
+    [CHAT_AGENT_INTENT_MODES.TEXT]: '文本处理',
+    [CHAT_AGENT_INTENT_MODES.PLANNING]: '方案规划',
+    [CHAT_AGENT_INTENT_MODES.EXECUTION]: '执行落地'
+});
+const CHAT_AGENT_FOLLOW_UP_PATTERN = /^(继续|再来|换一版|换个|多来|还有吗|然后|细化|展开|延展|深入|优化一下|改一下|偏向|那如果|或者|基于这个|照这个|按这个|再给我|多给我|补充)/i;
+const CHAT_AGENT_EXECUTION_PATTERNS = [
+    /(直接(生成|输出|给|做)|帮我(生成|输出|写|做)|给我(?:一版|一个|几个)?(?:提示词|prompt|json|工作流|节点配置)|输出(?:成|为)?\s*(?:json|prompt|提示词|工作流)|创建(?:到)?画布|落到节点|落地执行|开始做|开做)/i,
+    /(生成(?:一张|一版|一组)?(?:主图|海报|KV|分镜|提示词|workflow|工作流)|做(?:一版|一组|一套)|出图|做图|产出(?:提示词|方案))/i,
+    /\b(?:system_reasoning|api_payload|compiled_prompt|edit_instruction|negative_prompt)\b/i
+];
+const CHAT_AGENT_PLANNING_PATTERNS = [
+    /(方案|策略|工作流|流程|步骤|拆解|规划|怎么做|怎么搭|节点编排|路线|主图结构|套图思路|分镜脚本|执行路径|plan|roadmap)/i
+];
+const CHAT_AGENT_MATERIAL_PATTERNS = [
+    /(抓取|提取|整理|分析|识别|盘点|总结|归纳|拆一下|看看|读一下).{0,12}(素材|参考图|图片|图里|画面|元素|卖点|品牌|参数|信息|内容|视频|附件)/i,
+    /(素材|参考图|这张图|这些图|这个视频|附件|资料包|产品图|详情页|海报|pdf|文档)/i
+];
+const CHAT_AGENT_TEXT_PATTERNS = [
+    /(提取|识别|ocr|改写|润色|翻译|重写|扩写|压缩|整理|提炼|校对|转成表格|摘出).{0,10}(文案|文字|文本|标题|副标题|正文|口播|字幕|卖点|参数|copy|headline|text)/i,
+    /\b(?:ocr|copywriting|headline|subheadline|voiceover|subtitle)\b/i
+];
+const CHAT_AGENT_IDEATION_PATTERNS = [
+    /(创意|灵感|脑暴|脑洞|方向|风格|调性|概念|想法|一起想|聊聊|聊一下|有没有更好|还有什么可能|怎么更像|怎么更高级|主视觉方向|文案方向|品牌感|氛围感|参考方向)/i
+];
+const CHAT_AGENT_SEARCH_PATTERNS = [
+    /(趋势|竞品|市场|行业|小红书|抖音|天猫|京东|淘宝|亚马逊|amazon|shopify|官网|review|测评|参数|最新|今年|最近|资料|品牌|对标)/i
+];
+const CHAT_AGENT_CANVAS_PATTERNS = [
+    /(节点#?\s*\d+|素材#?\s*\d+|画布|节点|工作流|workflow|source_refs|node)/i
+];
+const CHAT_AGENT_URL_PATTERN = /https?:\/\/[^\s<>"']+/i;
+const CHAT_AGENT_MODE_INSTRUCTIONS = Object.freeze({
+    [CHAT_AGENT_INTENT_MODES.CONVERSATION]: [
+        '- 先像协作搭子一样直接回应用户，优先给判断、解释和下一步建议，不要默认上来就写完整方案。',
+        '- 只有在缺少关键信息时才追问 1 个最重要的问题；否则先继续对话。',
+        '- 只要用户还在讨论阶段，就不要把整段自然语言回复写成可直接同步到绘图节点的 prompt。'
+    ].join('\n'),
+    [CHAT_AGENT_INTENT_MODES.IDEATION]: [
+        '- 像创意搭档一样共创，优先提供 2-4 个方向、切角、风格差异或文案方向。',
+        '- 默认先帮助用户把想法想透，再进入方案或执行；除非用户明确要求，不要直接切到 SOP、节点编排或 JSON。',
+        '- 不要把创意分析段落直接伪装成最终 prompt。'
+    ].join('\n'),
+    [CHAT_AGENT_INTENT_MODES.MATERIAL]: [
+        '- 先抓取和整理素材本身：主体、卖点、品牌元素、版式、镜头、色彩、文案、尺寸/参数、可复用信息与缺失信息。',
+        '- 回答重点放在“识别出了什么 / 能怎么用 / 还缺什么”，不要默认直接生成整套设计方案。',
+        '- 如果只是做素材分析，不要顺手输出可执行 prompt。'
+    ].join('\n'),
+    [CHAT_AGENT_INTENT_MODES.TEXT]: [
+        '- 以文字任务为主，优先交付提取、OCR、改写、润色、翻译、提炼卖点或结构整理的结果。',
+        '- 先把文字结果本身做好，再补一句可选设计建议；除非用户要求，不要展开成完整视觉方案。',
+        '- 不要把文案改写结果直接当作图像 prompt。'
+    ].join('\n'),
+    [CHAT_AGENT_INTENT_MODES.PLANNING]: [
+        '- 把需求拆成 1-3 个可执行方案或工作流，明确目标、步骤、素材对应关系、节点建议和预期产出。',
+        '- 涉及多素材 / 多节点时，要显式写清 SOURCE_REFS，或在正文中明确标注“素材# / 节点#”的对应关系。',
+        '- 只有在用户明显要求直接执行时，再附上精简 JSON prompt spec。',
+        '- 如果还处在方案阶段，不要把整段方案正文写成可直接喂给模型的 prompt。'
+    ].join('\n'),
+    [CHAT_AGENT_INTENT_MODES.EXECUTION]: [
+        '- 目标是直接落地。先用 1-2 句话说明执行意图，再输出可直接用于节点的精简结构。',
+        '- 图像相关任务优先使用全大写下划线格式的 SYSTEM_REASONING + API_PAYLOAD；API_PAYLOAD 尽量包含 COMPILED_PROMPT、EDIT_INSTRUCTION、NEGATIVE_PROMPT、ASPECT_RATIO、RESOLUTION、SAMPLE_COUNT，空字段不要输出。',
+        '- 如果输出纯文本提示词，必须明确使用“提示词：”标签或 ```prompt 代码块，避免把解释性正文误判为 prompt。'
+    ].join('\n')
+});
+const matchChatIntentPattern = (text, patterns = []) => {
+    const source = String(text || '').trim();
+    if (!source) return false;
+    return patterns.some((pattern) => pattern.test(source));
+};
+const getLastChatIntentMode = (messages = []) => {
+    if (!Array.isArray(messages)) return CHAT_AGENT_INTENT_MODES.CONVERSATION;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const mode = String(messages[index]?.intentMode || '').trim();
+        if (mode) return mode;
+    }
+    return CHAT_AGENT_INTENT_MODES.CONVERSATION;
+};
+const inferChatAgentRoute = ({ userInput, files = [], historyMessages = [], canvasContext = null } = {}) => {
+    const text = String(userInput || '').trim();
+    const hasFiles = Array.isArray(files) && files.length > 0;
+    const hasVisualFiles = hasFiles && files.some((file) => file?.isImage || file?.isVideo);
+    const hasDocumentFiles = hasFiles && files.some((file) => file?.isPDF || file?.isDoc || file?.isExcel || file?.isCode);
+    const hasUrlInput = CHAT_AGENT_URL_PATTERN.test(text);
+    const hasCanvasContext = !!canvasContext?.text;
+    const previousMode = getLastChatIntentMode(historyMessages);
+    const reasons = [];
+    const isFollowUp = CHAT_AGENT_FOLLOW_UP_PATTERN.test(text)
+        || (!!text && text.length <= 18 && /^(再|继续|换|改|偏|那|然后|还有|多来|补充|细化)/.test(text));
+    const wantsExecution = matchChatIntentPattern(text, CHAT_AGENT_EXECUTION_PATTERNS);
+    const wantsPlanning = !wantsExecution && matchChatIntentPattern(text, CHAT_AGENT_PLANNING_PATTERNS);
+    const wantsText = matchChatIntentPattern(text, CHAT_AGENT_TEXT_PATTERNS);
+    const wantsIdeation = !wantsExecution && matchChatIntentPattern(text, CHAT_AGENT_IDEATION_PATTERNS);
+    const wantsMaterial = matchChatIntentPattern(text, CHAT_AGENT_MATERIAL_PATTERNS);
+    const wantsSearch = matchChatIntentPattern(text, CHAT_AGENT_SEARCH_PATTERNS);
+    const mentionsCanvas = matchChatIntentPattern(text, CHAT_AGENT_CANVAS_PATTERNS);
 
-你的核心职责：
-1. 把用户需求拆成可执行的画布工作流，而不只是给一句提示词。
-2. 当消息里出现“节点#”或“素材#”时，必须严格按编号引用对应对象，不能混淆。
-3. 当提供了画布上下文时，要同时理解节点类型、上下游关系、提示词、模型参数、镜头语言和素材内容。
-4. 当提供了图片或视频素材时，要主动分析构图、主体、风格、镜头、颜色、品牌元素、质感与连续性。
-5. 当模型支持搜索时，先利用搜索补足时效性信息，再把结果转成可落地的设计或分镜建议。
-6. 优先输出完整方案：目标拆解、节点编排、素材对应关系、套图/分镜方案、可直接执行的提示词。
+    let mode = CHAT_AGENT_INTENT_MODES.CONVERSATION;
+    if (isFollowUp && previousMode && previousMode !== CHAT_AGENT_INTENT_MODES.CONVERSATION) {
+        mode = previousMode;
+        reasons.push(`延续上一轮${CHAT_AGENT_INTENT_MODE_LABELS[previousMode] || previousMode}`);
+    } else if (wantsExecution) {
+        mode = CHAT_AGENT_INTENT_MODES.EXECUTION;
+        reasons.push('用户明确要求直接生成 / 输出 / 落地');
+    } else if (wantsPlanning) {
+        mode = CHAT_AGENT_INTENT_MODES.PLANNING;
+        reasons.push('用户当前更想要结构化方案或工作流');
+    } else if (((hasFiles || hasUrlInput) && (wantsMaterial || wantsText)) || (!text && hasFiles)) {
+        mode = CHAT_AGENT_INTENT_MODES.MATERIAL;
+        reasons.push(hasUrlInput ? '当前重点更像是在读取链接页与附件素材' : '当前重点更像是在读取和整理附件素材');
+    } else if (wantsText) {
+        mode = CHAT_AGENT_INTENT_MODES.TEXT;
+        reasons.push('用户主要在处理文字内容');
+    } else if (wantsIdeation) {
+        mode = CHAT_AGENT_INTENT_MODES.IDEATION;
+        reasons.push('用户当前更需要一起想创意和方向');
+    } else if ((hasVisualFiles || hasDocumentFiles || hasUrlInput) && text.length <= 24 && /^(看|读|拆|分析|识别|提取)/.test(text)) {
+        mode = CHAT_AGENT_INTENT_MODES.MATERIAL;
+        reasons.push(hasUrlInput ? '短指令配合链接，更适合先做素材分析' : '短指令配合附件，更适合先做素材分析');
+    } else if (hasCanvasContext && mentionsCanvas) {
+        mode = CHAT_AGENT_INTENT_MODES.PLANNING;
+        reasons.push('当前问题与画布节点 / 工作流强相关');
+    } else {
+        reasons.push('默认按自然对话理解当前需求');
+    }
 
-输出要求：
-- 默认使用中文。
-- 如果引用画布对象，统一使用“节点#1 / 素材#1”格式。
-- 如果用户要做系列图、角色一致性、镜头脚本或品牌套图，优先给出分步骤工作流。
-- 如果需要用户下一步操作，明确告诉他应该修改哪个节点、补哪张素材、或如何串联节点。
-- 如果用户在做 AI 绘图、图生图、套图延展、镜头设计或 Gemini image 相关任务，优先输出可直接落到节点里的精简 JSON 提示词对象，结构优先使用全大写下划线格式的 SYSTEM_REASONING + API_PAYLOAD；其中 API_PAYLOAD 应尽量包含 COMPILED_PROMPT、EDIT_INSTRUCTION、NEGATIVE_PROMPT、ASPECT_RATIO、RESOLUTION、SAMPLE_COUNT，不要输出空字段或 Not applicable 之类无效值。
-- 如果是图生图或局部编辑，优先把“保留主体不变、只改哪里、改成什么”的动作写进 EDIT_INSTRUCTION；真正喂给图像模型的画面描述尽量集中在 COMPILED_PROMPT 里，并自动过滤空字段与无效占位值。
-- 当你给出多个方案时，要按“方案#1 / 方案#2”编号，并在每个方案里明确对应的素材编号、节点编号和预期产出。
-- 如果存在多素材 / 多提示词映射，每个方案都要显式写清 SOURCE_REFS（如 ["素材#1","素材#3"]）或在正文中明确标注“对应素材#1 + 素材#3”；一个素材对应多个方案时，每个方案都重复写出该素材编号。`;
+    return {
+        mode,
+        label: CHAT_AGENT_INTENT_MODE_LABELS[mode] || CHAT_AGENT_INTENT_MODE_LABELS[CHAT_AGENT_INTENT_MODES.CONVERSATION],
+        previousMode,
+        routerNote: reasons.join('；'),
+        hasFiles,
+        hasUrlInput,
+        hasCanvasContext,
+        skills: {
+            search: wantsSearch,
+            materialReview: hasFiles || hasUrlInput || mode === CHAT_AGENT_INTENT_MODES.MATERIAL,
+            textCraft: wantsText || mode === CHAT_AGENT_INTENT_MODES.TEXT || (mode === CHAT_AGENT_INTENT_MODES.MATERIAL && /文案|文字|文本|copy|title|headline|subtitle|参数|卖点|口播|字幕/i.test(text)),
+            canvasMapping: hasCanvasContext || mentionsCanvas,
+            workflowJson: mode === CHAT_AGENT_INTENT_MODES.EXECUTION || (mode === CHAT_AGENT_INTENT_MODES.PLANNING && /提示词|prompt|json|节点|工作流|方案|分镜|主图|海报|套图/i.test(text))
+        }
+    };
+};
+const buildChatAgentSkillBlock = (route = {}, options = {}) => {
+    const lines = [];
+    if (route?.skills?.search && options.searchEnabled) {
+        lines.push('- SEARCH：在需要时效信息、竞品、品牌资料或平台趋势时，先搜索再总结。');
+    }
+    if (route?.skills?.materialReview) {
+        lines.push('- MATERIAL_REVIEW：先识别附件里的主体、构图、风格、版式、文案、参数与可复用元素。');
+    }
+    if (route?.skills?.textCraft) {
+        lines.push('- TEXT_CRAFT：直接提取、整理、改写、翻译或压缩文案，不要绕到泛泛而谈。');
+    }
+    if (route?.skills?.canvasMapping) {
+        lines.push('- CANVAS_MAPPING：把建议映射到 节点# / 素材#，并利用上下游关系。');
+    }
+    if (route?.skills?.workflowJson) {
+        lines.push('- WORKFLOW_JSON：仅在用户明确要落地执行时，输出可解析的 SYSTEM_REASONING + API_PAYLOAD。');
+    }
+    if (options.thinkingEnabled && [CHAT_AGENT_INTENT_MODES.IDEATION, CHAT_AGENT_INTENT_MODES.PLANNING, CHAT_AGENT_INTENT_MODES.EXECUTION].includes(route?.mode)) {
+        lines.push('- THINKING：先做隐藏推演，再给用户简洁结论，不展示冗长思维过程。');
+    }
+    return lines.length > 0 ? `本轮优先技能：\n${lines.join('\n')}` : '';
+};
+const buildChatImageModelGuide = (options = {}) => {
+    const modelId = String(options.imageModelId || '').trim();
+    if (!modelId) return '';
+    const lowerModelId = modelId.toLowerCase();
+    const label = options.imageModelLabel || modelId;
+    const lines = [`当前目标绘图模型：${label}`];
+    if (lowerModelId.includes('gemini') || lowerModelId.includes('imagen')) {
+        lines.push('- 按 Gemini / Imagen 风格组织提示词：使用自然语言描述画面，不要输出 Midjourney 参数如 --ar、--v、--stylize、--q。');
+        lines.push('- 比例、分辨率、出图张数分别写进 API_PAYLOAD.ASPECT_RATIO / RESOLUTION / SAMPLE_COUNT，不要混进 COMPILED_PROMPT。');
+        lines.push('- 有参考图时，把“保留什么 / 改哪里 / 怎么改”写进 EDIT_INSTRUCTION，把纯画面描述写进 COMPILED_PROMPT。');
+    } else if (lowerModelId.includes('mj') || lowerModelId.includes('midjourney')) {
+        lines.push('- 按 Midjourney 风格组织提示词：主体与风格建议用英文短句，参数可以留在 prompt 末尾。');
+    } else if (lowerModelId.includes('jimeng')) {
+        lines.push('- 按即梦风格组织提示词：优先中文，画面主体、镜头、场景、氛围、质感与限制条件写清楚。');
+    }
+    return lines.join('\n');
+};
+const buildAdaptiveChatSystemPrompt = (route = {}, options = {}) => {
+    const mode = route?.mode || CHAT_AGENT_INTENT_MODES.CONVERSATION;
+    const modeLabel = CHAT_AGENT_INTENT_MODE_LABELS[mode] || CHAT_AGENT_INTENT_MODE_LABELS[CHAT_AGENT_INTENT_MODES.CONVERSATION];
+    const modeInstruction = CHAT_AGENT_MODE_INSTRUCTIONS[mode] || CHAT_AGENT_MODE_INSTRUCTIONS[CHAT_AGENT_INTENT_MODES.CONVERSATION];
+    const skillBlock = buildChatAgentSkillBlock(route, options);
+    const imageModelGuide = buildChatImageModelGuide(options);
+    const header = options.designAgent ? '你是 TapNow 内置的设计 Agent。' : '你是 TapNow 的多模态设计协作助手。';
+    const designRules = options.designAgent
+        ? [
+            '9. 只有在用户明确要“方案 / 工作流 / 提示词 / 创建到画布 / 直接执行”时，才优先输出完整节点编排或可解析 JSON。',
+            '10. 图像执行任务中，优先把真正喂给模型的画面描述收敛到 API_PAYLOAD.COMPILED_PROMPT，把“保留什么 / 改哪里 / 改成什么”写进 EDIT_INSTRUCTION。'
+        ].join('\n')
+        : '';
+    return [
+        header,
+        '',
+        '你既要能像创意搭档一样思考对话，也要能像执行 agent 一样给出可落地结果。',
+        '',
+        '行为总则：',
+        '1. 先判断用户这一轮真正需要的是：思考对话、创意共创、素材抓取、文本处理、方案规划、执行落地。不要默认一上来就给完整方案。',
+        '2. 回复要贴着“此刻用户想要什么”走：用户想聊，就先聊；用户想抓素材，就先抓取；用户想改文案，就先处理文字；用户想出方案，再上结构化方案；用户想直接做，再输出可执行 prompt / workflow。',
+        '3. 如果需求还在探索阶段或表达含糊，优先给判断、方向或最多 1 个关键追问，而不是直接输出大段 SOP。',
+        '4. 当消息里出现“节点#”或“素材#”时，必须严格按编号引用对应对象，不能混淆。',
+        '5. 当提供了画布上下文时，要同时理解节点类型、上下游关系、提示词、模型参数、镜头语言和素材内容。',
+        '6. 当提供了图片、视频或文档素材时，要先分析主体、构图、风格、版式、文案、参数、品牌元素和可复用信息。',
+        '7. 当任务涉及时效信息、品牌资料、竞品或平台趋势，且搜索可用时，先利用搜索补足信息，再给结论。',
+        '8. 默认使用中文，回答简洁但有判断，不机械罗列模板。',
+        designRules,
+        '',
+        `当前路由模式：${modeLabel}`,
+        `系统路由参考：${route?.routerNote || '基于用户本轮输入与上下文自动判断。'}`,
+        modeInstruction,
+        '',
+        skillBlock,
+        imageModelGuide,
+        '',
+        '输出要求：',
+        '- 默认使用中文。',
+        '- 不要向用户解释“你被路由到某个模式”；直接自然地完成任务。',
+        '- 如果引用画布对象，统一使用“节点#1 / 素材#1”格式。',
+        '- 如果当前是对话、创意、素材分析或文本处理模式，不要强行输出 JSON、节点编排或整套 SOP。',
+        '- 如果给出多个方向或方案，使用“方向#1 / 方案#1”编号。',
+        '- 未进入执行落地模式时，不要输出可直接同步到绘图节点的提示词块。',
+        '- 当且仅当当前进入执行落地模式，或用户明确要求 prompt / JSON / workflow 时，再输出可直接落地的精简结构。'
+    ].filter(Boolean).join('\n');
+};
 const NODE_TYPE_LABELS = Object.freeze({
     'input-image': '图片输入',
     'video-input': '视频输入',
@@ -5268,7 +5689,7 @@ function TapnowApp() {
     const saveToUndoStack = useCallback(() => {
         if (isUndoRedoRef.current) return; // undo/redo 操作不记录
         setUndoStack(prev => {
-            const newStack = [...prev, { nodes: JSON.parse(JSON.stringify(nodes)), connections: JSON.parse(JSON.stringify(connections)) }];
+            const newStack = [...prev, { nodes: structuredClone(nodes), connections: structuredClone(connections) }];
             // 限制最多保存 maxUndoSteps 步
             return newStack.slice(-maxUndoSteps);
         });
@@ -5545,7 +5966,7 @@ function TapnowApp() {
         isUndoRedoRef.current = true;
         const lastState = undoStack[undoStack.length - 1];
         // 当前状态入 redo 栈
-        setRedoStack(prev => [...prev, { nodes: JSON.parse(JSON.stringify(nodes)), connections: JSON.parse(JSON.stringify(connections)) }]);
+        setRedoStack(prev => [...prev, { nodes: structuredClone(nodes), connections: structuredClone(connections) }]);
         // 恢复上一个状态
         setNodes(lastState.nodes);
         setConnections(lastState.connections);
@@ -5560,7 +5981,7 @@ function TapnowApp() {
         isUndoRedoRef.current = true;
         const nextState = redoStack[redoStack.length - 1];
         // 当前状态入 undo 栈
-        setUndoStack(prev => [...prev, { nodes: JSON.parse(JSON.stringify(nodes)), connections: JSON.parse(JSON.stringify(connections)) }]);
+        setUndoStack(prev => [...prev, { nodes: structuredClone(nodes), connections: structuredClone(connections) }]);
         // 恢复下一个状态
         setNodes(nextState.nodes);
         setConnections(nextState.connections);
@@ -5673,8 +6094,8 @@ function TapnowApp() {
             modelLibrary.forEach((entry) => {
                 if (prev.has(entry.id)) {
                     next.add(entry.id);
-                } else if (!hasStoredState) {
-                    // 初次加载时默认全部折叠
+                } else if (!hasStoredState || entry.source === 'provider-refresh') {
+                    // 初次加载和批量拉取模型时默认折叠，避免大量表单同时展开拖垮页面
                     next.add(entry.id);
                 }
             });
@@ -6612,6 +7033,7 @@ function TapnowApp() {
     const [promptLibraryCollapsed, setPromptLibraryCollapsed] = useState(false);
     const [promptLibraryEditorOpen, setPromptLibraryEditorOpen] = useState(false);
     const [imageEditModal, setImageEditModal] = useState({ nodeId: null, isMasking: false });
+    const [textRewriteScanState, setTextRewriteScanState] = useState({ nodeId: null, loading: false, error: '' });
     useEffect(() => {
         try {
             localStorage.setItem(PROMPT_LIBRARY_KEY, JSON.stringify(promptLibrary));
@@ -6737,6 +7159,9 @@ function TapnowApp() {
     const [editingApiModels, setEditingApiModels] = useState(() => new Set());
     const [editingLibraryModels, setEditingLibraryModels] = useState(() => new Set());
     const [libraryPreviewModels, setLibraryPreviewModels] = useState(() => new Set());
+    const [providerModelVisibleCounts, setProviderModelVisibleCounts] = useState(() => ({}));
+    const [libraryModelVisibleCount, setLibraryModelVisibleCount] = useState(MODEL_LIBRARY_RENDER_STEP);
+    const [modelLibraryFilter, setModelLibraryFilter] = useState('');
     const [libraryPreviewEditing, setLibraryPreviewEditing] = useState(() => new Set());
     const [libraryPreviewDrafts, setLibraryPreviewDrafts] = useState(() => ({}));
     const [libraryRequestPreviewEditing, setLibraryRequestPreviewEditing] = useState(() => new Set());
@@ -9344,6 +9769,23 @@ function TapnowApp() {
     }, [modelLibrary]);
 
     const hasExpandedLibraryModels = modelLibrary.some(entry => !collapsedLibraryModels.has(entry.id));
+    const normalizedModelLibraryFilter = String(modelLibraryFilter || '').trim().toLowerCase();
+    const filteredModelLibrary = useMemo(() => {
+        if (!normalizedModelLibraryFilter) return modelLibrary;
+        return modelLibrary.filter((entry) => (
+            [
+                entry.id,
+                entry.displayName,
+                entry.modelName,
+                entry.type,
+                entry.apiType
+            ].some((value) => String(value || '').toLowerCase().includes(normalizedModelLibraryFilter))
+        ));
+    }, [modelLibrary, normalizedModelLibraryFilter]);
+
+    useEffect(() => {
+        setLibraryModelVisibleCount(MODEL_LIBRARY_RENDER_STEP);
+    }, [normalizedModelLibraryFilter, settingsTab]);
 
     const resolveApiConfig = useCallback((config) => {
         if (!config) return null;
@@ -10118,17 +10560,19 @@ function TapnowApp() {
         if (!canvasRef.current) return nodes;
 
         const rect = canvasRef.current.getBoundingClientRect();
-        const padding = 200; // 额外的渲染区域，避免边缘闪烁
-        const currentView = viewRef.current;
+        if (!rect.width || !rect.height) return nodes;
+        const currentView = view;
+        const safeZoom = Math.max(0.2, Math.min(3, Number(currentView.zoom) || 1));
+        const padding = Math.max(220, Math.round(320 / safeZoom)); // 低缩放时扩大缓冲，避免节点在边缘闪烁或误裁剪
 
         // 计算视口在世界坐标系中的范围
-        const viewportLeft = (-currentView.x - padding) / currentView.zoom;
-        const viewportRight = (rect.width - currentView.x + padding) / currentView.zoom;
-        const viewportTop = (-currentView.y - padding) / currentView.zoom;
-        const viewportBottom = (rect.height - currentView.y + padding) / currentView.zoom;
+        const viewportLeft = (-currentView.x - padding) / safeZoom;
+        const viewportRight = (rect.width - currentView.x + padding) / safeZoom;
+        const viewportTop = (-currentView.y - padding) / safeZoom;
+        const viewportBottom = (rect.height - currentView.y + padding) / safeZoom;
 
         // 过滤出在视口内或附近的节点
-        return nodes.filter(node => {
+        const filtered = nodes.filter(node => {
             const nodeRight = node.x + (node.width || 0);
             const nodeBottom = node.y + (node.height || 0);
 
@@ -10138,7 +10582,32 @@ function TapnowApp() {
                 node.y < viewportBottom &&
                 nodeBottom > viewportTop;
         });
-    }, [nodes, view.x, view.y, view.zoom]);
+        if (filtered.length > 0 || nodes.length === 0) {
+            return filtered;
+        }
+
+        // 兜底：如果视口仍与整体节点包围盒相交，却一个节点都没命中，说明裁剪很可能误杀了，直接退回全部节点渲染
+        const bounds = nodes.reduce((acc, node) => {
+            const right = node.x + (node.width || 0);
+            const bottom = node.y + (node.height || 0);
+            return {
+                left: Math.min(acc.left, node.x),
+                top: Math.min(acc.top, node.y),
+                right: Math.max(acc.right, right),
+                bottom: Math.max(acc.bottom, bottom)
+            };
+        }, {
+            left: Infinity,
+            top: Infinity,
+            right: -Infinity,
+            bottom: -Infinity
+        });
+        const intersectsNodeBounds = bounds.left < viewportRight
+            && bounds.right > viewportLeft
+            && bounds.top < viewportBottom
+            && bounds.bottom > viewportTop;
+        return intersectsNodeBounds ? nodes : filtered;
+    }, [nodes, view]);
 
     // 性能优化：根据 zoom 计算 LOD 细节等级
     const getDetailLevel = useCallback((zoom) => {
@@ -12072,7 +12541,7 @@ function TapnowApp() {
         while (modelLibrary.some(entry => entry.id === newId)) {
             newId = `${baseId}-${counter++}`;
         }
-        const cloned = JSON.parse(JSON.stringify(source));
+        const cloned = structuredClone(source);
         const displayBase = cloned.displayName || cloned.modelName || cloned.id || newId;
         const duplicatedParams = Array.isArray(cloned.customParams)
             ? cloned.customParams.map((param) => ({ ...param, id: '' }))
@@ -12424,6 +12893,7 @@ function TapnowApp() {
         let added = 0;
         let updated = 0;
         let libraryAdded = 0;
+        const appendedLibraryIds = [];
         const incomingById = new Map(normalizedModels.map(model => [model.id, model]));
         const nextApiConfigs = apiConfigs.map((existing) => {
             if (existing.provider !== providerKey) return existing;
@@ -12467,12 +12937,18 @@ function TapnowApp() {
             if (!entry) return;
             nextModelLibrary.push(entry);
             existingLibraryIds.add(entry.id);
+            appendedLibraryIds.push(entry.id);
             libraryAdded += 1;
         });
 
         setApiConfigs(nextApiConfigs);
         if (libraryAdded > 0) {
             setModelLibrary(nextModelLibrary);
+            setCollapsedLibraryModels(prev => {
+                const next = new Set(prev);
+                appendedLibraryIds.forEach((id) => next.add(id));
+                return next;
+            });
         }
 
         return {
@@ -12658,10 +13134,14 @@ function TapnowApp() {
         }
         return resolveModelKey(lastUsedImageModel || apiConfigs.find(c => isImageModelType(c.type))?.id || '');
     }, [apiConfigs, resolveModelKey, getApiConfigByKey, lastUsedImageModel]);
+    const preferredWorkflowImageModel = useMemo(() => (
+        resolveModelKey(lastUsedImageModel || preferredGeminiImageModel || apiConfigs.find((config) => isImageModelType(config.type))?.id || '')
+    ), [lastUsedImageModel, preferredGeminiImageModel, apiConfigs, resolveModelKey]);
     const currentChatModelConfig = useMemo(() => getApiConfigByKey(chatModel), [getApiConfigByKey, chatModel]);
     const currentChatSupportsDesignAgent = useMemo(() => {
-        return isGeminiAgentModelConfig(currentChatModelConfig);
-    }, [currentChatModelConfig, isGeminiAgentModelConfig]);
+        if (!currentChatModelConfig) return false;
+        return isChatModelType(currentChatModelConfig.type) || isGeminiAgentModelConfig(currentChatModelConfig);
+    }, [currentChatModelConfig, isChatModelType, isGeminiAgentModelConfig]);
     const currentChatUsesOfficialGemini = useMemo(() => {
         if (!currentChatModelConfig?.provider) return false;
         const providerApiType = String(currentChatModelConfig?.apiType || providers?.[currentChatModelConfig.provider]?.apiType || '').toLowerCase();
@@ -12786,6 +13266,17 @@ function TapnowApp() {
         setChatFiles(prev => prev.filter((_, i) => i !== index));
     };
 
+    const extractHttpUrlsFromText = (text) => {
+        if (!text || typeof text !== 'string') return [];
+        const urls = new Set();
+        const matches = text.match(/https?:\/\/[^\s<>"']+/g) || [];
+        matches.forEach((match) => {
+            const cleaned = match.replace(/[),.;]+$/, '');
+            if (cleaned) urls.add(cleaned);
+        });
+        return Array.from(urls);
+    };
+
     const extractImageUrlsFromText = (text) => {
         if (!text || typeof text !== 'string') return [];
         const urls = new Set();
@@ -12804,6 +13295,187 @@ function TapnowApp() {
             }
         });
         return Array.from(urls);
+    };
+
+    const normalizeAbsoluteUrl = (rawUrl, baseUrl = '') => {
+        const source = String(rawUrl || '').trim();
+        if (!source) return '';
+        if (source.startsWith('data:') || source.startsWith('blob:')) return source;
+        try {
+            return new URL(source, baseUrl || undefined).toString();
+        } catch {
+            return '';
+        }
+    };
+
+    const buildJinaReaderUrlCandidates = (targetUrl) => {
+        const normalized = String(targetUrl || '').trim();
+        if (!normalized) return [];
+        const withoutScheme = normalized.replace(/^https?:\/\//i, '');
+        const candidates = /^https:\/\//i.test(normalized)
+            ? [
+                `https://r.jina.ai/http://${normalized}`,
+                `https://r.jina.ai/http://${withoutScheme}`
+            ]
+            : [
+                `https://r.jina.ai/http://${withoutScheme}`,
+                `https://r.jina.ai/http://${normalized}`
+            ];
+        return candidates.filter((value, index, list) => value && list.indexOf(value) === index);
+    };
+
+    const sanitizeUrlContextText = (text, maxLength = 1200) => {
+        const source = String(text || '');
+        if (!source) return '';
+        const compact = source
+            .replace(/\r/g, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+        if (!compact) return '';
+        return compact.length > maxLength
+            ? `${compact.slice(0, Math.max(0, maxLength - 1)).trim()}…`
+            : compact;
+    };
+
+    const fetchChatUrlPageContext = async (targetUrl) => {
+        const normalizedUrl = normalizeAbsoluteUrl(targetUrl);
+        if (!normalizedUrl) return null;
+        const fetchText = async (requestUrl) => {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 12000);
+            try {
+                const response = await fetch(requestUrl, {
+                    method: 'GET',
+                    headers: {
+                        Accept: 'text/plain, text/markdown, application/json;q=0.8, */*;q=0.5'
+                    },
+                    signal: controller.signal
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return await response.text();
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        };
+        let readerText = '';
+        let lastError = null;
+        for (const readerUrl of buildJinaReaderUrlCandidates(normalizedUrl)) {
+            try {
+                readerText = await fetchText(readerUrl);
+                if (readerText && readerText.trim()) break;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+        if (!readerText || !readerText.trim()) {
+            if (lastError) console.warn('[Chat URL Context] fetch failed:', normalizedUrl, lastError);
+            return null;
+        }
+        const titleMatch = readerText.match(/(?:^|\n)Title:\s*(.+?)(?:\n|$)/i);
+        const bodyMatch = readerText.match(/Markdown Content:\s*([\s\S]*)$/i);
+        const markdownBody = String(bodyMatch?.[1] || readerText || '').trim();
+        const headingMatch = markdownBody.match(/^#\s+(.+?)$/m);
+        const pageTitle = sanitizeUrlContextText(titleMatch?.[1] || headingMatch?.[1] || '', 160);
+        const summaryLines = markdownBody
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .filter((line) => !/^!\[[^\]]*]\([^)]+\)$/.test(line))
+            .filter((line) => !/^\*?\s*\[![^\]]+\]\([^)]+\)/.test(line))
+            .filter((line) => !/^(title|url source|markdown content|published time|warning):/i.test(line))
+            .slice(0, 16);
+        const summaryText = sanitizeUrlContextText(summaryLines.join('\n'), 900);
+        const imageCandidates = Array.from(markdownBody.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g))
+            .map((match) => {
+                const alt = String(match[1] || '').trim();
+                const url = normalizeAbsoluteUrl(match[2], normalizedUrl);
+                return { alt, url };
+            })
+            .filter((item) => !!item.url);
+        const lowerHost = (() => {
+            try {
+                return new URL(normalizedUrl).host.toLowerCase();
+            } catch {
+                return '';
+            }
+        })();
+        const scoreImageCandidate = ({ url, alt }) => {
+            const lowerUrl = String(url || '').toLowerCase();
+            const lowerAlt = String(alt || '').toLowerCase();
+            let score = 0;
+            if (lowerHost && lowerUrl.includes(lowerHost)) score += 18;
+            if (/\b(product|hero|main|gallery|detail|feature|poster|cover|front|angle|pack|sku)\b/.test(lowerUrl)) score += 18;
+            if (/\b(product|hero|main|gallery|detail|feature|front|camera|package|packaging)\b/.test(lowerAlt)) score += 16;
+            if (/\b(logo|icon|sprite|avatar|emoji|badge|favicon|qr|banner)\b/.test(lowerUrl)) score -= 28;
+            if (/\b(logo|icon|sprite|avatar|emoji|badge|favicon|qr|banner)\b/.test(lowerAlt)) score -= 24;
+            if (lowerUrl.includes('.svg')) score -= 20;
+            if (/\b\d{2,4}x\d{2,4}\b/.test(lowerUrl)) score += 4;
+            return score;
+        };
+        const images = imageCandidates
+            .sort((left, right) => scoreImageCandidate(right) - scoreImageCandidate(left))
+            .map((item) => item.url)
+            .filter((url, index, list) => list.indexOf(url) === index)
+            .slice(0, 6);
+        return {
+            url: normalizedUrl,
+            title: pageTitle,
+            summary: summaryText,
+            images
+        };
+    };
+
+    const buildChatUrlAutoContext = async (text, existingFiles = []) => {
+        const pageUrls = extractHttpUrlsFromText(text)
+            .filter((url) => !/\.(?:png|jpe?g|webp|gif|bmp|svg)(?:[?#]|$)/i.test(url))
+            .slice(0, 2);
+        if (pageUrls.length === 0) {
+            return { files: [], extraTexts: [], pages: [] };
+        }
+        const existingSources = new Set(
+            (Array.isArray(existingFiles) ? existingFiles : [])
+                .map((file) => String(file?.content || '').trim())
+                .filter(Boolean)
+        );
+        const pages = (await Promise.all(pageUrls.map((url) => fetchChatUrlPageContext(url).catch(() => null))))
+            .filter(Boolean);
+        const files = [];
+        const extraTexts = [];
+        pages.forEach((page, pageIndex) => {
+            const pickedImages = (Array.isArray(page.images) ? page.images : [])
+                .filter((url) => !existingSources.has(url))
+                .slice(0, 4);
+            pickedImages.forEach((imageUrl, imageIndex) => {
+                existingSources.add(imageUrl);
+                const extMatch = imageUrl.split('?')[0].match(/\.([a-zA-Z0-9]+)$/);
+                const ext = extMatch?.[1]?.toLowerCase() || 'jpg';
+                files.push({
+                    name: `URL-${pageIndex + 1}-${imageIndex + 1}.${ext === 'jpeg' ? 'jpg' : ext}`,
+                    type: `image/${ext === 'jpg' ? 'jpeg' : ext}`,
+                    content: imageUrl,
+                    isImage: true,
+                    isVideo: false,
+                    isAudio: false,
+                    isPDF: false,
+                    isDoc: false,
+                    isExcel: false,
+                    fromUrlContext: true,
+                    sourceUrl: page.url,
+                    fileExt: ext === 'jpeg' ? 'jpg' : ext
+                });
+            });
+            const summaryLines = [
+                `[链接解析#${pageIndex + 1}]`,
+                `URL: ${page.url}`,
+                page.title ? `标题: ${page.title}` : '',
+                page.summary ? `页面摘要:\n${page.summary}` : '',
+                pickedImages.length > 0
+                    ? `候选产品图:\n${pickedImages.map((url, idx) => `- 图${idx + 1}: ${url}`).join('\n')}`
+                    : '候选产品图: 未提取到可用图片'
+            ].filter(Boolean);
+            extraTexts.push(summaryLines.join('\n'));
+        });
+        return { files, extraTexts, pages };
     };
 
     const extractChatImageUrls = (data, textContent) => {
@@ -13339,15 +14011,38 @@ function TapnowApp() {
 
         const rawUserInput = chatInput;
         const manualFiles = [...chatFiles];
+        let urlAutoContext = { files: [], extraTexts: [], pages: [] };
+        try {
+            urlAutoContext = await buildChatUrlAutoContext(rawUserInput, manualFiles);
+        } catch (error) {
+            console.warn('[Chat URL Context] build failed:', error);
+        }
         const canvasContext = chatCanvasContextEnabled ? buildChatCanvasContext() : null;
         const autoCanvasFiles = chatAutoAttachCanvasMedia ? buildChatCanvasAutoFiles(canvasContext, manualFiles) : [];
-        const effectiveFiles = [...manualFiles, ...autoCanvasFiles];
+        const effectiveFiles = [...manualFiles, ...urlAutoContext.files, ...autoCanvasFiles]
+            .filter((file, index, list) => {
+                const content = String(file?.content || '').trim();
+                if (!content) return true;
+                return list.findIndex((item) => String(item?.content || '').trim() === content) === index;
+            });
+        const chatIntentRoute = inferChatAgentRoute({
+            userInput: rawUserInput,
+            files: effectiveFiles,
+            historyMessages: currentSessionMessages,
+            canvasContext
+        });
 
         const newUserMsg = {
             id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             role: 'user',
             content: rawUserInput,
             files: effectiveFiles,
+            intentMode: chatIntentRoute.mode,
+            urlContextMeta: urlAutoContext.pages.map((page) => ({
+                url: page.url,
+                title: page.title,
+                imageCount: Array.isArray(page.images) ? page.images.length : 0
+            })),
             canvasContextMeta: canvasContext ? { nodeCount: canvasContext.nodes?.length || 0, assetCount: canvasContext.assets?.length || 0 } : null,
             timestamp: Date.now(),
             modelId: chatModel
@@ -13369,9 +14064,17 @@ function TapnowApp() {
         const historyMessages = currentSessionMessages.length > MAX_HISTORY_MESSAGES
             ? currentSessionMessages.slice(-MAX_HISTORY_MESSAGES)
             : currentSessionMessages;
-        const agentSystemPrompt = currentChatSupportsDesignAgent
-            ? GEMINI_DESIGN_AGENT_SYSTEM_PROMPT
-            : t('你是一名多模态AI助手，需要结合整个对话的上下文进行连续回答。');
+        const chatTargetImageModelKey = preferredWorkflowImageModel;
+        const chatTargetImageModelConfig = getApiConfigByKey(chatTargetImageModelKey);
+        const agentSystemPrompt = buildAdaptiveChatSystemPrompt(chatIntentRoute, {
+            designAgent: currentChatSupportsDesignAgent,
+            searchEnabled: currentChatSupportsDesignAgent && currentChatUsesOfficialGemini && chatGeminiSearchEnabled,
+            thinkingEnabled: currentChatSupportsDesignAgent && currentChatUsesOfficialGemini && chatGeminiThinkingEnabled,
+            imageModelId: chatTargetImageModelConfig?.id || chatTargetImageModelKey,
+            imageModelLabel: chatTargetImageModelConfig
+                ? `${chatTargetImageModelConfig.displayName || chatTargetImageModelConfig.modelName || chatTargetImageModelConfig.id}${chatTargetImageModelConfig.provider ? ` / ${chatTargetImageModelConfig.provider}` : ''}`
+                : chatTargetImageModelKey
+        });
 
         try {
             const parseChatContent = (payload) => {
@@ -13520,7 +14223,10 @@ function TapnowApp() {
                 }
                 const currentGeminiParts = await buildGeminiParts(
                     newUserMsg,
-                    canvasContext?.text ? [`\n[画布上下文]\n${canvasContext.text}`] : [],
+                    [
+                        ...(canvasContext?.text ? [`\n[画布上下文]\n${canvasContext.text}`] : []),
+                        ...urlAutoContext.extraTexts
+                    ],
                     true
                 );
                 const requestBody = {
@@ -13577,6 +14283,9 @@ function TapnowApp() {
                 if (canvasContext?.text) {
                     currentContent.push({ type: 'text', text: `\n[画布上下文]\n${canvasContext.text}\n` });
                 }
+                urlAutoContext.extraTexts.forEach((text) => {
+                    currentContent.push({ type: 'text', text: `\n${text}\n` });
+                });
 
                 effectiveFiles.forEach((file) => {
                     const isGeminiLike = currentChatSupportsDesignAgent || (config?.modelName ?? '').toLowerCase().includes('gemini');
@@ -13852,12 +14561,16 @@ function TapnowApp() {
                 console.error('[聊天] API 响应内容为空:', data);
                 aiContent = 'No response';
             }
+            const assistantActions = evaluateChatAssistantActions(aiContent, newUserMsg);
 
             const newAssistantMsg = {
                 id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                 role: 'assistant',
                 content: aiContent,
                 files: assistantFiles.length > 0 ? assistantFiles : undefined,
+                intentMode: chatIntentRoute.mode,
+                canCreateWorkflow: assistantActions.canCreateWorkflow,
+                canSyncPrompt: assistantActions.canSyncPrompt,
                 timestamp: Date.now(),
                 modelId: chatModel
             };
@@ -15740,7 +16453,8 @@ function TapnowApp() {
         // banana模型使用800秒超时（160次 * 5秒），其他模型使用25分钟（300次 * 5秒）
         const maxAttempts = isBananaModel ? 160 : 300;
         const baseDelayMs = 5000; // 基础轮询间隔5秒
-        const delayMs = baseDelayMs;
+        // 指数退避：前10次保持基础间隔，之后逐步增长到最大30秒
+        const delayMs = attempt < 10 ? baseDelayMs : Math.min(30000, baseDelayMs * Math.pow(1.3, Math.floor((attempt - 10) / 5)));
         const isLikelyImageValue = (value) => {
             if (!value || typeof value !== 'string') return false;
             const trimmed = value.trim();
@@ -16302,7 +17016,9 @@ function TapnowApp() {
 
     const pollAsyncTask = (taskId, requestId, asyncConfig, baseVars, w, h, sourceNodeId, providerKey, attempt = 0) => {
         const maxAttempts = Number.isFinite(asyncConfig?.maxAttempts) ? asyncConfig.maxAttempts : 300;
-        const delayMs = Number.isFinite(asyncConfig?.pollIntervalMs) ? asyncConfig.pollIntervalMs : 3000;
+        const baseDelayMs = Number.isFinite(asyncConfig?.pollIntervalMs) ? asyncConfig.pollIntervalMs : 3000;
+        // 指数退避：前10次保持基础间隔，之后逐步增长到最大30秒
+        const delayMs = attempt < 10 ? baseDelayMs : Math.min(30000, baseDelayMs * Math.pow(1.3, Math.floor((attempt - 10) / 5)));
         if (attempt > maxAttempts) {
             const timeoutMsg = '异步任务轮询超时';
             setHistory((prev) => prev.map((hItem) => {
@@ -16611,6 +17327,8 @@ function TapnowApp() {
     const pollModelScopeTask = (taskId, taskIdForPoll, baseUrl, apiKey, w, h, sourceNodeId, providerKey, useProxy, attempt = 0) => {
         const maxAttempts = 300;
         const baseDelayMs = 5000;
+        // 指数退避：前10次保持基础间隔，之后逐步增长到最大30秒
+        const delayMs = attempt < 10 ? baseDelayMs : Math.min(30000, baseDelayMs * Math.pow(1.3, Math.floor((attempt - 10) / 5)));
 
         if (attempt > maxAttempts) {
             const timeoutMsg = 'ModelScope 轮询超时';
@@ -16689,7 +17407,7 @@ function TapnowApp() {
                     data = JSON.parse(text);
                 } catch (err) {
                     console.error('[ModelScope] Failed to parse response:', err);
-                    setTimeout(() => pollModelScopeTask(taskId, taskIdForPoll, baseUrl, apiKey, w, h, sourceNodeId, providerKey, useProxy, attempt + 1), baseDelayMs);
+                    setTimeout(() => pollModelScopeTask(taskId, taskIdForPoll, baseUrl, apiKey, w, h, sourceNodeId, providerKey, useProxy, attempt + 1), delayMs);
                     return;
                 }
 
@@ -16832,12 +17550,12 @@ function TapnowApp() {
                 }));
 
                 if (!isCompleted && !isFailed) {
-                    setTimeout(() => pollModelScopeTask(taskId, taskIdForPoll, baseUrl, apiKey, w, h, sourceNodeId, providerKey, useProxy, attempt + 1), baseDelayMs);
+                    setTimeout(() => pollModelScopeTask(taskId, taskIdForPoll, baseUrl, apiKey, w, h, sourceNodeId, providerKey, useProxy, attempt + 1), delayMs);
                 }
             })
             .catch((err) => {
                 console.error('[ModelScope] Poll error:', err);
-                setTimeout(() => pollModelScopeTask(taskId, taskIdForPoll, baseUrl, apiKey, w, h, sourceNodeId, providerKey, useProxy, attempt + 1), baseDelayMs);
+                setTimeout(() => pollModelScopeTask(taskId, taskIdForPoll, baseUrl, apiKey, w, h, sourceNodeId, providerKey, useProxy, attempt + 1), delayMs);
             });
     };
 
@@ -26454,32 +27172,275 @@ ${inputText.substring(0, 15000)} ... (截断)
     const stripChatSourceFooter = useCallback((text) => {
         return String(text || '').replace(/\n---\n参考来源[\s\S]*$/i, '').trim();
     }, []);
+    const normalizeChatPromptLookupKey = (key) => String(key || '')
+        .trim()
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .replace(/[\s-]+/g, '_')
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, '');
+    const hasMeaningfulChatPromptSpec = (spec) => {
+        if (!spec || typeof spec !== 'object') return false;
+        const values = [
+            spec?.systemReasoning?.intent,
+            spec?.systemReasoning?.originalSubject,
+            spec?.systemReasoning?.editStrategy,
+            spec?.apiPayload?.compiledPrompt,
+            spec?.apiPayload?.editInstruction,
+            spec?.apiPayload?.negativePrompt,
+            spec?.apiPayload?.aspectRatio,
+            spec?.apiPayload?.resolution,
+            spec?.copywriting?.headline,
+            spec?.copywriting?.subheadline,
+            spec?.copywriting?.body,
+            spec?.copywriting?.callToAction
+        ];
+        return values.some((value) => String(value || '').trim());
+    };
+    const extractStructuredPromptSpecFromText = (text) => {
+        const source = stripChatSourceFooter(String(text || ''));
+        if (!source) return null;
+        const fieldMap = {
+            'SYSTEM_REASONING.INTENT': ['systemReasoning', 'intent'],
+            'SYSTEM_REASONING.ORIGINAL_SUBJECT': ['systemReasoning', 'originalSubject'],
+            'SYSTEM_REASONING.EDIT_STRATEGY': ['systemReasoning', 'editStrategy'],
+            'API_PAYLOAD.COMPILED_PROMPT': ['apiPayload', 'compiledPrompt'],
+            'API_PAYLOAD.EDIT_INSTRUCTION': ['apiPayload', 'editInstruction'],
+            'API_PAYLOAD.NEGATIVE_PROMPT': ['apiPayload', 'negativePrompt'],
+            'API_PAYLOAD.ASPECT_RATIO': ['apiPayload', 'aspectRatio'],
+            'API_PAYLOAD.RESOLUTION': ['apiPayload', 'resolution'],
+            'API_PAYLOAD.SAMPLE_COUNT': ['apiPayload', 'sampleCount'],
+            'COPYWRITING.HEADLINE': ['copywriting', 'headline'],
+            'COPYWRITING.SUBHEADLINE': ['copywriting', 'subheadline'],
+            'COPYWRITING.BODY': ['copywriting', 'body'],
+            'COPYWRITING.CALL_TO_ACTION': ['copywriting', 'callToAction'],
+            'COPYWRITING.BRAND_NAME': ['copywriting', 'brandName'],
+            'COPYWRITING.LOGO_PLACEMENT': ['copywriting', 'logoPlacement'],
+            'COMPILED_PROMPT': ['apiPayload', 'compiledPrompt'],
+            'EDIT_INSTRUCTION': ['apiPayload', 'editInstruction'],
+            'NEGATIVE_PROMPT': ['apiPayload', 'negativePrompt'],
+            'ASPECT_RATIO': ['apiPayload', 'aspectRatio'],
+            'RESOLUTION': ['apiPayload', 'resolution'],
+            'SAMPLE_COUNT': ['apiPayload', 'sampleCount'],
+            'INTENT': ['systemReasoning', 'intent'],
+            'ORIGINAL_SUBJECT': ['systemReasoning', 'originalSubject'],
+            'EDIT_STRATEGY': ['systemReasoning', 'editStrategy'],
+            'HEADLINE': ['copywriting', 'headline'],
+            'SUBHEADLINE': ['copywriting', 'subheadline'],
+            'BODY': ['copywriting', 'body'],
+            'CALL_TO_ACTION': ['copywriting', 'callToAction'],
+            'BRAND_NAME': ['copywriting', 'brandName'],
+            'LOGO_PLACEMENT': ['copywriting', 'logoPlacement']
+        };
+        const multiLineKeys = new Set([
+            'SYSTEM_REASONING.INTENT',
+            'SYSTEM_REASONING.ORIGINAL_SUBJECT',
+            'SYSTEM_REASONING.EDIT_STRATEGY',
+            'API_PAYLOAD.COMPILED_PROMPT',
+            'API_PAYLOAD.EDIT_INSTRUCTION',
+            'API_PAYLOAD.NEGATIVE_PROMPT',
+            'COPYWRITING.HEADLINE',
+            'COPYWRITING.SUBHEADLINE',
+            'COPYWRITING.BODY',
+            'COPYWRITING.CALL_TO_ACTION',
+            'COPYWRITING.BRAND_NAME',
+            'COPYWRITING.LOGO_PLACEMENT',
+            'COMPILED_PROMPT',
+            'EDIT_INSTRUCTION',
+            'NEGATIVE_PROMPT',
+            'INTENT',
+            'ORIGINAL_SUBJECT',
+            'EDIT_STRATEGY',
+            'HEADLINE',
+            'SUBHEADLINE',
+            'BODY',
+            'CALL_TO_ACTION',
+            'BRAND_NAME',
+            'LOGO_PLACEMENT'
+        ]);
+        const result = {
+            systemReasoning: {},
+            apiPayload: {},
+            copywriting: {}
+        };
+        let activeTarget = null;
+        const appendValue = (target, value) => {
+            if (!target || !value) return;
+            const [sectionKey, fieldKey] = target;
+            const nextText = String(value || '').trim();
+            if (!nextText) return;
+            const existing = String(result?.[sectionKey]?.[fieldKey] || '').trim();
+            result[sectionKey][fieldKey] = existing ? `${existing}\n${nextText}` : nextText;
+        };
+        const lines = source.split(/\r?\n/);
+        for (const rawLine of lines) {
+            const trimmed = String(rawLine || '').trim();
+            if (!trimmed) {
+                activeTarget = null;
+                continue;
+            }
+            const normalizedLine = trimmed
+                .replace(/^[>\s]+/, '')
+                .replace(/[*`]+/g, '');
+            const labelMatch = normalizedLine.match(/^(?:(SYSTEM_REASONING|API_PAYLOAD|COPYWRITING)[.\s_-]*)?([A-Z][A-Z0-9_]+)\s*[:：]\s*(.*)$/i);
+            if (labelMatch) {
+                const section = String(labelMatch[1] || '').trim().toUpperCase();
+                const field = String(labelMatch[2] || '').trim().toUpperCase();
+                const mapKey = section ? `${section}.${field}` : field;
+                const target = fieldMap[mapKey];
+                if (target) {
+                    appendValue(target, labelMatch[3] || '');
+                    activeTarget = multiLineKeys.has(mapKey) ? target : null;
+                    continue;
+                }
+            }
+            if (
+                activeTarget
+                && !CHAT_PROMPT_SECTION_STOP_PATTERN.test(normalizedLine)
+                && !CHAT_PROMPT_HEADING_PATTERN.test(normalizedLine)
+                && !/^(?:方案|提示词|prompt|workflow|工作流)\s*#?\s*\d+/i.test(normalizedLine)
+            ) {
+                appendValue(activeTarget, trimmed);
+                continue;
+            }
+            activeTarget = null;
+        }
+        return hasMeaningfulChatPromptSpec(result) ? result : null;
+    };
+    const CHAT_PROMPT_JSON_KEYS = new Set([
+        'system_reasoning',
+        'api_payload',
+        'copywriting',
+        'creative_goal',
+        'subject',
+        'scene',
+        'visual_style',
+        'camera',
+        'output',
+        'negative_prompt',
+        'edit_notes',
+        'prompt',
+        'prompt_spec',
+        'prompt_json',
+        'compiled_prompt',
+        'edit_instruction',
+        'workflow',
+        'payload',
+        'source_refs',
+        'source_indexes',
+        'variants',
+        'workflows',
+        'items',
+        'images'
+    ]);
+    const CHAT_EXECUTION_MARKER_PATTERN = /\b(?:SYSTEM_REASONING|API_PAYLOAD|COMPILED_PROMPT|EDIT_INSTRUCTION|NEGATIVE_PROMPT)\b/i;
+    const CHAT_PROMPT_HEADING_PATTERN = /^\s{0,3}(?:#{1,6}\s*)?(?:最终)?(?:提示词|prompt|workflow|工作流)\s*[:：]?\s*$/i;
+    const CHAT_PROMPT_LABEL_PATTERN = /^(?:[-*]|\d+\.)?\s*(?:最终)?(?:提示词|prompt)\s*[:：]\s*(.*)$/i;
+    const CHAT_PROMPT_SECTION_STOP_PATTERN = /^(?:#{1,6}\s*)?(?:说明|解释|建议|原因|步骤|补充|使用方法|执行方式|可选项|推荐做法|注意事项|分析|思路|备注|为什么|下一步|交付说明|工作流说明)\s*[:：]?.*$/i;
+    const isChatPromptPayloadLike = (value, depth = 0) => {
+        if (depth > 3 || value === null || value === undefined) return false;
+        if (typeof value === 'string') {
+            return CHAT_EXECUTION_MARKER_PATTERN.test(value) || CHAT_PROMPT_LABEL_PATTERN.test(value);
+        }
+        if (Array.isArray(value)) {
+            return value.some((item) => isChatPromptPayloadLike(item, depth + 1));
+        }
+        if (typeof value !== 'object') return false;
+        const entries = Object.entries(value);
+        if (entries.length === 0) return false;
+        if (entries.some(([key]) => CHAT_PROMPT_JSON_KEYS.has(normalizeChatPromptLookupKey(key)))) {
+            return true;
+        }
+        return entries.some(([, nested]) => isChatPromptPayloadLike(nested, depth + 1));
+    };
+    const extractLabeledChatPromptBlock = (text) => {
+        const lines = String(text || '').split(/\r?\n/);
+        const collected = [];
+        let capturing = false;
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!capturing) {
+                const labelMatch = trimmed.match(CHAT_PROMPT_LABEL_PATTERN);
+                if (labelMatch) {
+                    const inlineText = String(labelMatch[1] || '').trim();
+                    if (inlineText) collected.push(inlineText);
+                    capturing = true;
+                    continue;
+                }
+                if (CHAT_PROMPT_HEADING_PATTERN.test(trimmed)) {
+                    capturing = true;
+                }
+                continue;
+            }
+            if (!trimmed) {
+                if (collected.length > 0) break;
+                continue;
+            }
+            if (
+                CHAT_PROMPT_SECTION_STOP_PATTERN.test(trimmed)
+                || CHAT_PROMPT_LABEL_PATTERN.test(trimmed)
+                || /^(?:[-*]|\d+\.)\s*(?:说明|解释|建议|步骤|补充|使用方法|执行方式|可选项|注意事项|分析|思路|备注|下一步)/i.test(trimmed)
+            ) {
+                break;
+            }
+            collected.push(line.trimEnd());
+        }
+        return collected.join('\n').trim();
+    };
     const extractActionablePromptFromChatMessage = useCallback((text) => {
         const stripped = stripChatSourceFooter(text);
         if (!stripped) return '';
-        const fencedJson = stripped.match(/```json\s*([\s\S]*?)```/i);
-        if (fencedJson?.[1]?.trim()) return fencedJson[1].trim();
-        const fencedAny = stripped.match(/```(?:prompt|text|markdown)?\s*([\s\S]*?)```/i);
-        if (fencedAny?.[1]?.trim()) return fencedAny[1].trim();
+        const codeBlocks = Array.from(stripped.matchAll(/```([a-zA-Z0-9_-]+)?\s*([\s\S]*?)```/g));
+        let previousBlockEnd = 0;
+        for (const match of codeBlocks) {
+            const lang = String(match[1] || '').trim().toLowerCase();
+            const content = String(match[2] || '').trim();
+            if (!content) {
+                previousBlockEnd = (match.index || 0) + match[0].length;
+                continue;
+            }
+            const headingContext = stripped
+                .slice(previousBlockEnd, match.index || 0)
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .slice(-1)[0] || '';
+            previousBlockEnd = (match.index || 0) + match[0].length;
+            if (lang === 'prompt' || lang === 'workflow') return content;
+            if (lang === 'json') {
+                try {
+                    const parsed = JSON.parse(content);
+                    if (isChatPromptPayloadLike(parsed)) return content;
+                } catch (error) { }
+            }
+            const structuredFromBlock = extractStructuredPromptSpecFromText(content);
+            if (structuredFromBlock) {
+                return JSON.stringify(structuredFromBlock, null, 2);
+            }
+            if (CHAT_EXECUTION_MARKER_PATTERN.test(content)) return content;
+            const labeledBlockContent = extractLabeledChatPromptBlock(content);
+            if (labeledBlockContent) return labeledBlockContent;
+            if (CHAT_PROMPT_HEADING_PATTERN.test(headingContext)) return content;
+        }
+        if (CHAT_EXECUTION_MARKER_PATTERN.test(stripped)) return stripped;
+        if (/^[\[{][\s\S]*[\]}]$/.test(stripped)) {
+            try {
+                const parsed = JSON.parse(stripped);
+                if (isChatPromptPayloadLike(parsed)) return stripped;
+            } catch (error) { }
+        }
         const jsonWindow = stripped.match(/\{[\s\S]*\}/);
         if (jsonWindow?.[0]) {
             try {
-                JSON.parse(jsonWindow[0]);
-                return jsonWindow[0];
+                const parsed = JSON.parse(jsonWindow[0]);
+                if (isChatPromptPayloadLike(parsed)) return jsonWindow[0].trim();
             } catch (error) { }
         }
-        const lines = stripped
-            .split(/\r?\n/)
-            .map((line) => line.trimEnd())
-            .filter((line) => line.trim());
-        const filtered = lines.filter((line) => {
-            const normalized = line.trim();
-            if (!normalized) return false;
-            if (/^(说明|解释|建议|工作流|步骤|补充|使用方法|执行方式|可选项|推荐做法|注意事项)[:：]/i.test(normalized)) return false;
-            if (/^(?:[-*]|\d+\.)\s*(说明|解释|建议|工作流|步骤|补充|使用方法|执行方式|可选项|注意事项)/i.test(normalized)) return false;
-            return true;
-        });
-        return filtered.join('\n').trim() || stripped;
+        const structuredFromWholeText = extractStructuredPromptSpecFromText(stripped);
+        const compiledPromptCount = (stripped.match(/(?:API_PAYLOAD\.)?COMPILED_PROMPT\s*[:：]/gi) || []).length;
+        if (structuredFromWholeText && compiledPromptCount <= 1) {
+            return JSON.stringify(structuredFromWholeText, null, 2);
+        }
+        return extractLabeledChatPromptBlock(stripped);
     }, [stripChatSourceFooter]);
     const extractChatSourceIndexesFromText = useCallback((text, maxCount = 0) => {
         const source = String(text || '');
@@ -26812,6 +27773,10 @@ ${inputText.substring(0, 15000)} ... (截断)
             const parsed = JSON.parse(jsonCandidate);
             return normalizeGeminiImagePromptSpec(parsed, defaults);
         } catch {
+            const structuredPromptSpec = extractStructuredPromptSpecFromText(rawText);
+            if (structuredPromptSpec) {
+                return normalizeGeminiImagePromptSpec(structuredPromptSpec, defaults);
+            }
             return normalizeGeminiImagePromptSpec({ creativeGoal: rawText }, defaults);
         }
     }, [normalizeGeminiImagePromptSpec, stripChatSourceFooter]);
@@ -26974,7 +27939,8 @@ ${inputText.substring(0, 15000)} ... (截断)
     }, [buildGeminiImageRenderPayload]);
     const buildChatWorkflowPromptPayload = useCallback((entry, defaults = {}) => {
         if (typeof entry === 'string') {
-            return extractActionablePromptFromChatMessage(entry);
+            const actionable = extractActionablePromptFromChatMessage(entry);
+            return actionable || '';
         }
         if (!entry || typeof entry !== 'object') return '';
         const directPayload = [
@@ -27023,11 +27989,30 @@ ${inputText.substring(0, 15000)} ... (截断)
         const systemReasoning = entry.systemReasoning && typeof entry.systemReasoning === 'object' ? entry.systemReasoning : {};
         const apiPayload = entry.apiPayload && typeof entry.apiPayload === 'object' ? entry.apiPayload : {};
         const copywriting = entry.copywriting && typeof entry.copywriting === 'object' ? entry.copywriting : {};
+        const intentValue = entry.intent || entry.goal || entry.title || entry.name || entry.label || systemReasoning.intent || '';
+        const originalSubjectValue = entry.originalSubject || systemReasoning.originalSubject || '';
+        const editStrategyValue = entry.editStrategy || entry.instruction || entry.editNotes || systemReasoning.editStrategy || '';
+        const compiledPromptValue = apiPayload.compiledPrompt || actionablePrompt || '';
+        const negativePromptValue = entry.negativePrompt || entry.negative || apiPayload.negativePrompt || '';
+        const editInstructionValue = entry.editInstruction || entry.instruction || apiPayload.editInstruction || '';
+        const hasExecutablePayload = [
+            intentValue,
+            originalSubjectValue,
+            editStrategyValue,
+            compiledPromptValue,
+            negativePromptValue,
+            editInstructionValue,
+            entry.headline || copywriting.headline || '',
+            entry.subheadline || copywriting.subheadline || '',
+            entry.body || copywriting.body || '',
+            entry.callToAction || entry.cta || copywriting.callToAction || ''
+        ].some((value) => String(value || '').trim());
+        if (!hasExecutablePayload) return null;
         return {
             systemReasoning: {
-                intent: entry.intent || entry.goal || entry.title || entry.name || entry.label || systemReasoning.intent || '',
-                originalSubject: entry.originalSubject || systemReasoning.originalSubject || '',
-                editStrategy: entry.editStrategy || entry.instruction || entry.editNotes || systemReasoning.editStrategy || ''
+                intent: intentValue,
+                originalSubject: originalSubjectValue,
+                editStrategy: editStrategyValue
             },
             copywriting: {
                 headline: entry.headline || copywriting.headline || '',
@@ -27038,9 +28023,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                 logoPlacement: entry.logoPlacement || copywriting.logoPlacement || ''
             },
             apiPayload: {
-                compiledPrompt: apiPayload.compiledPrompt || actionablePrompt || promptText || '',
-                negativePrompt: entry.negativePrompt || entry.negative || apiPayload.negativePrompt || '',
-                editInstruction: entry.editInstruction || entry.instruction || apiPayload.editInstruction || '',
+                compiledPrompt: compiledPromptValue,
+                negativePrompt: negativePromptValue,
+                editInstruction: editInstructionValue,
                 aspectRatio: entry.aspectRatio || entry.ratio || apiPayload.aspectRatio || defaults.aspectRatio || '',
                 resolution: entry.resolution || apiPayload.resolution || defaults.resolution || '',
                 sampleCount: entry.sampleCount || entry.imageCount || apiPayload.sampleCount || defaults.imageCount || 1
@@ -27146,7 +28131,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                     sourceRefs: extractChatSourceIndexesFromText(block, sourceCount)
                 }));
             }
-            return [rawText];
+            return primaryPromptCandidate ? [primaryPromptCandidate] : [];
         })();
         const blueprintList = collectEntries.map((entry, index) => {
             const promptPayload = buildChatWorkflowPromptPayload(entry, defaults);
@@ -27232,6 +28217,47 @@ ${inputText.substring(0, 15000)} ... (截断)
         parseGeminiImagePromptSpec,
         normalizeGeminiImagePromptSpec,
         stringifyGeminiImagePromptSpec
+    ]);
+    const evaluateChatAssistantActions = useCallback((assistantText, sourceUserMessage = null) => {
+        const sourceImageFiles = (sourceUserMessage?.files || []).filter((file) => file?.isImage);
+        const imageModelKey = preferredWorkflowImageModel;
+        const imageModelConfig = getApiConfigByKey(imageModelKey);
+        const defaultRatio = getPreferredModelRatio(imageModelKey || imageModelConfig?.id || '', 'image') || lastUsedRatio || '1:1';
+        const defaultResolution = getPreferredImageResolutionForModel(imageModelKey || imageModelConfig?.id || '') || lastUsedImageResolution || '2K';
+        const defaults = {
+            aspectRatio: defaultRatio,
+            resolution: defaultResolution,
+            imageCount: 1
+        };
+        const workflowBlueprints = parseChatImageWorkflowBlueprints(assistantText || '', sourceImageFiles, defaults);
+        const strippedText = stripChatSourceFooter(assistantText || '');
+        const actionablePrompt = extractActionablePromptFromChatMessage(assistantText || '');
+        const parsedPromptSpec = actionablePrompt ? parseGeminiImagePromptSpec(actionablePrompt, defaults) : null;
+        const hasStructuredPromptPayload = [
+            parsedPromptSpec?.apiPayload?.compiledPrompt,
+            parsedPromptSpec?.apiPayload?.editInstruction,
+            parsedPromptSpec?.apiPayload?.negativePrompt
+        ].some((value) => String(value || '').trim());
+        const hasExplicitPromptMarkers = /```(?:json|prompt|text)?/i.test(strippedText)
+            || /\b(?:SYSTEM_REASONING|API_PAYLOAD|COMPILED_PROMPT|EDIT_INSTRUCTION|NEGATIVE_PROMPT)\b/i.test(strippedText);
+        return {
+            canCreateWorkflow: workflowBlueprints.length > 0,
+            canSyncPrompt: !!actionablePrompt && (hasStructuredPromptPayload || hasExplicitPromptMarkers)
+        };
+    }, [
+        parseChatImageWorkflowBlueprints,
+        stripChatSourceFooter,
+        extractActionablePromptFromChatMessage,
+        parseGeminiImagePromptSpec,
+        resolveModelKey,
+        preferredWorkflowImageModel,
+        apiConfigs,
+        getApiConfigByKey,
+        isImageModelType,
+        getPreferredModelRatio,
+        getPreferredImageResolutionForModel,
+        lastUsedRatio,
+        lastUsedImageResolution
     ]);
     const getDefaultImagePromptConsoleState = useCallback((hasReferenceImage = false) => ({
         stylePreset: '',
@@ -27526,6 +28552,43 @@ ${inputText.substring(0, 15000)} ... (截断)
         const modelId = String(config.id || config.modelName || modelKey || '').toLowerCase();
         return modelId.includes('gemini') || modelId.includes('imagen');
     }, [getApiConfigByKey]);
+    const sanitizeImagePromptSpecForModel = useCallback((spec, modelKey, defaults = {}) => {
+        const normalized = normalizeGeminiImagePromptSpec(spec, defaults);
+        if (!isGeminiImageModelKey(modelKey)) return normalized;
+        const sourcePrompt = String(normalized?.apiPayload?.compiledPrompt || normalized?.creativeGoal || '').trim();
+        if (!sourcePrompt) return normalized;
+        const mjNegativeMatch = sourcePrompt.match(/(?:^|\s)--no\s+(.+?)(?=\s+--[a-z]|$)/i);
+        const mjAspectRatioMatch = sourcePrompt.match(/(?:^|\s)--ar\s+([0-9]+:[0-9]+)(?=\s|$)/i);
+        const cleanedPrompt = sourcePrompt
+            .split(/\s+--(?=[a-z])/i)[0]
+            .replace(/[，,;；\s]+$/g, '')
+            .trim();
+        if (cleanedPrompt === sourcePrompt && !mjNegativeMatch && !mjAspectRatioMatch) {
+            return normalized;
+        }
+        const mergedNegativePrompt = [
+            normalized?.apiPayload?.negativePrompt || '',
+            mjNegativeMatch?.[1] || ''
+        ]
+            .map((value) => String(value || '').trim())
+            .filter(Boolean)
+            .filter((value, index, list) => list.findIndex((item) => item.toLowerCase() === value.toLowerCase()) === index)
+            .join(', ');
+        return normalizeGeminiImagePromptSpec({
+            ...normalized,
+            creativeGoal: cleanedPrompt || normalized.creativeGoal,
+            apiPayload: {
+                ...normalized.apiPayload,
+                compiledPrompt: cleanedPrompt || normalized.apiPayload?.compiledPrompt || '',
+                negativePrompt: mergedNegativePrompt || normalized.apiPayload?.negativePrompt || '',
+                aspectRatio: mjAspectRatioMatch?.[1] || normalized.apiPayload?.aspectRatio || normalized.output?.aspectRatio || defaults.aspectRatio || '1:1'
+            },
+            output: {
+                ...normalized.output,
+                aspectRatio: mjAspectRatioMatch?.[1] || normalized.output?.aspectRatio || defaults.aspectRatio || '1:1'
+            }
+        }, defaults);
+    }, [normalizeGeminiImagePromptSpec, isGeminiImageModelKey]);
     const applyImagePromptTextToNode = useCallback((nodeId, promptText, extraUpdates = {}) => {
         const targetNode = nodesMap.get(nodeId) || {
             id: nodeId,
@@ -27573,7 +28636,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                     return { applied: true, promptText: rawPrompt, spec: baseSettings.geminiImagePromptSpec || null };
                 }
             }
-            const promptSpec = parseGeminiImagePromptSpec(rawPrompt, defaults);
+            const promptSpec = sanitizeImagePromptSpecForModel(parseGeminiImagePromptSpec(rawPrompt, defaults), modelKey, defaults);
             const promptJson = stringifyGeminiImagePromptSpec(promptSpec, defaults);
             const imageCount = normalizeImageConcurrency(promptSpec.output?.imageCount || defaults.imageCount || 1);
             const nextSizing = estimateImageNodeDisplaySize({
@@ -27626,6 +28689,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         getApiConfigByKey,
         isImageModelType,
         isGeminiImageModelKey,
+        sanitizeImagePromptSpecForModel,
         parseGeminiImagePromptSpec,
         stringifyGeminiImagePromptSpec,
         preferredGeminiImageModel,
@@ -27865,8 +28929,326 @@ ${inputText.substring(0, 15000)} ... (截断)
         body: '',
         callToAction: '',
         brandName: '',
-        backgroundMode: preset === 'cutout' ? 'pure-white' : 'keep-original'
+        backgroundMode: preset === 'cutout' ? 'pure-white' : 'keep-original',
+        textBlocks: [],
+        selectedTextBlockIds: [],
+        recognizedAt: 0,
+        recognizedModel: ''
     }), []);
+    const getPreferredTextRewriteModelKey = useCallback(() => {
+        const candidates = [
+            lastUsedExtractModel,
+            preferredGeminiAgentModel,
+            chatModel
+        ]
+            .map((value) => resolveModelKey(value || ''))
+            .filter(Boolean);
+        for (const candidate of candidates) {
+            const config = getApiConfigByKey(candidate);
+            if (!config) continue;
+            if (config.type === 'ChatImage' || isOfficialGeminiProvider(config.provider) || isGeminiAgentModelConfig(config)) {
+                return candidate;
+            }
+        }
+        const fallback = apiConfigs.find((entry) => {
+            if (!entry || entry.disabled) return false;
+            const resolved = resolveApiConfig(entry);
+            return !!resolved && (
+                resolved.type === 'ChatImage'
+                || isOfficialGeminiProvider(resolved.provider)
+                || isGeminiAgentModelConfig(resolved)
+            );
+        });
+        return resolveModelKey(fallback?._uid || fallback?.id || '');
+    }, [
+        lastUsedExtractModel,
+        preferredGeminiAgentModel,
+        chatModel,
+        resolveModelKey,
+        getApiConfigByKey,
+        isOfficialGeminiProvider,
+        isGeminiAgentModelConfig,
+        apiConfigs,
+        resolveApiConfig
+    ]);
+    const applyTextRewriteBlocksToMask = useCallback(async (nodeId) => {
+        const targetNode = nodesMap.get(nodeId);
+        if (!targetNode || targetNode.type !== 'input-image') return;
+        const imageUrl = String(targetNode.content || '').trim();
+        if (!imageUrl || isVideoUrl(imageUrl)) {
+            showToast('请先准备一张可编辑的图片素材', 'warning', 2200);
+            return;
+        }
+        const workbench = {
+            ...getDefaultImageEditWorkbench('text-rewrite'),
+            ...(targetNode.settings?.editWorkbench || {})
+        };
+        const allBlocks = normalizeTextRewriteBlocks(workbench.textBlocks || []);
+        const selectedIds = Array.isArray(workbench.selectedTextBlockIds)
+            ? workbench.selectedTextBlockIds.map((id) => String(id))
+            : [];
+        const selectedBlocks = allBlocks.filter((block) => selectedIds.includes(String(block.id)));
+        if (selectedBlocks.length === 0) {
+            showToast('请先选择要修改的文字框', 'warning', 2200);
+            return;
+        }
+        let dims = targetNode.dimensions;
+        if (!dims?.w || !dims?.h) {
+            try {
+                dims = await getImageDimensions(imageUrl);
+            } catch (error) {
+                dims = null;
+            }
+        }
+        if (!dims?.w || !dims?.h) {
+            showToast('无法读取图片尺寸，暂时不能自动生成遮罩', 'error', 2600);
+            return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = dims.w;
+        canvas.height = dims.h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+            showToast('浏览器不支持当前的遮罩绘制能力', 'error', 2600);
+            return;
+        }
+        const padding = Math.max(12, Math.round(Math.min(dims.w, dims.h) * 0.012));
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#FFFFFF';
+        selectedBlocks.forEach((block) => {
+            const bbox = block.bbox;
+            const x = Math.round((bbox.x / 1000) * dims.w);
+            const y = Math.round((bbox.y / 1000) * dims.h);
+            const w = Math.round((bbox.w / 1000) * dims.w);
+            const h = Math.round((bbox.h / 1000) * dims.h);
+            const left = clampNumber(x - padding, 0, dims.w);
+            const top = clampNumber(y - padding, 0, dims.h);
+            const right = clampNumber(x + w + padding, 0, dims.w);
+            const bottom = clampNumber(y + h + padding, 0, dims.h);
+            const width = Math.max(1, right - left);
+            const height = Math.max(1, bottom - top);
+            ctx.fillRect(left, top, width, height);
+        });
+        saveToUndoStack();
+        setNodes((prev) => prev.map((item) => (
+            item.id === nodeId
+                ? {
+                    ...item,
+                    dimensions: dims,
+                    maskContent: canvas.toDataURL('image/png'),
+                    settings: {
+                        ...item.settings,
+                        editWorkbench: {
+                            ...workbench
+                        }
+                    }
+                }
+                : item
+        )));
+        showToast(`已根据 ${selectedBlocks.length} 个文字框生成遮罩`, 'success', 2200);
+    }, [nodesMap, isVideoUrl, showToast, getDefaultImageEditWorkbench, getImageDimensions, saveToUndoStack, setNodes]);
+    const scanTextRewriteBlocks = useCallback(async (nodeId) => {
+        const targetNode = nodesMap.get(nodeId);
+        if (!targetNode || targetNode.type !== 'input-image') return;
+        const imageUrl = String(targetNode.content || '').trim();
+        if (!imageUrl || isVideoUrl(imageUrl)) {
+            showToast('请先准备一张图片素材再识别文字', 'warning', 2400);
+            return;
+        }
+        const modelKey = getPreferredTextRewriteModelKey();
+        if (!modelKey) {
+            showToast('未找到支持图片识别的对话模型，请先配置 Gemini / GPT-4o 等多模态模型', 'error', 4200);
+            setSettingsOpen(true);
+            return;
+        }
+        const config = getApiConfigByKey(modelKey);
+        const credentials = getApiCredentials(modelKey);
+        if (!config || !credentials?.key) {
+            showToast('请先为识别模型配置 API Key', 'error', 3200);
+            setSettingsOpen(true);
+            return;
+        }
+        setTextRewriteScanState({ nodeId, loading: true, error: '' });
+        try {
+            const workbench = {
+                ...getDefaultImageEditWorkbench('text-rewrite'),
+                ...(targetNode.settings?.editWorkbench || {})
+            };
+            const prompt = `请识别这张图片里的所有可编辑文字，并返回严格 JSON。
+
+输出格式：
+{
+  "boxes": [
+    {
+      "id": "text-1",
+      "role": "brandName|headline|subheadline|body|callToAction|other",
+      "text": "识别到的原文",
+      "bbox": { "x": 0, "y": 0, "w": 0, "h": 0 }
+    }
+  ]
+}
+
+要求：
+1. 只返回 JSON，不要 markdown、不要解释。
+2. bbox 使用 0-1000 的归一化坐标，基于整张图宽高。
+3. 按阅读顺序排序，适合同步做局部文字修改。
+4. 同一文案块不要拆得过碎；同一行品牌名或标题尽量视为一个框。
+5. 如果没有识别到文字，返回 { "boxes": [] }。`;
+            let responsePayload = null;
+            let aiContent = '';
+            if (isOfficialGeminiProvider(config.provider) || isGeminiAgentModelConfig(config)) {
+                let mimeType = 'image/png';
+                let base64Data = '';
+                if (imageUrl.startsWith('data:')) {
+                    const normalized = normalizeDataUrl(imageUrl);
+                    const mimeMatch = normalized.match(/^data:([^;,]+)[;,]/i);
+                    mimeType = mimeMatch?.[1] || mimeType;
+                    base64Data = normalized.split(',')[1] || '';
+                } else {
+                    const ext = getUrlExt(imageUrl, '.png');
+                    if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+                    else if (ext === '.webp') mimeType = 'image/webp';
+                    else if (ext === '.gif') mimeType = 'image/gif';
+                    const useProxy = getProxyPreferenceForUrl(imageUrl, !!credentials.useProxy);
+                    base64Data = await getBase64FromUrl(imageUrl, { useProxy });
+                }
+                const geminiModelName = stripGoogleModelPrefix(credentials.modelName || config.modelName || config.id || modelKey);
+                const requestUrl = `${String(credentials.url || '').replace(/\/+$/, '')}/v1beta/models/${encodeURIComponent(geminiModelName)}:generateContent?key=${encodeURIComponent(credentials.key)}`;
+                const targetUrl = config.provider ? buildProxyUrl(requestUrl, config.provider) : requestUrl;
+                const response = await fetch(targetUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Accept: 'application/json'
+                    },
+                    body: JSON.stringify({
+                        systemInstruction: {
+                            parts: [{ text: 'You are a precise OCR and layout extraction assistant.' }]
+                        },
+                        contents: [{
+                            role: 'user',
+                            parts: [
+                                { text: prompt },
+                                {
+                                    inline_data: {
+                                        mime_type: mimeType,
+                                        data: base64Data
+                                    }
+                                }
+                            ]
+                        }]
+                    })
+                });
+                const rawText = await response.text();
+                try {
+                    responsePayload = rawText ? JSON.parse(rawText) : null;
+                } catch (error) {
+                    responsePayload = null;
+                }
+                if (!response.ok) {
+                    throw new Error(
+                        responsePayload?.error?.message
+                        || responsePayload?.message
+                        || rawText
+                        || `API Error: ${response.status || 0}`
+                    );
+                }
+                aiContent = parseGeminiAssistantPayload(responsePayload).text || '';
+            } else {
+                const endpoint = `${String(credentials.url || '').replace(/\/+$/, '')}/v1/chat/completions`;
+                const targetUrl = config.provider ? buildProxyUrl(endpoint, config.provider) : endpoint;
+                let requestImageUrl = imageUrl;
+                if (!requestImageUrl.startsWith('data:') && !requestImageUrl.startsWith('http://') && !requestImageUrl.startsWith('https://')) {
+                    const useProxy = getProxyPreferenceForUrl(requestImageUrl, !!credentials.useProxy);
+                    const base64 = await getBase64FromUrl(requestImageUrl, { useProxy });
+                    requestImageUrl = `data:image/png;base64,${base64}`;
+                }
+                const response = await fetch(targetUrl, {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${credentials.key}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        model: credentials.modelName || config.modelName || config.id || modelKey,
+                        messages: [
+                            {
+                                role: 'system',
+                                content: 'You are a precise OCR and layout extraction assistant.'
+                            },
+                            {
+                                role: 'user',
+                                content: [
+                                    { type: 'text', text: prompt },
+                                    { type: 'image_url', image_url: { url: requestImageUrl } }
+                                ]
+                            }
+                        ],
+                        temperature: 0.1,
+                        stream: false
+                    })
+                });
+                const rawText = await response.text();
+                try {
+                    responsePayload = rawText ? JSON.parse(rawText) : null;
+                } catch (error) {
+                    responsePayload = null;
+                }
+                if (!response.ok) {
+                    throw new Error(
+                        responsePayload?.error?.message
+                        || responsePayload?.message
+                        || rawText
+                        || `API Error: ${response.status || 0}`
+                    );
+                }
+                aiContent = extractModelTextContent(responsePayload);
+            }
+            const parsed = parseLooseJsonObject(aiContent);
+            const nextBlocks = normalizeTextRewriteBlocks(
+                parsed?.boxes
+                || parsed?.textBlocks
+                || parsed?.blocks
+                || parsed?.items
+                || []
+            );
+            updateNodeSettings(nodeId, {
+                editWorkbench: {
+                    ...workbench,
+                    textBlocks: nextBlocks,
+                    selectedTextBlockIds: nextBlocks.map((block) => block.id),
+                    recognizedAt: Date.now(),
+                    recognizedModel: modelKey
+                }
+            });
+            setLastUsedExtractModel(modelKey);
+            try { localStorage.setItem('tapnow_last_extract_model', modelKey); } catch { }
+            setTextRewriteScanState({ nodeId: null, loading: false, error: '' });
+            showToast(nextBlocks.length > 0 ? `已识别 ${nextBlocks.length} 个文字框` : '未识别到可编辑文字', nextBlocks.length > 0 ? 'success' : 'warning', 2600);
+        } catch (error) {
+            const message = error?.message || '文字识别失败';
+            setTextRewriteScanState({ nodeId, loading: false, error: message });
+            showToast(`文字识别失败：${message}`, 'error', 4200);
+        }
+    }, [
+        nodesMap,
+        isVideoUrl,
+        showToast,
+        getPreferredTextRewriteModelKey,
+        setSettingsOpen,
+        getApiConfigByKey,
+        getApiCredentials,
+        getDefaultImageEditWorkbench,
+        isOfficialGeminiProvider,
+        isGeminiAgentModelConfig,
+        stripGoogleModelPrefix,
+        buildProxyUrl,
+        getProxyPreferenceForUrl,
+        getBase64FromUrl,
+        parseGeminiAssistantPayload,
+        updateNodeSettings,
+        setLastUsedExtractModel
+    ]);
     const openInputImageEditWorkbench = useCallback((nodeId, preset = 'inpaint') => {
         const targetNode = nodesMap.get(nodeId);
         if (!targetNode || targetNode.type !== 'input-image') return;
@@ -27944,13 +29326,34 @@ ${inputText.substring(0, 15000)} ... (截断)
             baseSpec.output.aspectRatio = defaults.aspectRatio || 'Auto';
             baseSpec.editNotes = [UPSCALE_PROMPT_TEXT, instruction].filter(Boolean).join('\n');
         } else if (preset === 'text-rewrite') {
-            const textTargets = [
-                copywriting.headline ? `Headline: ${copywriting.headline}` : '',
-                copywriting.subheadline ? `Subheadline: ${copywriting.subheadline}` : '',
-                copywriting.body ? `Body: ${copywriting.body}` : '',
-                copywriting.callToAction ? `CTA: ${copywriting.callToAction}` : '',
-                copywriting.brandName ? `Brand: ${copywriting.brandName}` : ''
-            ].filter(Boolean).join('; ');
+            const normalizedBlocks = normalizeTextRewriteBlocks(workbench.textBlocks || []);
+            const selectedIds = Array.isArray(workbench.selectedTextBlockIds)
+                ? workbench.selectedTextBlockIds.map((id) => String(id))
+                : [];
+            const targetedBlocks = selectedIds.length > 0
+                ? normalizedBlocks.filter((block) => selectedIds.includes(String(block.id)))
+                : normalizedBlocks;
+            const recognizedCopywriting = buildTextRewriteCopyDraft(targetedBlocks);
+            const finalCopywriting = {
+                headline: copywriting.headline || recognizedCopywriting.headline || '',
+                subheadline: copywriting.subheadline || recognizedCopywriting.subheadline || '',
+                body: copywriting.body || recognizedCopywriting.body || '',
+                callToAction: copywriting.callToAction || recognizedCopywriting.callToAction || '',
+                brandName: copywriting.brandName || recognizedCopywriting.brandName || '',
+                logoPlacement: ''
+            };
+            const structuredTargets = [
+                finalCopywriting.headline ? `Headline: ${finalCopywriting.headline}` : '',
+                finalCopywriting.subheadline ? `Subheadline: ${finalCopywriting.subheadline}` : '',
+                finalCopywriting.body ? `Body: ${finalCopywriting.body}` : '',
+                finalCopywriting.callToAction ? `CTA: ${finalCopywriting.callToAction}` : '',
+                finalCopywriting.brandName ? `Brand: ${finalCopywriting.brandName}` : ''
+            ].filter(Boolean);
+            const blockTargets = targetedBlocks.map((block, index) => {
+                const roleLabel = TEXT_REWRITE_ROLE_LABELS[block.role] || TEXT_REWRITE_ROLE_LABELS.other;
+                return `${roleLabel}#${index + 1}: ${block.text}`;
+            });
+            const textTargets = (structuredTargets.length > 0 ? structuredTargets : blockTargets).join('; ');
             baseSpec.creativeGoal = '图生图：无痕修改画面中的文案与排版';
             baseSpec.systemReasoning = {
                 intent: '图生图：无痕修改画面中的文案与排版',
@@ -27962,7 +29365,10 @@ ${inputText.substring(0, 15000)} ... (截断)
                 lighting: 'keep original lighting',
                 material: 'preserve paper, packaging or screen texture'
             };
-            baseSpec.copywriting.logoPlacement = '保持与原稿协调';
+            baseSpec.copywriting = {
+                ...finalCopywriting,
+                logoPlacement: '保持与原稿协调'
+            };
             baseSpec.apiPayload = {
                 compiledPrompt: 'clean premium poster layout, keep original composition, preserve paper and packaging texture, realistic typography rendering',
                 negativePrompt: 'unmasked area changes, layout collapse, extra text, warped letters, distorted product shape',
@@ -28046,7 +29452,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             return null;
         }
 
-        const imageModelKey = resolveModelKey(preferredGeminiImageModel || lastUsedImageModel || apiConfigs.find(config => isImageModelType(config.type))?.id || '');
+        const imageModelKey = preferredWorkflowImageModel;
         const defaultRatio = getPreferredModelRatio(imageModelKey, 'image') || 'Auto';
         const defaultResolution = preset === 'upscale'
             ? '4K'
@@ -28091,8 +29497,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         showToast,
         getDefaultImageEditWorkbench,
         setImageEditModal,
-        preferredGeminiImageModel,
-        lastUsedImageModel,
+        preferredWorkflowImageModel,
         apiConfigs,
         resolveModelKey,
         getPreferredModelRatio,
@@ -28118,7 +29523,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         const assistantMessage = session.messages[assistantIndex];
         const sourceUserMessage = [...session.messages.slice(0, assistantIndex)].reverse().find(message => message.role === 'user') || null;
         const sourceImageFiles = (sourceUserMessage?.files || []).filter(file => file?.isImage);
-        const imageModelKey = resolveModelKey(preferredGeminiImageModel || lastUsedImageModel || apiConfigs.find(config => isImageModelType(config.type))?.id || '');
+        const imageModelKey = preferredWorkflowImageModel;
         const imageModelConfig = getApiConfigByKey(imageModelKey);
         const defaultRatio = getPreferredModelRatio(imageModelKey || imageModelConfig?.id || '', 'image') || lastUsedRatio || '1:1';
         const defaultResolution = getPreferredImageResolutionForModel(imageModelKey || imageModelConfig?.id || '') || lastUsedImageResolution || '2K';
@@ -28286,8 +29691,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         showToast,
         stripChatSourceFooter,
         parseChatImageWorkflowBlueprints,
-        preferredGeminiImageModel,
-        lastUsedImageModel,
+        preferredWorkflowImageModel,
         apiConfigs,
         resolveModelKey,
         getApiConfigByKey,
@@ -31322,6 +32726,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         };
                                         const currentPreset = String(workbench.preset || 'inpaint');
                                         const requiresMask = currentPreset === 'inpaint' || currentPreset === 'text-rewrite';
+                                        const detectedTextBlocks = normalizeTextRewriteBlocks(workbench.textBlocks || []);
+                                        const selectedTextBlockIds = Array.isArray(workbench.selectedTextBlockIds)
+                                            ? workbench.selectedTextBlockIds.map((id) => String(id))
+                                            : [];
+                                        const selectedTextBlockIdSet = new Set(selectedTextBlockIds);
+                                        const isScanningText = textRewriteScanState.loading && textRewriteScanState.nodeId === node.id;
                                         const presetOptions = [
                                             { id: 'inpaint', label: '局部重绘', icon: Brush, desc: '局部替换 / 修瑕 / 局部改稿' },
                                             { id: 'upscale', label: '高清还原', icon: Sparkles, desc: '放大 / 锐化 / 去噪' },
@@ -31404,6 +32814,46 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     className="w-full h-full object-contain"
                                                                     draggable={false}
                                                                 />
+                                                                {currentPreset === 'text-rewrite' && detectedTextBlocks.length > 0 && (
+                                                                    <div className="absolute inset-0 pointer-events-none">
+                                                                        {detectedTextBlocks.map((block, index) => {
+                                                                            const isSelectedBlock = selectedTextBlockIdSet.has(String(block.id));
+                                                                            return (
+                                                                                <button
+                                                                                    key={block.id}
+                                                                                    type="button"
+                                                                                    onClick={() => {
+                                                                                        const nextSelectedIds = selectedTextBlockIdSet.has(String(block.id))
+                                                                                            ? selectedTextBlockIds.filter((id) => id !== String(block.id))
+                                                                                            : [...selectedTextBlockIds, String(block.id)];
+                                                                                        updateNodeSettings(node.id, {
+                                                                                            editWorkbench: {
+                                                                                                ...workbench,
+                                                                                                textBlocks: detectedTextBlocks,
+                                                                                                selectedTextBlockIds: nextSelectedIds
+                                                                                            }
+                                                                                        });
+                                                                                    }}
+                                                                                    className={`absolute pointer-events-auto rounded-lg border-2 transition-all ${isSelectedBlock
+                                                                                        ? 'border-cyan-300 bg-cyan-400/18 shadow-[0_0_0_1px_rgba(34,211,238,0.55)]'
+                                                                                        : 'border-white/55 bg-black/10 hover:border-cyan-200'
+                                                                                        }`}
+                                                                                    style={{
+                                                                                        left: `${block.bbox.x / 10}%`,
+                                                                                        top: `${block.bbox.y / 10}%`,
+                                                                                        width: `${block.bbox.w / 10}%`,
+                                                                                        height: `${block.bbox.h / 10}%`
+                                                                                    }}
+                                                                                    title={`${TEXT_REWRITE_ROLE_LABELS[block.role] || TEXT_REWRITE_ROLE_LABELS.other}: ${block.text}`}
+                                                                                >
+                                                                                    <span className="absolute -top-2 left-0 px-1.5 py-0.5 rounded-full bg-black/75 text-white text-[10px] leading-none">
+                                                                                        {index + 1}
+                                                                                    </span>
+                                                                                </button>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                )}
                                                                 {node.maskContent && (
                                                                     <div
                                                                         className="absolute inset-0 pointer-events-none"
@@ -31513,63 +32963,207 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             </label>
 
                                                             {currentPreset === 'text-rewrite' && (
-                                                                <div className="grid grid-cols-2 gap-2">
-                                                                    <label className="flex flex-col gap-1">
-                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>大标题</span>
-                                                                        <input
-                                                                            value={workbench.headline || ''}
-                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, headline: e.target.value } })}
-                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
-                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
-                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                <div className="space-y-3">
+                                                                    <div className="flex items-center gap-2">
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => scanTextRewriteBlocks(node.id)}
+                                                                            disabled={isScanningText}
+                                                                            className={`inline-flex items-center gap-2 px-3 py-2 rounded-xl text-[11px] font-medium border ${isScanningText
+                                                                                ? theme === 'dark'
+                                                                                    ? 'border-zinc-800 bg-zinc-900 text-zinc-500 cursor-wait'
+                                                                                    : 'border-zinc-200 bg-zinc-100 text-zinc-400 cursor-wait'
+                                                                                : theme === 'dark'
+                                                                                    ? 'border-cyan-400/30 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20'
+                                                                                    : 'border-cyan-200 bg-cyan-50 text-cyan-700 hover:bg-cyan-100'
                                                                                 }`}
-                                                                        />
-                                                                    </label>
-                                                                    <label className="flex flex-col gap-1">
-                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>副标题</span>
-                                                                        <input
-                                                                            value={workbench.subheadline || ''}
-                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, subheadline: e.target.value } })}
-                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
-                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
-                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                        >
+                                                                            {isScanningText ? <Loader2 size={12} className="animate-spin" /> : <FileSearch size={12} />}
+                                                                            <span>{isScanningText ? '识别中...' : '识别图中文字'}</span>
+                                                                        </button>
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => applyTextRewriteBlocksToMask(node.id)}
+                                                                            disabled={detectedTextBlocks.length === 0}
+                                                                            className={`inline-flex items-center gap-2 px-3 py-2 rounded-xl text-[11px] font-medium border ${detectedTextBlocks.length === 0
+                                                                                ? theme === 'dark'
+                                                                                    ? 'border-zinc-800 bg-zinc-900 text-zinc-600 cursor-not-allowed'
+                                                                                    : 'border-zinc-200 bg-zinc-100 text-zinc-400 cursor-not-allowed'
+                                                                                : theme === 'dark'
+                                                                                    ? 'border-purple-400/30 bg-purple-500/10 text-purple-200 hover:bg-purple-500/20'
+                                                                                    : 'border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100'
                                                                                 }`}
-                                                                        />
-                                                                    </label>
-                                                                    <label className="flex flex-col gap-1 col-span-2">
-                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>正文 / 说明文案</span>
-                                                                        <textarea
-                                                                            value={workbench.body || ''}
-                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, body: e.target.value } })}
-                                                                            rows={3}
-                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none resize-none ${theme === 'dark'
-                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
-                                                                                : 'bg-white border-zinc-200 text-zinc-800'
-                                                                                }`}
-                                                                        />
-                                                                    </label>
-                                                                    <label className="flex flex-col gap-1">
-                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>CTA</span>
-                                                                        <input
-                                                                            value={workbench.callToAction || ''}
-                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, callToAction: e.target.value } })}
-                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
-                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
-                                                                                : 'bg-white border-zinc-200 text-zinc-800'
-                                                                                }`}
-                                                                        />
-                                                                    </label>
-                                                                    <label className="flex flex-col gap-1">
-                                                                        <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>品牌名</span>
-                                                                        <input
-                                                                            value={workbench.brandName || ''}
-                                                                            onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, brandName: e.target.value } })}
-                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
-                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
-                                                                                : 'bg-white border-zinc-200 text-zinc-800'
-                                                                                }`}
-                                                                        />
-                                                                    </label>
+                                                                        >
+                                                                            <Square size={12} />
+                                                                            <span>按文字框生成遮罩</span>
+                                                                        </button>
+                                                                    </div>
+                                                                    <div className={`rounded-xl border px-3 py-3 text-[11px] ${theme === 'dark'
+                                                                        ? 'border-zinc-800 bg-zinc-900/70 text-zinc-300'
+                                                                        : 'border-zinc-200 bg-zinc-50 text-zinc-600'
+                                                                        }`}>
+                                                                        {detectedTextBlocks.length > 0
+                                                                            ? `已识别 ${detectedTextBlocks.length} 个文字框。可直接改右侧文案，也可以点左侧框选择要改的区域。`
+                                                                            : '先识别图中文字，再把需要改的文字框一键转成遮罩。'}
+                                                                        {workbench.recognizedModel && (
+                                                                            <span className="block mt-1 opacity-75">识别模型：{getModelLabel(workbench.recognizedModel)}</span>
+                                                                        )}
+                                                                        {textRewriteScanState.error && textRewriteScanState.nodeId === node.id && (
+                                                                            <span className="block mt-1 text-red-400">{textRewriteScanState.error}</span>
+                                                                        )}
+                                                                    </div>
+                                                                    {detectedTextBlocks.length > 0 && (
+                                                                        <div className="space-y-2">
+                                                                            <div className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>编辑文字</div>
+                                                                            {detectedTextBlocks.map((block, index) => {
+                                                                                const isSelectedBlock = selectedTextBlockIdSet.has(String(block.id));
+                                                                                const isMultiline = block.text.includes('\n') || block.text.length > 36;
+                                                                                return (
+                                                                                    <div
+                                                                                        key={block.id}
+                                                                                        className={`rounded-2xl border px-3 py-2.5 transition-colors ${isSelectedBlock
+                                                                                            ? theme === 'dark'
+                                                                                                ? 'border-cyan-400/40 bg-cyan-500/10'
+                                                                                                : 'border-cyan-200 bg-cyan-50'
+                                                                                            : theme === 'dark'
+                                                                                                ? 'border-zinc-800 bg-zinc-950/60'
+                                                                                                : 'border-zinc-200 bg-white'
+                                                                                            }`}
+                                                                                    >
+                                                                                        <div className="flex items-center gap-2 mb-2">
+                                                                                            <label className="inline-flex items-center gap-2 text-[10px]">
+                                                                                                <input
+                                                                                                    type="checkbox"
+                                                                                                    checked={isSelectedBlock}
+                                                                                                    onChange={(e) => {
+                                                                                                        const nextSelectedIds = e.target.checked
+                                                                                                            ? [...selectedTextBlockIds, String(block.id)]
+                                                                                                            : selectedTextBlockIds.filter((id) => id !== String(block.id));
+                                                                                                        updateNodeSettings(node.id, {
+                                                                                                            editWorkbench: {
+                                                                                                                ...workbench,
+                                                                                                                textBlocks: detectedTextBlocks,
+                                                                                                                selectedTextBlockIds: nextSelectedIds
+                                                                                                            }
+                                                                                                        });
+                                                                                                    }}
+                                                                                                />
+                                                                                                <span>框 {index + 1}</span>
+                                                                                            </label>
+                                                                                            <span className={`px-2 py-0.5 rounded-full text-[10px] ${theme === 'dark'
+                                                                                                ? 'bg-zinc-800 text-zinc-300'
+                                                                                                : 'bg-zinc-100 text-zinc-600'
+                                                                                                }`}>
+                                                                                                {TEXT_REWRITE_ROLE_LABELS[block.role] || TEXT_REWRITE_ROLE_LABELS.other}
+                                                                                            </span>
+                                                                                        </div>
+                                                                                        {isMultiline ? (
+                                                                                            <textarea
+                                                                                                value={block.text}
+                                                                                                rows={Math.min(4, Math.max(2, block.text.split('\n').length))}
+                                                                                                onChange={(e) => {
+                                                                                                    const nextBlocks = detectedTextBlocks.map((item) => (
+                                                                                                        item.id === block.id
+                                                                                                            ? { ...item, text: e.target.value }
+                                                                                                            : item
+                                                                                                    ));
+                                                                                                    updateNodeSettings(node.id, {
+                                                                                                        editWorkbench: {
+                                                                                                            ...workbench,
+                                                                                                            textBlocks: nextBlocks
+                                                                                                        }
+                                                                                                    });
+                                                                                                }}
+                                                                                                className={`w-full rounded-xl px-3 py-2 text-[12px] border outline-none resize-none ${theme === 'dark'
+                                                                                                    ? 'bg-zinc-900 border-zinc-800 text-zinc-100'
+                                                                                                    : 'bg-zinc-50 border-zinc-200 text-zinc-800'
+                                                                                                    }`}
+                                                                                            />
+                                                                                        ) : (
+                                                                                            <input
+                                                                                                value={block.text}
+                                                                                                onChange={(e) => {
+                                                                                                    const nextBlocks = detectedTextBlocks.map((item) => (
+                                                                                                        item.id === block.id
+                                                                                                            ? { ...item, text: e.target.value }
+                                                                                                            : item
+                                                                                                    ));
+                                                                                                    updateNodeSettings(node.id, {
+                                                                                                        editWorkbench: {
+                                                                                                            ...workbench,
+                                                                                                            textBlocks: nextBlocks
+                                                                                                        }
+                                                                                                    });
+                                                                                                }}
+                                                                                                className={`w-full rounded-xl px-3 py-2 text-[12px] border outline-none ${theme === 'dark'
+                                                                                                    ? 'bg-zinc-900 border-zinc-800 text-zinc-100'
+                                                                                                    : 'bg-zinc-50 border-zinc-200 text-zinc-800'
+                                                                                                    }`}
+                                                                                            />
+                                                                                        )}
+                                                                                    </div>
+                                                                                );
+                                                                            })}
+                                                                        </div>
+                                                                    )}
+                                                                    <div className="grid grid-cols-2 gap-2">
+                                                                        <label className="flex flex-col gap-1">
+                                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>大标题（可选覆盖）</span>
+                                                                            <input
+                                                                                value={workbench.headline || ''}
+                                                                                onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, headline: e.target.value } })}
+                                                                                className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                    ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                    }`}
+                                                                            />
+                                                                        </label>
+                                                                        <label className="flex flex-col gap-1">
+                                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>副标题（可选覆盖）</span>
+                                                                            <input
+                                                                                value={workbench.subheadline || ''}
+                                                                                onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, subheadline: e.target.value } })}
+                                                                                className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                    ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                    }`}
+                                                                            />
+                                                                        </label>
+                                                                        <label className="flex flex-col gap-1 col-span-2">
+                                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>正文 / 说明文案（可选覆盖）</span>
+                                                                            <textarea
+                                                                                value={workbench.body || ''}
+                                                                                onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, body: e.target.value } })}
+                                                                                rows={3}
+                                                                                className={`px-3 py-2 rounded-xl text-[12px] border outline-none resize-none ${theme === 'dark'
+                                                                                    ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                    }`}
+                                                                            />
+                                                                        </label>
+                                                                        <label className="flex flex-col gap-1">
+                                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>CTA（可选覆盖）</span>
+                                                                            <input
+                                                                                value={workbench.callToAction || ''}
+                                                                                onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, callToAction: e.target.value } })}
+                                                                                className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                    ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                    }`}
+                                                                            />
+                                                                        </label>
+                                                                        <label className="flex flex-col gap-1">
+                                                                            <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>品牌名（可选覆盖）</span>
+                                                                            <input
+                                                                                value={workbench.brandName || ''}
+                                                                                onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, brandName: e.target.value } })}
+                                                                                className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                    ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                    : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                    }`}
+                                                                            />
+                                                                        </label>
+                                                                    </div>
                                                                 </div>
                                                             )}
 
@@ -37601,7 +39195,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                 </div>
             </div >
         );
-    }, [selectedNodeId, selectedNodeIds, hoverTargetId, nodeConnectedStatus, adjacentNodesCache, apiConfigsMap, getConnectedInputImages, theme, view.zoom, dragNodeId, connectingSource, connectingTarget, connectingInputType, deleteNode, handleNodeMouseUp, screenToWorld, setDragNodeId, setSelectedNodeId, setSelectedNodeIds, setActiveDropdown, setHoverTargetId, setConnectingSource, setConnectingTarget, setConnectingInputType, beginNodeResize, setLightboxItem, isVideoUrl, updateNodeSettings, getConnectedTextNodes, startGeneration, getDefaultDurationForModel, getDefaultDurationsForModel, getConnectedGenNodes, getConnectedVideoInputNode, getConnectedVideoAnalyzeNode, handleCanvasDragOver, handleGenNodeDrop, importStoryboardMarkdownTable, importStoryboardTableFromFile, mutateStoryboardTable, normalizeStoryboardTableData, openStoryboardTableCellEditor, runStoryboardTablePromptMerge, markInteraction, resolveNodeRenderZIndex, touchNodeSelectionPriority, buildGeminiImageRenderPayload, parseGeminiImagePromptSpec, lastUsedRatio, lastUsedImageResolution, updateImagePromptConsole, getCachedImagePromptRenderState]);
+    }, [selectedNodeId, selectedNodeIds, hoverTargetId, nodeConnectedStatus, adjacentNodesCache, apiConfigsMap, getConnectedInputImages, theme, view.zoom, dragNodeId, connectingSource, connectingTarget, connectingInputType, deleteNode, handleNodeMouseUp, screenToWorld, setDragNodeId, setSelectedNodeId, setSelectedNodeIds, setActiveDropdown, setHoverTargetId, setConnectingSource, setConnectingTarget, setConnectingInputType, beginNodeResize, setLightboxItem, isVideoUrl, updateNodeSettings, getConnectedTextNodes, startGeneration, getDefaultDurationForModel, getDefaultDurationsForModel, getConnectedGenNodes, getConnectedVideoInputNode, getConnectedVideoAnalyzeNode, handleCanvasDragOver, handleGenNodeDrop, importStoryboardMarkdownTable, importStoryboardTableFromFile, mutateStoryboardTable, normalizeStoryboardTableData, openStoryboardTableCellEditor, runStoryboardTablePromptMerge, markInteraction, resolveNodeRenderZIndex, touchNodeSelectionPriority, buildGeminiImageRenderPayload, parseGeminiImagePromptSpec, lastUsedRatio, lastUsedImageResolution, updateImagePromptConsole, getCachedImagePromptRenderState, imageEditModal, textRewriteScanState, getDefaultImageEditWorkbench, openInputImageEditWorkbench, launchInputImageEditWorkflow, scanTextRewriteBlocks, applyTextRewriteBlocksToMask, getModelLabel]);
 
     // 高性能模式：当节点数量超过 50 或手动开启时启用
     const isPerfMode = nodes.length > 50 || globalPerformanceMode !== 'off';
@@ -39425,7 +41019,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         ? theme === 'dark' ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30' : 'bg-blue-100 text-blue-700 border border-blue-200'
                                         : theme === 'dark' ? 'bg-zinc-800 text-zinc-400 border border-zinc-700' : 'bg-zinc-200 text-zinc-600 border border-zinc-300'
                                         }`}>
-                                        {currentChatSupportsDesignAgent ? 'Gemini 设计 Agent' : '通用对话'}
+                                        {currentChatSupportsDesignAgent
+                                            ? (currentChatUsesOfficialGemini ? 'Gemini 设计 Agent' : '设计 Agent')
+                                            : '通用对话'}
                                     </span>
                                     {currentChatUsesOfficialGemini && (
                                         <span className={`text-[10px] px-2 py-0.5 rounded-full ${theme === 'dark' ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
@@ -39592,47 +41188,51 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     ) : null}
                                                 </div>
                                             )}
-                                            {msg.role === 'assistant' && msg.content && msg.content.trim() && !msg.isError && (
+                                            {msg.role === 'assistant' && msg.content && msg.content.trim() && !msg.isError && (msg.canCreateWorkflow !== false || msg.canSyncPrompt !== false) && (
                                                 <div className="flex flex-wrap gap-2 pt-1">
-                                                    <button
-                                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 ${theme === 'dark'
-                                                            ? 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
-                                                            : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
-                                                            }`}
-                                                        onMouseDown={(e) => e.stopPropagation()}
-                                                        onClick={() => createImageWorkflowFromChatMessage(currentSession.id, msg.id)}
-                                                    >
-                                                        <Workflow size={10} />
-                                                        {t('创建到画布')}
-                                                    </button>
-                                                    <button
-                                                        className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 ${theme === 'dark'
-                                                            ? 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
-                                                            : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
-                                                            }`}
-                                                        onMouseDown={(e) => e.stopPropagation()}
-                                                        onClick={() => {
-                                                            const targetNodeId = resolvePrimarySelectedNodeId();
-                                                            if (!targetNodeId) {
-                                                                showToast('请先选中一个画布节点', 'warning', 2200);
-                                                                return;
-                                                            }
-                                                            const actionablePrompt = extractActionablePromptFromChatMessage(msg.content);
-                                                            if (!actionablePrompt) {
-                                                                showToast('这条回复里没有可直接同步的提示词', 'warning', 2400);
-                                                                return;
-                                                            }
-                                                            const result = applyHistoryPromptToNode(targetNodeId, actionablePrompt);
-                                                            if (result.applied) {
-                                                                showToast('已同步到当前节点', 'success', 2200);
-                                                            } else {
-                                                                showToast('当前节点不支持接收该提示词', 'warning', 2400);
-                                                            }
-                                                        }}
-                                                    >
-                                                        <ArrowRightSquare size={10} />
-                                                        {t('同步到当前节点')}
-                                                    </button>
+                                                    {msg.canCreateWorkflow !== false && (
+                                                        <button
+                                                            className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 ${theme === 'dark'
+                                                                ? 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
+                                                                : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
+                                                                }`}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            onClick={() => createImageWorkflowFromChatMessage(currentSession.id, msg.id)}
+                                                        >
+                                                            <Workflow size={10} />
+                                                            {t('创建到画布')}
+                                                        </button>
+                                                    )}
+                                                    {msg.canSyncPrompt !== false && (
+                                                        <button
+                                                            className={`px-2 py-1 rounded-full text-[10px] border flex items-center gap-1 ${theme === 'dark'
+                                                                ? 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
+                                                                : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
+                                                                }`}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            onClick={() => {
+                                                                const targetNodeId = resolvePrimarySelectedNodeId();
+                                                                if (!targetNodeId) {
+                                                                    showToast('请先选中一个画布节点', 'warning', 2200);
+                                                                    return;
+                                                                }
+                                                                const actionablePrompt = extractActionablePromptFromChatMessage(msg.content);
+                                                                if (!actionablePrompt) {
+                                                                    showToast('这条回复里没有可直接同步的提示词', 'warning', 2400);
+                                                                    return;
+                                                                }
+                                                                const result = applyHistoryPromptToNode(targetNodeId, actionablePrompt);
+                                                                if (result.applied) {
+                                                                    showToast('已同步到当前节点', 'success', 2200);
+                                                                } else {
+                                                                    showToast('当前节点不支持接收该提示词', 'warning', 2400);
+                                                                }
+                                                            }}
+                                                        >
+                                                            <ArrowRightSquare size={10} />
+                                                            {t('同步到当前节点')}
+                                                        </button>
+                                                    )}
                                                 </div>
                                             )}
                                         </div>
@@ -41198,7 +42798,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         </div>
                                                     )}
                                                     <div className="space-y-1.5">
-                                                        {group.models.map(api => {
+                                                        {group.models.slice(0, providerModelVisibleCounts[providerKey] || PROVIDER_MODEL_RENDER_STEP).map(api => {
                                                             const isEditing = editingApiModels.has(api._uid);
                                                             const libraryLabel = api.libraryId
                                                                 ? (modelLibraryMap.get(api.libraryId)?.displayName
@@ -41217,65 +42817,87 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     <div className="flex items-start justify-between gap-2">
                                                                         <div className="flex flex-wrap items-center gap-2 flex-1">
                                                                             <div className={`w-1.5 h-1.5 rounded-full ${getStatusColor(api._uid)}`}></div>
-                                                                            <input
-                                                                                type="text"
-                                                                                value={api.id || ''}
-                                                                                onChange={(e) => updateApiConfig(api._uid, { id: e.target.value })}
-                                                                                onKeyDown={(e) => e.stopPropagation()}
-                                                                                onClick={(e) => e.stopPropagation()}
-                                                                                className={`text-xs bg-transparent border-b border-transparent hover:border-zinc-600 focus:border-blue-500 outline-none flex-1 min-w-[120px] font-mono ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}
-                                                                                placeholder="model-id"
-                                                                                title={`模型 ID: ${api.id}`}
-                                                                                disabled={!isEditing}
-                                                                            />
-                                                                            <select
-                                                                                value={api.type || 'Chat'}
-                                                                                onChange={(e) => updateApiConfig(api._uid, { type: e.target.value })}
-                                                                                className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
-                                                                                disabled={!isEditing || !!api.libraryId}
-                                                                            >
-                                                                                <option value="Chat">Chat</option>
-                                                                                <option value="Image">Image</option>
-                                                                                <option value="ChatImage">Chat Image</option>
-                                                                                <option value="Video">Video</option>
-                                                                            </select>
-                                                                            <select
-                                                                                value={api.libraryId || ''}
-                                                                                onChange={(e) => {
-                                                                                    const selectedId = e.target.value || null;
-                                                                                    const selected = selectedId ? modelLibraryMap.get(selectedId) : null;
-                                                                                    const updates = { libraryId: selectedId };
-                                                                                    if (selected) {
-                                                                                        updates.modelName = selected.modelName;
-                                                                                        updates.displayName = selected.displayName;
-                                                                                        updates.type = selected.type || api.type;
-                                                                                        updates.apiType = selected.apiType || api.apiType;
-                                                                                        updates.ratioLimits = Array.isArray(selected.ratioLimits) ? selected.ratioLimits : null;
-                                                                                        updates.resolutionLimits = Array.isArray(selected.resolutionLimits) ? selected.resolutionLimits : null;
-                                                                                        updates.durations = Array.isArray(selected.durations) ? selected.durations : null;
-                                                                                        updates.videoResolutions = Array.isArray(selected.videoResolutions) ? selected.videoResolutions : null;
-                                                                                    }
-                                                                                    updateApiConfig(api._uid, updates);
-                                                                                }}
-                                                                                className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none min-w-[120px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
-                                                                                disabled={!isEditing}
-                                                                            >
-                                                                                <option value="">{t('不引用模型库')}</option>
-                                                                                {modelLibrary.map((entry) => (
-                                                                                    <option key={entry.id} value={entry.id}>{entry.displayName || entry.modelName || entry.id}</option>
-                                                                                ))}
-                                                                            </select>
-                                                                            <select
-                                                                                value={api.apiType || ''}
-                                                                                onChange={(e) => updateApiConfig(api._uid, { apiType: e.target.value || null })}
-                                                                                className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
-                                                                                disabled={!isEditing || !!api.libraryId}
-                                                                            >
-                                                                                <option value="">{t('跟随 Provider')}</option>
-                                                                                <option value="openai">OpenAI</option>
-                                                                                <option value="gemini">Gemini</option>
-                                                                                <option value="modelscope">ModelScope</option>
-                                                                            </select>
+                                                                            {isEditing ? (
+                                                                                <input
+                                                                                    type="text"
+                                                                                    value={api.id || ''}
+                                                                                    onChange={(e) => updateApiConfig(api._uid, { id: e.target.value })}
+                                                                                    onKeyDown={(e) => e.stopPropagation()}
+                                                                                    onClick={(e) => e.stopPropagation()}
+                                                                                    className={`text-xs bg-transparent border-b border-transparent hover:border-zinc-600 focus:border-blue-500 outline-none flex-1 min-w-[120px] font-mono ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}
+                                                                                    placeholder="model-id"
+                                                                                    title={`模型 ID: ${api.id}`}
+                                                                                />
+                                                                            ) : (
+                                                                                <span className={`text-xs font-mono truncate max-w-[240px] ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`} title={`模型 ID: ${api.id}`}>
+                                                                                    {api.id || 'model-id'}
+                                                                                </span>
+                                                                            )}
+                                                                            {isEditing ? (
+                                                                                <select
+                                                                                    value={api.type || 'Chat'}
+                                                                                    onChange={(e) => updateApiConfig(api._uid, { type: e.target.value })}
+                                                                                    className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
+                                                                                    disabled={!!api.libraryId}
+                                                                                >
+                                                                                    <option value="Chat">Chat</option>
+                                                                                    <option value="Image">Image</option>
+                                                                                    <option value="ChatImage">Chat Image</option>
+                                                                                    <option value="Video">Video</option>
+                                                                                </select>
+                                                                            ) : (
+                                                                                <span className={`text-[9px] px-1.5 py-0.5 rounded ${theme === 'dark' ? 'bg-zinc-800 text-zinc-300' : 'bg-zinc-200 text-zinc-600'}`}>
+                                                                                    {api.type || 'Chat'}
+                                                                                </span>
+                                                                            )}
+                                                                            {isEditing ? (
+                                                                                <select
+                                                                                    value={api.libraryId || ''}
+                                                                                    onChange={(e) => {
+                                                                                        const selectedId = e.target.value || null;
+                                                                                        const selected = selectedId ? modelLibraryMap.get(selectedId) : null;
+                                                                                        const updates = { libraryId: selectedId };
+                                                                                        if (selected) {
+                                                                                            updates.modelName = selected.modelName;
+                                                                                            updates.displayName = selected.displayName;
+                                                                                            updates.type = selected.type || api.type;
+                                                                                            updates.apiType = selected.apiType || api.apiType;
+                                                                                            updates.ratioLimits = Array.isArray(selected.ratioLimits) ? selected.ratioLimits : null;
+                                                                                            updates.resolutionLimits = Array.isArray(selected.resolutionLimits) ? selected.resolutionLimits : null;
+                                                                                            updates.durations = Array.isArray(selected.durations) ? selected.durations : null;
+                                                                                            updates.videoResolutions = Array.isArray(selected.videoResolutions) ? selected.videoResolutions : null;
+                                                                                        }
+                                                                                        updateApiConfig(api._uid, updates);
+                                                                                    }}
+                                                                                    className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none min-w-[120px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
+                                                                                >
+                                                                                    <option value="">{t('不引用模型库')}</option>
+                                                                                    {modelLibrary.map((entry) => (
+                                                                                        <option key={entry.id} value={entry.id}>{entry.displayName || entry.modelName || entry.id}</option>
+                                                                                    ))}
+                                                                                </select>
+                                                                            ) : (
+                                                                                <span className={`text-[9px] px-1.5 py-0.5 rounded max-w-[180px] truncate ${theme === 'dark' ? 'bg-zinc-800 text-zinc-300' : 'bg-zinc-200 text-zinc-600'}`} title={api.libraryId ? libraryLabel : t('不引用模型库')}>
+                                                                                    {api.libraryId ? libraryLabel : t('不引用模型库')}
+                                                                                </span>
+                                                                            )}
+                                                                            {isEditing ? (
+                                                                                <select
+                                                                                    value={api.apiType || ''}
+                                                                                    onChange={(e) => updateApiConfig(api._uid, { apiType: e.target.value || null })}
+                                                                                    className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
+                                                                                    disabled={!!api.libraryId}
+                                                                                >
+                                                                                    <option value="">{t('跟随 Provider')}</option>
+                                                                                    <option value="openai">OpenAI</option>
+                                                                                    <option value="gemini">Gemini</option>
+                                                                                    <option value="modelscope">ModelScope</option>
+                                                                                </select>
+                                                                            ) : (
+                                                                                <span className={`text-[9px] px-1.5 py-0.5 rounded ${theme === 'dark' ? 'bg-zinc-800 text-zinc-300' : 'bg-zinc-200 text-zinc-600'}`}>
+                                                                                    {resolvedApiType || 'openai'}
+                                                                                </span>
+                                                                            )}
                                                                         </div>
                                                                         <div className="flex items-center gap-1">
                                                                             <button
@@ -41312,6 +42934,17 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                 </div>
                                                             );
                                                         })}
+                                                        {group.models.length > (providerModelVisibleCounts[providerKey] || PROVIDER_MODEL_RENDER_STEP) && (
+                                                            <button
+                                                                onClick={() => setProviderModelVisibleCounts(prev => ({
+                                                                    ...prev,
+                                                                    [providerKey]: (prev[providerKey] || PROVIDER_MODEL_RENDER_STEP) + PROVIDER_MODEL_RENDER_STEP
+                                                                }))}
+                                                                className={`w-full text-[10px] px-2 py-1.5 rounded border border-dashed ${theme === 'dark' ? 'border-zinc-700 text-zinc-400 hover:bg-zinc-800' : 'border-zinc-300 text-zinc-600 hover:bg-zinc-50'}`}
+                                                            >
+                                                                {t('继续加载模型')}（+{Math.min(PROVIDER_MODEL_RENDER_STEP, group.models.length - (providerModelVisibleCounts[providerKey] || PROVIDER_MODEL_RENDER_STEP))} / {group.models.length}）
+                                                            </button>
+                                                        )}
                                                     </div>
                                                 </div>
                                             </div>
@@ -41326,12 +42959,12 @@ ${inputText.substring(0, 15000)} ... (截断)
 
                             {settingsTab === 'library' && (
                                 <div className="p-4 space-y-3">
-                                    <div className="flex items-center justify-between">
+                                    <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                                         <div>
                                             <div className={`text-xs font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>{t('模型库')}</div>
                                             <p className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>{t('统一维护模型能力与限制，供应商模型可直接引用。')}</p>
                                         </div>
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex items-center gap-2 self-start lg:self-auto">
                                             <button
                                                 onClick={() => importModelLibraryEntries()}
                                                 className={`text-[10px] px-2 py-1 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'}`}
@@ -41359,8 +42992,20 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             </button>
                                         </div>
                                     </div>
+                                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                        <input
+                                            type="text"
+                                            value={modelLibraryFilter}
+                                            onChange={(e) => setModelLibraryFilter(e.target.value)}
+                                            placeholder={t('搜索模型名 / ID / 类型')}
+                                            className={`w-full sm:max-w-[320px] rounded px-2 py-1 text-xs outline-none border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                        />
+                                        <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                            {t('已匹配')} {filteredModelLibrary.length} / {modelLibrary.length}
+                                        </span>
+                                    </div>
                                     <div className="space-y-2 max-h-[60vh] overflow-y-auto custom-scrollbar pr-1">
-                                        {modelLibrary.map((entry) => {
+                                        {filteredModelLibrary.slice(0, libraryModelVisibleCount).map((entry) => {
                                             const isEditing = editingLibraryModels.has(entry.id);
                                             const isCollapsed = collapsedLibraryModels.has(entry.id);
                                             const isPreviewOpen = libraryPreviewModels.has(entry.id);
@@ -43267,6 +44912,19 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 </div>
                                             );
                                         })}
+                                        {filteredModelLibrary.length === 0 && (
+                                            <div className={`rounded-lg border border-dashed px-3 py-4 text-center text-[10px] ${theme === 'dark' ? 'border-zinc-800 text-zinc-500' : 'border-zinc-300 text-zinc-500'}`}>
+                                                {t('没有匹配的模型')}
+                                            </div>
+                                        )}
+                                        {filteredModelLibrary.length > libraryModelVisibleCount && (
+                                            <button
+                                                onClick={() => setLibraryModelVisibleCount((prev) => prev + MODEL_LIBRARY_RENDER_STEP)}
+                                                className={`w-full text-[10px] px-2 py-1.5 rounded border border-dashed ${theme === 'dark' ? 'border-zinc-700 text-zinc-400 hover:bg-zinc-800' : 'border-zinc-300 text-zinc-600 hover:bg-zinc-50'}`}
+                                            >
+                                                {t('继续加载模型')}（+{Math.min(MODEL_LIBRARY_RENDER_STEP, filteredModelLibrary.length - libraryModelVisibleCount)} / {filteredModelLibrary.length}）
+                                            </button>
+                                        )}
                                     </div>
                                     <p className="text-[9px] text-zinc-500">提示：映射提示名仅用于展示，模型ID用于真实调用；不填写列表将使用默认限制。</p>
                                 </div>
