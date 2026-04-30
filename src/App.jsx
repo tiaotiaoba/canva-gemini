@@ -40187,7 +40187,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     onMouseLeave={() => setHoveredProvider(null)}
                                                 >
                                                     {/* V3.4.6: 左侧 Provider 列表 */}
-                                                    <div className={`w-36 border-r pr-1 max-h-64 overflow-y-auto custom-scrollbar flex flex-col justify-end ${theme === 'dark' ? 'border-zinc-700' : 'border-zinc-200'}`}>
+                                                    <div className={`w-36 border-r pr-1 max-h-64 overflow-y-auto custom-scrollbar flex flex-col ${theme === 'dark' ? 'border-zinc-700' : 'border-zinc-200'}`}>
                                                         {Object.entries(groupedApiConfigs)
                                                             .filter(([, group]) => group.models.some(m => (node.type === 'gen-image' ? isImageModelType(m.type) : m.type === 'Video')))
                                                             .map(([providerKey, group]) => (
@@ -40205,7 +40205,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             ))}
                                                     </div>
                                                     {/* V3.4.6: 右侧 Model 列表 */}
-                                                    <div className="flex-1 pl-1 max-h-64 overflow-y-auto custom-scrollbar flex flex-col justify-end">
+                                                    <div className="flex-1 pl-1 max-h-64 overflow-y-auto custom-scrollbar flex flex-col">
                                                         {hoveredProvider && groupedApiConfigs[hoveredProvider]?.models
                                                             .filter(m => (node.type === 'gen-image' ? isImageModelType(m.type) : m.type === 'Video'))
                                                             .map((m) => {
