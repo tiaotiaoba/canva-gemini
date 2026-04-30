@@ -65,38 +65,47 @@
 
 ---
 
-## 部署
+## 本地运行
 
-### Docker（推荐）
+### 1. 安装依赖
 
 ```bash
 git clone https://github.com/tiaotiaoba/canva-gemini.git
 cd canva-gemini
-docker compose up -d --build
+npm install
+```
+
+### 2. 启动服务
+
+```bash
+# 启动 Vite 开发服务器（前端）
+npm run dev
+
+# 另开终端，启动 Python 本地接收器（后端代理/文件存储）
+python localserver/tapnow-server-full.py
 ```
 
 启动后访问：
 | 服务 | 地址 | 说明 |
 |------|------|------|
-| 前端 | `http://127.0.0.1:8080` | Nginx 静态页面 |
+| 前端 | `http://localhost:5173` | Vite 开发服务器 |
 | 接收器 | `http://127.0.0.1:9527` | Python 本地服务（代理/文件存储） |
 
-```bash
-docker compose logs -f    # 查看日志
-docker compose down       # 停止
-```
-
-### 本地开发
+### 3. 构建单文件
 
 ```bash
-npm install
-npm run dev       # Vite 开发服务器
-npm run build     # 构建单文件 dist/index.html
+npm run build     # 构建为 dist/index.html，可直接用浏览器打开
 ```
 
-### Release 文件
+构建产物为 `dist/index.html`，无需服务器即可本地使用。
 
-构建产物为 `dist/index.html`，可直接用浏览器打开使用。
+### Docker（可选）
+
+```bash
+docker compose up -d --build    # 前端 http://127.0.0.1:8080 + 接收器 http://127.0.0.1:9527
+docker compose logs -f          # 查看日志
+docker compose down             # 停止
+```
 
 ---
 
@@ -117,4 +126,4 @@ npm run build     # 构建单文件 dist/index.html
 - **前端**：React 18 + Vite + Tailwind CSS，构建为单文件 HTML
 - **后端**：Python FastAPI 本地接收器（代理 / 文件存储 / ComfyUI 桥接）
 - **存储**：IndexedDB + localStorage + 本地文件缓存
-- **部署**：Docker Compose 双容器（Nginx + Python）
+- **部署**：Vite 开发服务器 + Python FastAPI 本地接收器（可选 Docker Compose）
