@@ -28,7 +28,12 @@ import queue
 import time
 import uuid
 import mimetypes
+import subprocess
+import glob
+import re
 import urllib.request
+import urllib.error
+import urllib.parse
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote, parse_qs
 from datetime import datetime
@@ -813,6 +818,577 @@ def resolve_job_by_request_id(request_id):
                 return candidate
     return None
 
+RUNTIME_TOOL_TEMPLATE_PATTERN = re.compile(r'\{\{\s*([^}]+?)\s*\}\}')
+RUNTIME_TOOL_MAX_TEXT = 40000
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+def get_runtime_tool_context(tool_def, args, context):
+    args_dict = args if isinstance(args, dict) else {"value": args}
+    data = {
+        "args": args_dict,
+        "context": context if isinstance(context, dict) else {},
+        "env": dict(os.environ),
+        "tool": tool_def or {}
+    }
+    if isinstance(args_dict, dict):
+        for key, value in args_dict.items():
+            if key not in data:
+                data[key] = value
+    return data
+
+def get_runtime_context_value(data, path):
+    raw_path = str(path or '').strip()
+    if not raw_path:
+        return ''
+    current = data
+    normalized = raw_path.replace('[', '.').replace(']', '').replace('..', '.')
+    for part in [p for p in normalized.split('.') if p]:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list):
+            try:
+                index = int(part)
+            except Exception:
+                return ''
+            if index < 0 or index >= len(current):
+                return ''
+            current = current[index]
+        else:
+            return ''
+    return current
+
+def stringify_runtime_value(value):
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+def render_runtime_template(value, data):
+    if isinstance(value, str):
+        stripped = value.strip()
+        full_match = RUNTIME_TOOL_TEMPLATE_PATTERN.fullmatch(stripped)
+        if full_match:
+            return get_runtime_context_value(data, full_match.group(1))
+        return RUNTIME_TOOL_TEMPLATE_PATTERN.sub(
+            lambda match: stringify_runtime_value(get_runtime_context_value(data, match.group(1))),
+            value
+        )
+    if isinstance(value, list):
+        return [render_runtime_template(item, data) for item in value]
+    if isinstance(value, dict):
+        return {key: render_runtime_template(val, data) for key, val in value.items()}
+    return value
+
+def truncate_runtime_text(text, max_chars=RUNTIME_TOOL_MAX_TEXT):
+    text = str(text or '')
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n...[truncated]"
+
+def maybe_parse_json_text(text):
+    candidate = str(text or '').strip()
+    if not candidate:
+        return None
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+def append_query_params(url, query_obj):
+    if not isinstance(query_obj, dict) or not query_obj:
+        return url
+    items = []
+    for key, value in query_obj.items():
+        if value is None:
+            continue
+        if isinstance(value, list):
+            for item in value:
+                items.append((str(key), '' if item is None else str(item)))
+        else:
+            items.append((str(key), str(value)))
+    if not items:
+        return url
+    separator = '&' if '?' in url else '?'
+    query = '&'.join([
+        f"{urllib.parse.quote_plus(k)}={urllib.parse.quote_plus(v)}"
+        for k, v in items
+    ])
+    return f"{url}{separator}{query}"
+
+def build_runtime_result(tool_def, request, success, output=None, output_text='', error=''):
+    return {
+        "requestId": request.get("id") or request.get("requestId") or '',
+        "tool": request.get("tool") or tool_def.get("id") or '',
+        "kind": tool_def.get("kind") or '',
+        "success": bool(success),
+        "output": output,
+        "outputText": truncate_runtime_text(output_text),
+        "error": str(error or '')
+    }
+
+def flatten_mcp_result_text(result):
+    if result is None:
+        return ''
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        content = result.get('content')
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get('text') or item.get('content') or ''
+                    if text:
+                        parts.append(str(text))
+            if parts:
+                return '\n'.join(parts)
+        if result.get('structuredContent') is not None:
+            return stringify_runtime_value(result.get('structuredContent'))
+        if result.get('content') is not None:
+            return stringify_runtime_value(result.get('content'))
+    return stringify_runtime_value(result)
+
+def execute_runtime_http_tool(tool_def, args, context):
+    data = get_runtime_tool_context(tool_def, args, context)
+    url = str(render_runtime_template(tool_def.get('url') or tool_def.get('endpoint') or '', data)).strip()
+    if not url:
+        raise ValueError('HTTP 工具缺少 url')
+    method = str(render_runtime_template(tool_def.get('method') or 'POST', data)).upper() or 'POST'
+    headers = render_runtime_template(tool_def.get('headers') or {}, data)
+    headers = headers if isinstance(headers, dict) else {}
+    query = render_runtime_template(tool_def.get('query') or {}, data)
+    body = render_runtime_template(tool_def.get('body'), data)
+    timeout_sec = max(1, int((tool_def.get('timeoutMs') or 30000) / 1000))
+    final_url = append_query_params(url, query)
+    request_data = None
+    if method not in ('GET', 'HEAD') and body is not None:
+        if isinstance(body, (dict, list)):
+            request_data = json.dumps(body, ensure_ascii=False).encode('utf-8')
+            headers.setdefault('Content-Type', 'application/json')
+        elif isinstance(body, bytes):
+            request_data = body
+        else:
+            request_data = str(body).encode('utf-8')
+            headers.setdefault('Content-Type', 'text/plain; charset=utf-8')
+    request = urllib.request.Request(final_url, data=request_data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        raw_bytes = response.read()
+        content_type = response.headers.get('Content-Type', '')
+    raw_text = raw_bytes.decode('utf-8', errors='ignore') if isinstance(raw_bytes, bytes) else str(raw_bytes or '')
+    parsed = maybe_parse_json_text(raw_text) if 'json' in content_type.lower() else None
+    return {
+        "output": parsed if parsed is not None else raw_text,
+        "outputText": stringify_runtime_value(parsed) if parsed is not None else raw_text
+    }
+
+def execute_runtime_cli_tool(tool_def, args, context):
+    data = get_runtime_tool_context(tool_def, args, context)
+    env_extra = render_runtime_template(tool_def.get('env') or {}, data)
+    env = os.environ.copy()
+    if isinstance(env_extra, dict):
+        env.update({str(k): '' if v is None else str(v) for k, v in env_extra.items()})
+    cwd = render_runtime_template(tool_def.get('cwd') or '', data)
+    cwd = os.path.abspath(os.path.expanduser(str(cwd))) if cwd else None
+    timeout_sec = max(1, int((tool_def.get('timeoutMs') or 30000) / 1000))
+    shell_command = render_runtime_template(tool_def.get('shellCommand') or '', data)
+    if shell_command:
+        completed = subprocess.run(
+            str(shell_command),
+            shell=True,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+            timeout=timeout_sec,
+            encoding='utf-8',
+            errors='ignore'
+        )
+    else:
+        command = render_runtime_template(tool_def.get('command') or '', data)
+        if not command:
+            raise ValueError('CLI 工具缺少 command')
+        args_list = render_runtime_template(tool_def.get('argsTemplate') or tool_def.get('args') or [], data)
+        if not isinstance(args_list, list):
+            args_list = [args_list]
+        completed = subprocess.run(
+            [str(command), *[str(item) for item in args_list if item is not None]],
+            shell=False,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+            timeout=timeout_sec,
+            encoding='utf-8',
+            errors='ignore'
+        )
+    stdout = completed.stdout or ''
+    stderr = completed.stderr or ''
+    if completed.returncode != 0:
+        raise RuntimeError((stderr or stdout or f'命令退出码 {completed.returncode}').strip())
+    parsed = maybe_parse_json_text(stdout)
+    return {
+        "output": parsed if parsed is not None else stdout,
+        "outputText": stdout.strip() or stderr.strip()
+    }
+
+def resolve_runtime_skill_path(path_value):
+    raw_path = os.path.expanduser(str(path_value or '').strip())
+    if not raw_path:
+        return ''
+    if os.path.isabs(raw_path):
+        return os.path.abspath(raw_path)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(base_dir, raw_path))
+
+def execute_runtime_skill_tool(tool_def, args, context):
+    data = get_runtime_tool_context(tool_def, args, context)
+    mode = str(render_runtime_template(tool_def.get('mode') or 'read', data)).strip().lower() or 'read'
+    target_path = resolve_runtime_skill_path(render_runtime_template(tool_def.get('path') or tool_def.get('skillPath') or '', data))
+    if not target_path or not os.path.exists(target_path):
+        raise FileNotFoundError('Skill 路径不存在')
+    max_bytes = int(tool_def.get('maxBytes') or 24000)
+    if mode == 'list':
+        if os.path.isdir(target_path):
+            entries = sorted(os.listdir(target_path))[:200]
+            return {"output": entries, "outputText": '\n'.join(entries)}
+        return {"output": [target_path], "outputText": os.path.basename(target_path)}
+    if mode == 'search':
+        query = str(render_runtime_template(args.get('query') or args.get('needle') or '', data)).strip()
+        if not query:
+            raise ValueError('Skill search 缺少 query')
+        if os.path.isdir(target_path):
+            pattern = str(render_runtime_template(tool_def.get('glob') or '**/*', data)).strip() or '**/*'
+            files = [p for p in glob.glob(os.path.join(target_path, pattern), recursive=True) if os.path.isfile(p)]
+        else:
+            files = [target_path]
+        matches = []
+        for file_path in files[:200]:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as handle:
+                    for line_no, line in enumerate(handle, 1):
+                        if query.lower() in line.lower():
+                            matches.append({
+                                "path": file_path,
+                                "line": line_no,
+                                "text": line.strip()
+                            })
+                        if len(matches) >= 40:
+                            break
+            except Exception:
+                continue
+            if len(matches) >= 40:
+                break
+        output_text = '\n'.join([f"{item['path']}:{item['line']} {item['text']}" for item in matches])
+        return {"output": matches, "outputText": output_text}
+    if os.path.isdir(target_path):
+        entries = sorted(os.listdir(target_path))[:200]
+        return {"output": entries, "outputText": '\n'.join(entries)}
+    with open(target_path, 'r', encoding='utf-8', errors='ignore') as handle:
+        content = handle.read(max_bytes + 1)
+    truncated = len(content) > max_bytes
+    final_text = content[:max_bytes]
+    if truncated:
+        final_text += "\n...[truncated]"
+    return {
+        "output": {
+            "path": target_path,
+            "content": final_text
+        },
+        "outputText": final_text
+    }
+
+def _write_mcp_message(stream, payload):
+    body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    header = f"Content-Length: {len(body)}\r\n\r\n".encode('ascii')
+    stream.write(header)
+    stream.write(body)
+    stream.flush()
+
+def _read_mcp_message(stream):
+    headers = {}
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        if line in (b'\n', b'\r\n'):
+            break
+        decoded = line.decode('utf-8', errors='ignore').strip()
+        if not decoded:
+            break
+        if ':' in decoded:
+            key, value = decoded.split(':', 1)
+            headers[key.strip().lower()] = value.strip()
+    content_length = int(headers.get('content-length', '0') or '0')
+    if content_length <= 0:
+        return None
+    body = stream.read(content_length)
+    if not body:
+        return None
+    return json.loads(body.decode('utf-8', errors='ignore'))
+
+def _start_mcp_stdout_reader(process, output_queue):
+    def reader_loop():
+        try:
+            while True:
+                message = _read_mcp_message(process.stdout)
+                if message is None:
+                    break
+                output_queue.put(message)
+        except Exception as exc:
+            output_queue.put({"__reader_error__": str(exc)})
+    thread = threading.Thread(target=reader_loop, daemon=True)
+    thread.start()
+    return thread
+
+def _drain_pipe_async(pipe, sink):
+    def reader_loop():
+        try:
+            while True:
+                chunk = pipe.readline()
+                if not chunk:
+                    break
+                sink.append(chunk.decode('utf-8', errors='ignore'))
+        except Exception:
+            pass
+    thread = threading.Thread(target=reader_loop, daemon=True)
+    thread.start()
+    return thread
+
+def _wait_for_mcp_response(output_queue, request_id, timeout_sec):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        remaining = max(0.05, deadline - time.time())
+        try:
+            message = output_queue.get(timeout=remaining)
+        except queue.Empty:
+            continue
+        if isinstance(message, dict) and message.get('__reader_error__'):
+            raise RuntimeError(message['__reader_error__'])
+        if isinstance(message, dict) and message.get('id') == request_id:
+            return message
+    raise TimeoutError('MCP 响应超时')
+
+def send_mcp_http_message(url, payload, headers, timeout_sec):
+    request_headers = {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'}
+    if isinstance(headers, dict):
+        request_headers.update({str(k): str(v) for k, v in headers.items()})
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers=request_headers,
+        method='POST'
+    )
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        raw_text = response.read().decode('utf-8', errors='ignore')
+        response_headers = {str(k).lower(): str(v) for k, v in response.getheaders()}
+    parsed = maybe_parse_json_text(raw_text)
+    if parsed is None and raw_text.startswith('data:'):
+        lines = [line[5:].strip() for line in raw_text.splitlines() if line.startswith('data:')]
+        parsed = maybe_parse_json_text(lines[-1] if lines else '')
+    return parsed or {}, response_headers
+
+def execute_runtime_mcp_http_tool(tool_def, args, context):
+    data = get_runtime_tool_context(tool_def, args, context)
+    url = str(render_runtime_template(tool_def.get('url') or '', data)).strip()
+    if not url:
+        raise ValueError('MCP HTTP 工具缺少 url')
+    tool_name = str(render_runtime_template(tool_def.get('toolName') or args.get('toolName') or '', data)).strip()
+    if not tool_name:
+        raise ValueError('MCP 工具缺少 toolName')
+    timeout_sec = max(1, int((tool_def.get('timeoutMs') or 45000) / 1000))
+    headers = render_runtime_template(tool_def.get('headers') or {}, data)
+    headers = headers if isinstance(headers, dict) else {}
+    protocol_version = str(tool_def.get('protocolVersion') or MCP_PROTOCOL_VERSION)
+    merged_args = render_runtime_template(tool_def.get('fixedArgs') or {}, data)
+    if not isinstance(merged_args, dict):
+        merged_args = {}
+    if isinstance(args, dict):
+        merged_args.update(args)
+    session_headers = dict(headers)
+    if not tool_def.get('skipInitialize'):
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "tapnow-localserver", "version": "2.4.0"}
+            }
+        }
+        init_response, init_headers = send_mcp_http_message(url, init_payload, session_headers, timeout_sec)
+        if init_response.get('error'):
+            raise RuntimeError(init_response['error'].get('message') or 'MCP initialize 失败')
+        session_id = init_headers.get('mcp-session-id') or init_headers.get('x-mcp-session-id')
+        if session_id:
+            session_headers['Mcp-Session-Id'] = session_id
+        initialized_payload = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        try:
+            send_mcp_http_message(url, initialized_payload, session_headers, timeout_sec)
+        except Exception:
+            pass
+    call_payload = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": merged_args
+        }
+    }
+    response, _headers = send_mcp_http_message(url, call_payload, session_headers, timeout_sec)
+    if response.get('error'):
+        raise RuntimeError(response['error'].get('message') or 'MCP tools/call 失败')
+    result = response.get('result')
+    return {
+        "output": result,
+        "outputText": flatten_mcp_result_text(result)
+    }
+
+def execute_runtime_mcp_stdio_tool(tool_def, args, context):
+    data = get_runtime_tool_context(tool_def, args, context)
+    command = render_runtime_template(tool_def.get('command') or '', data)
+    if not command:
+        raise ValueError('MCP stdio 工具缺少 command')
+    args_list = render_runtime_template(tool_def.get('commandArgs') or tool_def.get('argsTemplate') or tool_def.get('args') or [], data)
+    if not isinstance(args_list, list):
+        args_list = [args_list]
+    cwd = render_runtime_template(tool_def.get('cwd') or '', data)
+    cwd = os.path.abspath(os.path.expanduser(str(cwd))) if cwd else None
+    env_extra = render_runtime_template(tool_def.get('env') or {}, data)
+    env = os.environ.copy()
+    if isinstance(env_extra, dict):
+        env.update({str(k): '' if v is None else str(v) for k, v in env_extra.items()})
+    timeout_sec = max(1, int((tool_def.get('timeoutMs') or 45000) / 1000))
+    tool_name = str(render_runtime_template(tool_def.get('toolName') or args.get('toolName') or '', data)).strip()
+    if not tool_name:
+        raise ValueError('MCP 工具缺少 toolName')
+    merged_args = render_runtime_template(tool_def.get('fixedArgs') or {}, data)
+    if not isinstance(merged_args, dict):
+        merged_args = {}
+    if isinstance(args, dict):
+        merged_args.update(args)
+    process = subprocess.Popen(
+        [str(command), *[str(item) for item in args_list if item is not None]],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env
+    )
+    output_queue = queue.Queue()
+    stderr_lines = []
+    _start_mcp_stdout_reader(process, output_queue)
+    _drain_pipe_async(process.stderr, stderr_lines)
+    try:
+        _write_mcp_message(process.stdin, {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "tapnow-localserver", "version": "2.4.0"}
+            }
+        })
+        init_response = _wait_for_mcp_response(output_queue, 1, timeout_sec)
+        if init_response.get('error'):
+            raise RuntimeError(init_response['error'].get('message') or 'MCP initialize 失败')
+        _write_mcp_message(process.stdin, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        _write_mcp_message(process.stdin, {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": merged_args
+            }
+        })
+        response = _wait_for_mcp_response(output_queue, 2, timeout_sec)
+        if response.get('error'):
+            raise RuntimeError(response['error'].get('message') or 'MCP tools/call 失败')
+        result = response.get('result')
+        return {
+            "output": result,
+            "outputText": flatten_mcp_result_text(result) or ''.join(stderr_lines).strip()
+        }
+    finally:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=1)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+def execute_runtime_mcp_tool(tool_def, args, context):
+    transport = str(tool_def.get('transport') or 'http').strip().lower()
+    if transport == 'stdio':
+        return execute_runtime_mcp_stdio_tool(tool_def, args, context)
+    return execute_runtime_mcp_http_tool(tool_def, args, context)
+
+def execute_runtime_builtin_tool(tool_def, args, context):
+    action = str(tool_def.get('action') or tool_def.get('builtin') or 'echo').strip().lower()
+    if action == 'time':
+        text = datetime.now().isoformat()
+        return {"output": {"now": text}, "outputText": text}
+    return {
+        "output": {
+            "args": args,
+            "context": context
+        },
+        "outputText": stringify_runtime_value(args if args is not None else context)
+    }
+
+def execute_runtime_tool(tool_def, args, context):
+    kind = str(tool_def.get('kind') or 'http').strip().lower()
+    if kind == 'cli':
+        return execute_runtime_cli_tool(tool_def, args, context)
+    if kind == 'skill':
+        return execute_runtime_skill_tool(tool_def, args, context)
+    if kind == 'mcp':
+        return execute_runtime_mcp_tool(tool_def, args, context)
+    if kind == 'builtin':
+        return execute_runtime_builtin_tool(tool_def, args, context)
+    return execute_runtime_http_tool(tool_def, args, context)
+
+def execute_runtime_tool_requests(payload):
+    requests = payload.get('toolRequests') or []
+    runtime_tools = payload.get('runtimeTools') or []
+    context = payload.get('context') or {}
+    tool_map = {}
+    if isinstance(runtime_tools, list):
+        for item in runtime_tools:
+            if isinstance(item, dict) and item.get('id'):
+                tool_map[str(item.get('id'))] = item
+    results = []
+    for index, raw_request in enumerate(requests if isinstance(requests, list) else []):
+        request = raw_request if isinstance(raw_request, dict) else {}
+        tool_id = str(request.get('tool') or '').strip()
+        tool_def = tool_map.get(tool_id)
+        if not tool_def:
+            results.append(build_runtime_result({"id": tool_id, "kind": ""}, {"id": request.get('id') or f"tool-{index+1}", "tool": tool_id}, False, error='未找到对应的运行时工具定义'))
+            continue
+        try:
+            execution = execute_runtime_tool(tool_def, request.get('args') or {}, context)
+            results.append(build_runtime_result(tool_def, request, True, execution.get('output'), execution.get('outputText')))
+        except Exception as exc:
+            results.append(build_runtime_result(tool_def, request, False, error=str(exc)))
+    return {
+        "success": all(item.get('success') for item in results) if results else True,
+        "results": results
+    }
+
 # ==============================================================================
 # SECTION 4: HTTP 处理器 (Request Handlers)
 # ==============================================================================
@@ -879,8 +1455,8 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
         if path == '/status' or path == '/ping':
             self._send_json({
                 "status": "running",
-                "version": "2.3.0",
-                "features": FEATURES,
+                "version": "2.4.0",
+                "features": {**FEATURES, "runtime_tools": True},
                 "config": {
                     "save_path": config["save_path"],
                     "image_save_path": config["image_save_path"] or config["save_path"],
@@ -890,6 +1466,10 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                     "convert_png_to_jpg": config["convert_png_to_jpg"]
                 }
             })
+            return
+
+        if path == '/runtime-tools/ping':
+            self._send_json({"success": True, "runtime_tools": True})
             return
             
         if path == '/config':
@@ -961,6 +1541,8 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
 
         if path == '/save':
             self.handle_save(body)
+        elif path == '/runtime-tools/execute':
+            self.handle_runtime_tool_execute(body)
         elif path == '/save-batch':
             self.handle_batch_save(body) # 简化：复用 save 逻辑或自行展开
         elif path == '/save-thumbnail':
@@ -1341,6 +1923,14 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
         log("配置已更新")
         self._send_json({"success": True, "config": config})
 
+    def handle_runtime_tool_execute(self, data):
+        try:
+            result = execute_runtime_tool_requests(data if isinstance(data, dict) else {})
+            self._send_json(result)
+        except Exception as exc:
+            log(f"运行时工具执行失败: {exc}")
+            self._send_json({"success": False, "error": str(exc)}, 500)
+
     def handle_save_thumbnail(self, data):
         try:
             item_id = data.get('id', '')
@@ -1629,6 +2219,7 @@ def main():
     print("  Modules:")
     print(f"  [x] File Server")
     print(f"  [x] HTTP Proxy")
+    print(f"  [x] Runtime Tools")
     print(f"  [{'x' if FEATURES['comfy_middleware'] else ' '}] ComfyUI Middleware")
     print("=" * 60)
     

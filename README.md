@@ -1,4 +1,6 @@
 
+![Tapnow Studio cover](./assets/tapnow-studio-cover.png)
+
 ## 🌟 核心工作内容 (Highlights)
 相比于原始项目，我们在以下方面进行了重大改进：
 *   **工程化重构**: 将原始单 HTML 架构利用 Vite + React 进行现代化重构，提升了 10 倍以上的加载速度。

@@ -77,6 +77,12 @@ const TEXT_REWRITE_ROLE_LABELS = Object.freeze({
     callToAction: 'CTA',
     other: '其他'
 });
+const LOCAL_EDIT_ACTION_LABELS = Object.freeze({
+    repair: '修复/清理',
+    replace: '替换/改成',
+    erase: '擦除/移除',
+    material: '按素材替换'
+});
 
 const clampNumber = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -229,6 +235,217 @@ const parseLooseJsonObject = (rawText) => {
     return null;
 };
 
+const CHAT_ASSISTANT_META_BLOCK_PATTERN = /```(?:tapnow-meta|tapnow_meta|tapnowmeta)\s*([\s\S]*?)```/gi;
+const CHAT_RUNTIME_TOOL_KINDS = new Set(['mcp', 'cli', 'skill', 'http', 'builtin']);
+const mergeUniqueStrings = (...groups) => {
+    const seen = new Set();
+    const list = [];
+    groups.flat().forEach((item) => {
+        const normalized = String(item || '').trim();
+        if (!normalized || seen.has(normalized)) return;
+        seen.add(normalized);
+        list.push(normalized);
+    });
+    return list;
+};
+const normalizeChatSuggestedReplies = (value) => {
+    if (Array.isArray(value)) {
+        return mergeUniqueStrings(value)
+            .filter((item) => item.length <= 120)
+            .slice(0, 4);
+    }
+    if (typeof value === 'string') {
+        return mergeUniqueStrings(
+            value.split(/\r?\n|[|｜]/).map((item) => item.trim())
+        )
+            .filter((item) => item.length <= 120)
+            .slice(0, 4);
+    }
+    return [];
+};
+const normalizeChatToolRequestItem = (value, index = 0) => {
+    if (!value) return null;
+    if (typeof value === 'string') {
+        const toolId = value.trim();
+        return toolId ? { id: `tool-request-${index + 1}`, tool: toolId, args: {} } : null;
+    }
+    if (typeof value !== 'object' || Array.isArray(value)) return null;
+    const toolId = String(value.tool || value.toolId || value.id || value.name || '').trim();
+    if (!toolId) return null;
+    const rawArgs = value.args || value.arguments || value.params || value.input || {};
+    const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
+        ? rawArgs
+        : {};
+    return {
+        id: String(value.requestId || value.callId || value.id || `tool-request-${index + 1}`).trim() || `tool-request-${index + 1}`,
+        tool: toolId,
+        args
+    };
+};
+const normalizeChatToolRequests = (value) => {
+    const list = Array.isArray(value) ? value : [value];
+    return list
+        .map((item, index) => normalizeChatToolRequestItem(item, index))
+        .filter(Boolean);
+};
+const extractChatAssistantWorkflowPayload = (meta) => {
+    if (!meta || typeof meta !== 'object') return null;
+    const direct = [
+        meta.workflow,
+        meta.workflowJson,
+        meta.promptPayload,
+        meta.promptSpec,
+        meta.promptJson,
+        meta.promptJSON,
+        meta.actionablePrompt
+    ].find((value) => (
+        typeof value === 'string'
+            ? value.trim()
+            : (
+                Array.isArray(value)
+                    ? value.length > 0
+                    : value && typeof value === 'object'
+            )
+    ));
+    if (direct) return direct;
+    const compiledPrompt = String(meta.compiledPrompt || '').trim();
+    const editInstruction = String(meta.editInstruction || '').trim();
+    const negativePrompt = String(meta.negativePrompt || '').trim();
+    if (!compiledPrompt && !editInstruction && !negativePrompt) return null;
+    return {
+        apiPayload: {
+            compiledPrompt,
+            editInstruction,
+            negativePrompt
+        }
+    };
+};
+const normalizeChatAssistantMeta = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return {
+            suggestedReplies: [],
+            toolRequests: []
+        };
+    }
+    const normalized = {
+        suggestedReplies: normalizeChatSuggestedReplies(
+            value.suggestedReplies
+            || value.replyOptions
+            || value.quickReplies
+            || value.quickReply
+        ),
+        toolRequests: normalizeChatToolRequests(
+            value.toolRequests
+            || value.tool_calls
+            || value.toolCalls
+            || value.requests
+        )
+    };
+    const workflowPayload = extractChatAssistantWorkflowPayload(value);
+    if (workflowPayload) normalized.workflow = workflowPayload;
+    return normalized;
+};
+const mergeChatAssistantMeta = (base = {}, extra = {}) => {
+    const left = normalizeChatAssistantMeta(base);
+    const right = normalizeChatAssistantMeta(extra);
+    const workflow = extractChatAssistantWorkflowPayload(right) || extractChatAssistantWorkflowPayload(left) || null;
+    return {
+        ...left,
+        ...right,
+        workflow,
+        suggestedReplies: mergeUniqueStrings(left.suggestedReplies || [], right.suggestedReplies || []).slice(0, 4),
+        toolRequests: [...(left.toolRequests || []), ...(right.toolRequests || [])]
+    };
+};
+const buildChatAssistantDisplayFallback = (meta) => {
+    if (extractChatAssistantWorkflowPayload(meta)) {
+        return '已整理好可执行提示词，可直接创建到画布。';
+    }
+    if ((meta?.suggestedReplies || []).length > 0) {
+        return '我给你准备了几个继续推进的选项，可以直接点下面。';
+    }
+    if ((meta?.toolRequests || []).length > 0) {
+        return '正在补充工具结果，请稍等。';
+    }
+    return '';
+};
+const parseChatAssistantEnvelope = (rawText) => {
+    const source = String(rawText || '');
+    if (!source.trim()) {
+        return {
+            rawText: '',
+            displayText: '',
+            meta: normalizeChatAssistantMeta(null)
+        };
+    }
+    let mergedMeta = normalizeChatAssistantMeta(null);
+    const cleanText = source.replace(CHAT_ASSISTANT_META_BLOCK_PATTERN, (_, block) => {
+        const parsed = parseLooseJsonObject(block);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            mergedMeta = mergeChatAssistantMeta(mergedMeta, parsed);
+        }
+        return '';
+    }).replace(/\n{3,}/g, '\n\n').trim();
+    return {
+        rawText: source,
+        displayText: cleanText || buildChatAssistantDisplayFallback(mergedMeta),
+        meta: mergedMeta
+    };
+};
+const resolveChatAssistantEnvelopeInput = (value) => {
+    if (typeof value === 'string') {
+        const envelope = parseChatAssistantEnvelope(value);
+        return {
+            rawText: envelope.rawText,
+            displayText: envelope.displayText,
+            meta: envelope.meta
+        };
+    }
+    if (!value || typeof value !== 'object') {
+        return {
+            rawText: '',
+            displayText: '',
+            meta: normalizeChatAssistantMeta(null)
+        };
+    }
+    const rawText = String(value.rawContent || value.rawText || value.content || '').trim();
+    const displayText = String(value.content || '').trim();
+    const meta = mergeChatAssistantMeta(
+        rawText && !value.assistantMeta && !value.meta ? parseChatAssistantEnvelope(rawText).meta : null,
+        value.assistantMeta || value.meta || null
+    );
+    return {
+        rawText,
+        displayText: displayText || buildChatAssistantDisplayFallback(meta),
+        meta
+    };
+};
+const normalizeChatRuntimeToolDefinition = (value, index = 0) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const kindRaw = String(value.kind || value.type || 'http').trim().toLowerCase();
+    const kind = CHAT_RUNTIME_TOOL_KINDS.has(kindRaw) ? kindRaw : 'http';
+    const id = String(value.id || value.tool || value.name || value.label || `${kind}-tool-${index + 1}`).trim();
+    if (!id) return null;
+    const timeoutMs = Number(value.timeoutMs);
+    return {
+        ...value,
+        id,
+        kind,
+        label: String(value.label || value.name || id).trim() || id,
+        name: String(value.name || value.label || id).trim() || id,
+        description: String(value.description || value.summary || '').trim(),
+        enabled: value.enabled !== false,
+        timeoutMs: Number.isFinite(timeoutMs) && timeoutMs >= 0 ? timeoutMs : undefined
+    };
+};
+const normalizeChatRuntimeToolDefinitions = (value) => {
+    const parsed = typeof value === 'string' ? parseLooseJsonObject(value) : value;
+    const list = Array.isArray(parsed) ? parsed : [];
+    return list
+        .map((item, index) => normalizeChatRuntimeToolDefinition(item, index))
+        .filter(Boolean);
+};
+
 const extractModelTextContent = (payload) => {
     if (!payload || typeof payload !== 'object') return '';
     const primaryMessage = payload?.choices?.[0]?.message || payload?.data?.choices?.[0]?.message;
@@ -338,7 +555,9 @@ const LocalImageManager = (() => {
     const STORE_NAME = 'images';
     let dbInstance = null;
     let dbInitPromise = null;
+    const MAX_BLOB_URL_CACHE = 100; // V3.8.8+: LRU cache limit to prevent unbounded growth
     const blobUrlCache = new Map(); // Cache: id -> blobUrl
+    const blobUrlAccessOrder = []; // Track access order for LRU eviction
 
     const initDB = () => {
         if (dbInitPromise) return dbInitPromise;
@@ -436,8 +655,10 @@ const LocalImageManager = (() => {
 
     // Get image as Blob URL from IndexedDB
     const getImage = async (id) => {
-        // Check cache first
+        // Check cache first (LRU: move to end on access)
         if (blobUrlCache.has(id)) {
+            const idx = blobUrlAccessOrder.indexOf(id);
+            if (idx !== -1) { blobUrlAccessOrder.splice(idx, 1); blobUrlAccessOrder.push(id); }
             return blobUrlCache.get(id);
         }
 
@@ -456,7 +677,15 @@ const LocalImageManager = (() => {
                         const isFileProtocol = typeof window !== 'undefined' && window.location?.protocol === 'file:';
                         if (!isFileProtocol) {
                             const objectUrl = URL.createObjectURL(record.blob);
+                            // V3.8.8+: LRU eviction - remove oldest when cache full
+                            while (blobUrlAccessOrder.length >= MAX_BLOB_URL_CACHE) {
+                                const oldest = blobUrlAccessOrder.shift();
+                                const oldUrl = blobUrlCache.get(oldest);
+                                if (oldUrl && oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl);
+                                blobUrlCache.delete(oldest);
+                            }
                             blobUrlCache.set(id, objectUrl);
+                            blobUrlAccessOrder.push(id);
                             resolve(objectUrl);
                             return;
                         }
@@ -465,7 +694,15 @@ const LocalImageManager = (() => {
                         const reader = new FileReader();
                         reader.onloadend = () => {
                             const base64 = reader.result;
+                            // V3.8.8+: LRU eviction for file:// protocol too
+                            while (blobUrlAccessOrder.length >= MAX_BLOB_URL_CACHE) {
+                                const oldest = blobUrlAccessOrder.shift();
+                                const oldUrl = blobUrlCache.get(oldest);
+                                if (oldUrl && oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl);
+                                blobUrlCache.delete(oldest);
+                            }
                             blobUrlCache.set(id, base64);
+                            blobUrlAccessOrder.push(id);
                             resolve(base64);
                         };
                         reader.onerror = () => {
@@ -509,7 +746,7 @@ const LocalImageManager = (() => {
         });
     };
 
-    // Get storage stats
+    // Get storage stats (V3.8.8+: cursor-based to avoid loading all blobs into memory)
     const getStats = async () => {
         const db = await initDB();
         if (!db) return { count: 0, totalSize: 0 };
@@ -517,15 +754,21 @@ const LocalImageManager = (() => {
         return new Promise((resolve) => {
             const transaction = db.transaction([STORE_NAME], 'readonly');
             const store = transaction.objectStore(STORE_NAME);
-            const request = store.getAll();
+            let totalSize = 0;
+            let count = 0;
+            const cursorRequest = store.openCursor();
 
-            request.onsuccess = () => {
-                const records = request.result || [];
-                const totalSize = records.reduce((sum, r) => sum + (r.size || 0), 0);
-                resolve({ count: records.length, totalSize });
+            cursorRequest.onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                    totalSize += cursor.value.size || 0;
+                    count++;
+                    cursor.continue();
+                } else {
+                    resolve({ count, totalSize });
+                }
             };
-
-            request.onerror = () => resolve({ count: 0, totalSize: 0 });
+            cursorRequest.onerror = () => resolve({ count: 0, totalSize: 0 });
         });
     };
 
@@ -682,9 +925,12 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
             setBlobUrl(src);
         }
 
-        // 清理函数：避免卸载后继续写状态
+        // V3.8.8+: Cleanup - revoke blob URL to prevent memory leak
         return () => {
             active = false;
+            if (blobUrlRef.current && blobUrlRef.current.startsWith('blob:')) {
+                URL.revokeObjectURL(blobUrlRef.current);
+            }
             blobUrlRef.current = null;
         };
     }, [src]);
@@ -1469,19 +1715,39 @@ const HistoryItem = memo(({
 });
 
 // --- MaskEditor 组件：图片标注/局部重绘 ---
-const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSave, theme, view, maskContent, onUpdateNode }) => {
+const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSave, theme, view, maskContent, nodeSettings, onUpdateNode }) => {
     const canvasRef = useRef(null);
     const ctxRef = useRef(null);
     const lastPointRef = useRef(null); // V3.7.27: 用于平滑绘制
     const rectStartRef = useRef(null);
     const [brushSize, setBrushSize] = useState(30);
+    const [fineMode, setFineMode] = useState(false); // V3.8.8+: Fine brush mode (1-9px)
     const [toolMode, setToolMode] = useState('brush');
+    const [markColor, setMarkColor] = useState('#ef4444');
+    const [editAction, setEditAction] = useState(nodeSettings?.editWorkbench?.localEditAction || 'repair');
+    const [annotationText, setAnnotationText] = useState(nodeSettings?.editWorkbench?.localEditNote || '只修这里');
+    const [annotationNotes, setAnnotationNotes] = useState([]);
     const [isDrawing, setIsDrawing] = useState(false);
     const [rectPreview, setRectPreview] = useState(null);
     const [history, setHistory] = useState([]);
     const [historyIndex, setHistoryIndex] = useState(-1);
-    const maxHistory = 10;
+    const maxHistory = resolvedDimensions && Math.max(resolvedDimensions.w, resolvedDimensions.h) > 2048 ? 5 : 10; // V3.8.8+: reduce for large images
     const [resolvedDimensions, setResolvedDimensions] = useState(imageDimensions);
+
+    useEffect(() => {
+        if (!isActive) return;
+        const savedNotes = Array.isArray(nodeSettings?.editWorkbench?.maskNotes)
+            ? nodeSettings.editWorkbench.maskNotes.map((item) => String(item || '').trim()).filter(Boolean)
+            : [];
+        setAnnotationNotes(savedNotes.slice(-6));
+        setEditAction(nodeSettings?.editWorkbench?.localEditAction || 'repair');
+        setAnnotationText(nodeSettings?.editWorkbench?.localEditNote || '只修这里');
+    }, [
+        isActive,
+        nodeSettings?.editWorkbench?.maskNotes,
+        nodeSettings?.editWorkbench?.localEditAction,
+        nodeSettings?.editWorkbench?.localEditNote
+    ]);
 
     useEffect(() => {
         if (imageDimensions?.w && imageDimensions?.h) {
@@ -1524,7 +1790,7 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         if (maskContent) {
             const img = new Image();
             img.onload = () => {
-                ctx.drawImage(img, 0, 0);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
                 saveToHistory();
             };
             img.src = maskContent;
@@ -1533,19 +1799,23 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         }
     }, [isActive, resolvedDimensions, nodeId, maskContent]);
 
-    // 保存当前状态到历史记录
+    // V3.8.8+: Use compressed PNG blob instead of raw ImageData (10-50x smaller)
     const saveToHistory = () => {
         if (!canvasRef.current || !ctxRef.current) return;
         const canvas = canvasRef.current;
-        const ctx = ctxRef.current;
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const newHistory = history.slice(0, historyIndex + 1);
-        newHistory.push(imageData);
-        if (newHistory.length > maxHistory) {
-            newHistory.shift();
-        }
-        setHistory(newHistory);
-        setHistoryIndex(newHistory.length - 1);
+        canvas.toBlob((blob) => {
+            if (!blob) return;
+            const newHistory = history.slice(0, historyIndex + 1);
+            // Revoke old blob URL if evicting
+            if (newHistory.length >= maxHistory) {
+                const oldest = newHistory.shift();
+                if (oldest.url && oldest.url.startsWith('blob:')) URL.revokeObjectURL(oldest.url);
+            }
+            const url = URL.createObjectURL(blob);
+            newHistory.push({ blob, url });
+            setHistory(newHistory);
+            setHistoryIndex(newHistory.length - 1);
+        }, 'image/png');
     };
 
     // 获取鼠标在 Canvas 上的真实像素坐标
@@ -1576,9 +1846,9 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         if (!coords) return;
 
         const ctx = ctxRef.current;
-        ctx.globalCompositeOperation = 'source-over';
-        ctx.strokeStyle = '#FFFFFF';
-        ctx.fillStyle = '#FFFFFF';
+        ctx.globalCompositeOperation = toolMode === 'erase' ? 'destination-out' : 'source-over';
+        ctx.strokeStyle = markColor;
+        ctx.fillStyle = markColor;
         ctx.lineWidth = brushSize;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
@@ -1597,12 +1867,68 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         }
         lastPointRef.current = coords;
     };
+    // V3.8.8+: Numbered annotation system for clear model instructions
+    const recordRegionNote = () => {
+        const note = annotationText.trim();
+        const actionLabel = LOCAL_EDIT_ACTION_LABELS[editAction] || LOCAL_EDIT_ACTION_LABELS.repair;
+        const entry = note ? `${actionLabel}：${note}` : actionLabel;
+        setAnnotationNotes((prev) => {
+            // Remove duplicate entries, keep unique
+            const existing = prev.filter((e) => e !== entry);
+            const next = [...existing, entry].slice(-8);
+            return next;
+        });
+    };
     const paintRect = (rect) => {
         if (!rect || !ctxRef.current) return;
         const ctx = ctxRef.current;
         ctx.globalCompositeOperation = 'source-over';
-        ctx.fillStyle = '#FFFFFF';
+        ctx.globalAlpha = 0.72;
+        ctx.fillStyle = markColor;
         ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+        ctx.globalAlpha = 1;
+        recordRegionNote();
+    };
+    const paintEllipse = (rect) => {
+        if (!rect || !ctxRef.current) return;
+        const ctx = ctxRef.current;
+        const centerX = rect.x + rect.w / 2;
+        const centerY = rect.y + rect.h / 2;
+        const radiusX = Math.max(1, Math.abs(rect.w) / 2);
+        const radiusY = Math.max(1, Math.abs(rect.h) / 2);
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.beginPath();
+        ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2);
+        ctx.globalAlpha = 0.26;
+        ctx.fillStyle = markColor;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = Math.max(4, Math.round(brushSize * 0.18));
+        ctx.strokeStyle = markColor;
+        ctx.stroke();
+        recordRegionNote();
+    };
+    const paintPointNote = (point) => {
+        if (!point || !ctxRef.current) return;
+        const ctx = ctxRef.current;
+        const radius = Math.max(8, Math.round(brushSize * 0.42));
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.globalAlpha = 0.36;
+        ctx.fillStyle = markColor;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = Math.max(2, Math.round(brushSize * 0.08));
+        ctx.strokeStyle = markColor;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(point.x - radius * 0.65, point.y);
+        ctx.lineTo(point.x + radius * 0.65, point.y);
+        ctx.moveTo(point.x, point.y - radius * 0.65);
+        ctx.lineTo(point.x, point.y + radius * 0.65);
+        ctx.stroke();
+        recordRegionNote();
     };
 
     // 鼠标事件处理
@@ -1614,9 +1940,19 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         saveToHistory();
         const coords = getCanvasCoordinates(e);
         if (!coords) return;
-        if (toolMode === 'rect') {
+        if (toolMode === 'rect' || toolMode === 'circle' || toolMode === 'note') {
             rectStartRef.current = coords;
-            setRectPreview({ x: coords.x, y: coords.y, w: 0, h: 0 });
+            setRectPreview({
+                type: toolMode,
+                x: coords.x,
+                y: coords.y,
+                w: 0,
+                h: 0,
+                startX: coords.x,
+                startY: coords.y,
+                endX: coords.x,
+                endY: coords.y
+            });
             return;
         }
         lastPointRef.current = null; // V3.7.27: 重置上一个点
@@ -1627,15 +1963,20 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         if (!isDrawing) return;
         e.preventDefault();
         e.stopPropagation();
-        if (toolMode === 'rect') {
+        if (toolMode === 'rect' || toolMode === 'circle' || toolMode === 'note') {
             const coords = getCanvasCoordinates(e);
             if (!coords || !rectStartRef.current) return;
             const start = rectStartRef.current;
             setRectPreview({
+                type: toolMode,
                 x: Math.min(start.x, coords.x),
                 y: Math.min(start.y, coords.y),
                 w: Math.abs(coords.x - start.x),
-                h: Math.abs(coords.y - start.y)
+                h: Math.abs(coords.y - start.y),
+                startX: start.x,
+                startY: start.y,
+                endX: coords.x,
+                endY: coords.y
             });
             return;
         }
@@ -1647,18 +1988,29 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
         e.preventDefault();
         e.stopPropagation();
         setIsDrawing(false);
-        if (toolMode === 'rect') {
+        if (toolMode === 'rect' || toolMode === 'circle' || toolMode === 'note') {
             const coords = getCanvasCoordinates(e);
             const finalRect = rectStartRef.current && coords
                 ? {
+                    type: toolMode,
                     x: Math.min(rectStartRef.current.x, coords.x),
                     y: Math.min(rectStartRef.current.y, coords.y),
                     w: Math.abs(coords.x - rectStartRef.current.x),
-                    h: Math.abs(coords.y - rectStartRef.current.y)
+                    h: Math.abs(coords.y - rectStartRef.current.y),
+                    startX: rectStartRef.current.x,
+                    startY: rectStartRef.current.y,
+                    endX: coords.x,
+                    endY: coords.y
                 }
                 : rectPreview;
-            if (finalRect && finalRect.w > 0 && finalRect.h > 0) {
-                paintRect(finalRect);
+            if (finalRect && (finalRect.w > 0 || finalRect.h > 0)) {
+                if (toolMode === 'circle') {
+                    paintEllipse(finalRect);
+                } else if (toolMode === 'note') {
+                    paintPointNote({ x: finalRect.endX, y: finalRect.endY });
+                } else {
+                    paintRect(finalRect);
+                }
                 saveToHistory();
             }
             rectStartRef.current = null;
@@ -1666,16 +2018,28 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
             return;
         }
         lastPointRef.current = null; // V3.7.27: 清除上一个点
+        if (toolMode === 'brush') {
+            recordRegionNote();
+        }
         saveToHistory();
     };
 
     // 撤销
+    // V3.8.8+: Load compressed blob snapshot via Image
     const handleUndo = () => {
         if (historyIndex <= 0 || !canvasRef.current || !ctxRef.current) return;
         const newIndex = historyIndex - 1;
         setHistoryIndex(newIndex);
+        const snapshot = history[newIndex];
+        if (!snapshot?.url) return;
         const ctx = ctxRef.current;
-        ctx.putImageData(history[newIndex], 0, 0);
+        const canvas = canvasRef.current;
+        const img = new Image();
+        img.onload = () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0);
+        };
+        img.src = snapshot.url;
     };
 
     // 清空
@@ -1689,14 +2053,39 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
     };
 
     // 保存蒙版
+    // V3.8.8+: Numbered annotation compilation for precise model instructions
     const handleSave = () => {
         if (!canvasRef.current) return;
         const canvas = canvasRef.current;
         const maskDataUrl = canvas.toDataURL('image/png');
+        // Compile numbered annotations: ① repair: fix the valve / ② replace: change color
+        const numberedNotes = annotationNotes
+            .map((item, idx) => `${String.fromCodePoint(0x2460 + idx)} ${String(item || '').trim()}`)
+            .filter(Boolean);
+        const noteText = numberedNotes.join('\n');
 
         // 更新节点状态
         if (onUpdateNode) {
-            onUpdateNode(nodeId, { maskContent: maskDataUrl, isMasking: false });
+            const currentWorkbench = nodeSettings?.editWorkbench || {};
+            const currentInstruction = String(currentWorkbench.instruction || '').trim();
+            const maskInstruction = noteText ? `区域批注：\n${noteText}` : '';
+            const nextInstruction = maskInstruction && !currentInstruction.includes(maskInstruction)
+                ? [currentInstruction, maskInstruction].filter(Boolean).join('\n')
+                : currentInstruction;
+            onUpdateNode(nodeId, {
+                maskContent: maskDataUrl,
+                isMasking: false,
+                settings: {
+                    ...(nodeSettings || {}),
+                    editWorkbench: {
+                        ...currentWorkbench,
+                        instruction: nextInstruction,
+                        localEditAction: editAction,
+                        localEditNote: annotationText.trim(),
+                        maskNotes: annotationNotes
+                    }
+                }
+            });
         }
 
         if (onSave) onSave(maskDataUrl);
@@ -1734,8 +2123,8 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
                     ref={canvasRef}
                     className="absolute inset-0 w-full h-full"
                     style={{
-                        opacity: 0.5,
-                        mixBlendMode: 'multiply',
+                        opacity: 0.68,
+                        mixBlendMode: 'normal',
                         cursor: 'crosshair',
                         pointerEvents: 'auto',
                         imageRendering: 'auto'
@@ -1745,16 +2134,54 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
                     onMouseUp={handleMouseUp}
                     onMouseLeave={handleMouseUp}
                 />
-                {toolMode === 'rect' && rectPreview && resolvedDimensions?.w && resolvedDimensions?.h && (
+                {(toolMode === 'rect' || toolMode === 'circle') && rectPreview && resolvedDimensions?.w && resolvedDimensions?.h && (
                     <div
-                        className="absolute border-2 border-dashed border-white bg-white/20 pointer-events-none"
+                        className={`absolute border-2 border-dashed pointer-events-none ${toolMode === 'circle' ? 'rounded-full' : ''}`}
                         style={{
                             left: `${(rectPreview.x / resolvedDimensions.w) * 100}%`,
                             top: `${(rectPreview.y / resolvedDimensions.h) * 100}%`,
                             width: `${(rectPreview.w / resolvedDimensions.w) * 100}%`,
-                            height: `${(rectPreview.h / resolvedDimensions.h) * 100}%`
+                            height: `${(rectPreview.h / resolvedDimensions.h) * 100}%`,
+                            borderColor: markColor,
+                            backgroundColor: `${markColor}22`
                         }}
                     />
+                )}
+                {toolMode === 'note' && rectPreview && resolvedDimensions?.w && resolvedDimensions?.h && (
+                    <svg className="absolute inset-0 w-full h-full pointer-events-none overflow-visible">
+                        <circle
+                            cx={`${(rectPreview.endX / resolvedDimensions.w) * 100}%`}
+                            cy={`${(rectPreview.endY / resolvedDimensions.h) * 100}%`}
+                            r="8"
+                            fill={`${markColor}55`}
+                            stroke={markColor}
+                            strokeWidth="3"
+                        />
+                        <line
+                            x1={`${(rectPreview.endX / resolvedDimensions.w) * 100}%`}
+                            y1={`${(rectPreview.endY / resolvedDimensions.h) * 100}%`}
+                            x2={`${(rectPreview.endX / resolvedDimensions.w) * 100}%`}
+                            y2={`${(rectPreview.endY / resolvedDimensions.h) * 100}%`}
+                            stroke={markColor}
+                            strokeWidth="1"
+                        />
+                        {annotationText.trim() && (
+                            <text
+                                x={`${(rectPreview.endX / resolvedDimensions.w) * 100}%`}
+                                y={`${(rectPreview.endY / resolvedDimensions.h) * 100}%`}
+                                dx="12"
+                                dy="-10"
+                                fill={markColor}
+                                fontSize="14"
+                                fontWeight="700"
+                                stroke={theme === 'dark' ? '#000000' : '#ffffff'}
+                                strokeWidth="3"
+                                paintOrder="stroke"
+                            >
+                                {annotationText.trim().slice(0, 18)}
+                            </text>
+                        )}
+                    </svg>
                 )}
 
                 {/* 视觉反馈层：半透明红色覆盖 - 使用 Canvas 作为 mask */}
@@ -1764,7 +2191,7 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
             {/* 工具栏 - 使用 Portal 固定到 Body，避免被 Canvas Transform 影响 */}
             {createPortal(
                 <div
-                    className={`fixed bottom-4 left-1/2 -translate-x-1/2 flex flex-row items-center gap-4 p-2 rounded-full border backdrop-blur-md shadow-xl z-[9999] ${theme === 'dark'
+                    className={`fixed bottom-4 left-1/2 -translate-x-1/2 max-w-[92vw] flex flex-row flex-wrap items-center justify-center gap-3 p-2 rounded-2xl border backdrop-blur-md shadow-xl z-[9999] ${theme === 'dark'
                         ? 'bg-zinc-900/90 border-zinc-700 text-zinc-200'
                         : 'bg-white/90 border-zinc-300 text-zinc-800'
                         }`}
@@ -1802,15 +2229,123 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
                         >
                             <Square size={14} />
                         </button>
+                        <button
+                            onClick={() => {
+                                setToolMode('circle');
+                                lastPointRef.current = null;
+                            }}
+                            className={`p-1.5 rounded-full transition-colors ${toolMode === 'circle'
+                                ? 'bg-blue-600 text-white'
+                                : theme === 'dark'
+                                    ? 'hover:bg-zinc-800'
+                                    : 'hover:bg-zinc-100'
+                                }`}
+                            title={t('红圈/黑圈标注')}
+                        >
+                            <Circle size={14} />
+                        </button>
+                        <button
+                            onClick={() => {
+                                setToolMode('note');
+                                lastPointRef.current = null;
+                            }}
+                            className={`p-1.5 rounded-full transition-colors ${toolMode === 'note'
+                                ? 'bg-blue-600 text-white'
+                                : theme === 'dark'
+                                    ? 'hover:bg-zinc-800'
+                                    : 'hover:bg-zinc-100'
+                                }`}
+                            title={t('点位注释')}
+                        >
+                            <FileText size={14} />
+                        </button>
+                        <button
+                            onClick={() => {
+                                setToolMode('erase');
+                                rectStartRef.current = null;
+                                setRectPreview(null);
+                                lastPointRef.current = null;
+                            }}
+                            className={`p-1.5 rounded-full transition-colors ${toolMode === 'erase'
+                                ? 'bg-blue-600 text-white'
+                                : theme === 'dark'
+                                    ? 'hover:bg-zinc-800'
+                                    : 'hover:bg-zinc-100'
+                                }`}
+                            title={t('擦除遮罩')}
+                        >
+                            <Eraser size={14} />
+                        </button>
                     </div>
 
+                    <div className="flex items-center gap-1">
+                        {[
+                            { value: '#ef4444', label: '红色标注' },
+                            { value: '#111827', label: '黑色标注' }
+                        ].map((option) => (
+                            <button
+                                key={option.value}
+                                type="button"
+                                onClick={() => setMarkColor(option.value)}
+                                className={`w-5 h-5 rounded-full border-2 transition-transform ${markColor === option.value
+                                    ? 'border-blue-500 scale-110'
+                                    : theme === 'dark'
+                                        ? 'border-zinc-600'
+                                        : 'border-zinc-300'
+                                    }`}
+                                style={{ backgroundColor: option.value }}
+                                title={t(option.label)}
+                            />
+                        ))}
+                    </div>
+
+                    <div className="flex items-center gap-1">
+                        <select
+                            value={editAction}
+                            onChange={(e) => setEditAction(e.target.value)}
+                            className={`px-2 py-1 rounded-lg text-[11px] border outline-none ${theme === 'dark'
+                                ? 'bg-zinc-950 border-zinc-700 text-zinc-100'
+                                : 'bg-white border-zinc-300 text-zinc-800'
+                                }`}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            title={t('区域动作')}
+                        >
+                            <option value="repair">修复</option>
+                            <option value="replace">替换</option>
+                            <option value="erase">擦除</option>
+                            <option value="material">按素材</option>
+                        </select>
+                        <FileText size={13} className={theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'} />
+                        <input
+                            value={annotationText}
+                            onChange={(e) => setAnnotationText(e.target.value.slice(0, 32))}
+                            className={`w-36 px-2 py-1 rounded-lg text-[11px] border outline-none ${theme === 'dark'
+                                ? 'bg-zinc-950 border-zinc-700 text-zinc-100'
+                                : 'bg-white border-zinc-300 text-zinc-800'
+                                }`}
+                            placeholder="只修阀门 / 别动枪身"
+                            onMouseDown={(e) => e.stopPropagation()}
+                        />
+                    </div>
+
+                    {/* V3.8.8+: Fine brush mode toggle */}
+                    <div className="flex items-center gap-1 ml-1">
+                        <button
+                            onClick={() => { setFineMode(!fineMode); setBrushSize(fineMode ? 30 : 3); }}
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-medium border transition ${fineMode
+                                ? 'bg-amber-600 text-white border-amber-500'
+                                : theme === 'dark' ? 'border-zinc-700 text-zinc-400' : 'border-zinc-300 text-zinc-500'
+                                }`}
+                        >精细</button>
+                    </div>
                     {/* 笔刷粗细 */}
                     <div className="flex items-center gap-2">
                         <span className="text-[10px] font-medium whitespace-nowrap">笔刷</span>
                         <input
                             type="range"
-                            min="10"
-                            max="150"
+                            min={fineMode ? 1 : 10}
+                            max={fineMode ? 9 : 150}
+                            step={fineMode ? 1 : 1}
                             value={brushSize}
                             onChange={(e) => setBrushSize(Number(e.target.value))}
                             className="w-20"
@@ -1840,7 +2375,7 @@ const MaskEditor = ({ nodeId, imageUrl, imageDimensions, isActive, onClose, onSa
                                 }`}
                             title={t('清空')}
                         >
-                            <Eraser size={14} />
+                            <Trash2 size={14} />
                         </button>
                         <button
                             onClick={handleSave}
@@ -2313,6 +2848,32 @@ const buildChatAgentSkillBlock = (route = {}, options = {}) => {
     }
     return lines.length > 0 ? `本轮优先技能：\n${lines.join('\n')}` : '';
 };
+const buildChatRuntimeToolGuide = (runtimeTools = []) => {
+    const enabledTools = (Array.isArray(runtimeTools) ? runtimeTools : [])
+        .filter((tool) => tool?.enabled !== false && tool?.id);
+    if (enabledTools.length === 0) return '';
+    const lines = ['当前已热加载的宿主工具：'];
+    enabledTools.forEach((tool) => {
+        const kind = String(tool.kind || 'http').trim();
+        const description = String(tool.description || tool.label || '').trim();
+        lines.push(`- ${tool.id}（${kind}）：${description || '可由宿主执行的外部工具'}`);
+    });
+    lines.push('当你确实需要调用宿主工具时，不要伪造结果；请在正文后追加一个 ```tapnow-meta``` JSON 代码块，并写入 toolRequests。');
+    lines.push('toolRequests 示例：{"toolRequests":[{"tool":"cli-runner","args":{"command":"..."} }]}');
+    lines.push('收到宿主返回的工具结果后，再继续完成最终答复。');
+    return lines.join('\n');
+};
+const buildChatAssistantMetaGuide = (options = {}) => {
+    const lines = [
+        '隐藏元数据协议（这些内容放在正文后，不要混进给用户看的正文里）：',
+        '- 如需给用户 1-3 个可点击的候选回复，请使用 ```tapnow-meta``` 并写入 suggestedReplies。',
+        '- 如需支持“创建到画布 / 同步到节点”，请把真正可执行的 prompt / workflow 写入 tapnow-meta.workflow / promptSpec / actionablePrompt。不要把整段聊天记录当提示词。'
+    ];
+    if (Array.isArray(options.runtimeTools) && options.runtimeTools.length > 0) {
+        lines.push('- 如需调用热加载工具，请把 toolRequests 写进 tapnow-meta，等待宿主返回结果。');
+    }
+    return lines.join('\n');
+};
 const buildChatImageModelGuide = (options = {}) => {
     const modelId = String(options.imageModelId || '').trim();
     if (!modelId) return '';
@@ -2327,6 +2888,11 @@ const buildChatImageModelGuide = (options = {}) => {
         lines.push('- 按 Midjourney 风格组织提示词：主体与风格建议用英文短句，参数可以留在 prompt 末尾。');
     } else if (lowerModelId.includes('jimeng')) {
         lines.push('- 按即梦风格组织提示词：优先中文，画面主体、镜头、场景、氛围、质感与限制条件写清楚。');
+    } else if (isOpenAIGptImageModelId(lowerModelId)) {
+        lines.push('- 按 OpenAI GPT Image 风格组织提示词：用自然语言写清主体、构图、材质、光线、文字要求与限制条件，不要输出 Midjourney 参数。');
+        if (isOpenAIGptImage2ModelId(lowerModelId)) {
+            lines.push('- gpt-image-2 支持文字+图片输入；有参考图时，明确“保留什么 / 改哪里 / 怎么改”，不要要求透明背景或 input_fidelity 参数。');
+        }
     }
     return lines.join('\n');
 };
@@ -2335,6 +2901,8 @@ const buildAdaptiveChatSystemPrompt = (route = {}, options = {}) => {
     const modeLabel = CHAT_AGENT_INTENT_MODE_LABELS[mode] || CHAT_AGENT_INTENT_MODE_LABELS[CHAT_AGENT_INTENT_MODES.CONVERSATION];
     const modeInstruction = CHAT_AGENT_MODE_INSTRUCTIONS[mode] || CHAT_AGENT_MODE_INSTRUCTIONS[CHAT_AGENT_INTENT_MODES.CONVERSATION];
     const skillBlock = buildChatAgentSkillBlock(route, options);
+    const runtimeToolGuide = buildChatRuntimeToolGuide(options.runtimeTools);
+    const assistantMetaGuide = buildChatAssistantMetaGuide(options);
     const imageModelGuide = buildChatImageModelGuide(options);
     const header = options.designAgent ? '你是 TapNow 内置的设计 Agent。' : '你是 TapNow 的多模态设计协作助手。';
     const designRules = options.designAgent
@@ -2364,6 +2932,8 @@ const buildAdaptiveChatSystemPrompt = (route = {}, options = {}) => {
         modeInstruction,
         '',
         skillBlock,
+        runtimeToolGuide,
+        assistantMetaGuide,
         imageModelGuide,
         '',
         '输出要求：',
@@ -2373,7 +2943,8 @@ const buildAdaptiveChatSystemPrompt = (route = {}, options = {}) => {
         '- 如果当前是对话、创意、素材分析或文本处理模式，不要强行输出 JSON、节点编排或整套 SOP。',
         '- 如果给出多个方向或方案，使用“方向#1 / 方案#1”编号。',
         '- 未进入执行落地模式时，不要输出可直接同步到绘图节点的提示词块。',
-        '- 当且仅当当前进入执行落地模式，或用户明确要求 prompt / JSON / workflow 时，再输出可直接落地的精简结构。'
+        '- 当且仅当当前进入执行落地模式，或用户明确要求 prompt / JSON / workflow 时，再输出可直接落地的精简结构。',
+        '- 如需附带 suggestedReplies / workflow / toolRequests，请统一放进 ```tapnow-meta``` JSON 代码块，正文只保留给用户看的自然语言内容。'
     ].filter(Boolean).join('\n');
 };
 const NODE_TYPE_LABELS = Object.freeze({
@@ -2402,57 +2973,41 @@ const NODE_TYPE_LABELS = Object.freeze({
 // 即梦API配置（代理地址，默认本地5100端口）
 const JIMENG_API_BASE_URL = 'http://localhost:5100';
 const JIMENG_SESSION_ID = '7a16459fbd65d9c87b4ea44d3318f5fa';
+const SEEDANCE_API_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
+const DEFAULT_PROVIDER_KEYS = new Set(['openai', 'google', 'seedance']);
 
 // V3.6.0: 供应商配置（简化版 - 无 name 字段，直接用 key 作为显示名）
 const DEFAULT_PROVIDERS = {
     'openai': { key: '', url: DEFAULT_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
     'google': { key: '', url: GOOGLE_OFFICIAL_BASE_URL, apiType: 'gemini', useProxy: false, forceAsync: false, officialApi: true },
-    'deepseek': { key: '', url: DEFAULT_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
-    'midjourney': { key: '', url: 'https://api.midjourney.com', apiType: 'openai', useProxy: false, forceAsync: false },
-    'jimeng': { key: '', url: JIMENG_API_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
-    'grok': { key: '', url: 'https://ai.t8star.cn', apiType: 'openai', useProxy: false, forceAsync: false },
-    'yunwu': { key: '', url: 'https://yunwu.ai', apiType: 'gemini', useProxy: false, forceAsync: false },
+    'seedance': { key: '', url: SEEDANCE_API_BASE_URL, apiType: 'openai', useProxy: false, forceAsync: false },
 };
 
 // V3.6.0: 模型配置（简化版 - id 即 modelName，无 displayName）
 const DEFAULT_API_CONFIGS = [
-    // Chat Models
+    // Chat Models (V3.8.8+: added gpt-5.4, gpt-5.5)
     { id: 'gpt-5.1', provider: 'openai', type: 'Chat' },
     { id: 'gpt-5.2', provider: 'openai', type: 'Chat' },
+    { id: 'gpt-5.4', provider: 'openai', type: 'Chat' },
+    { id: 'gpt-5.5', provider: 'openai', type: 'Chat' },
     { id: 'gpt-4o', provider: 'openai', type: 'Chat' },
-    { id: 'deepseek-v3-1-250821', provider: 'deepseek', type: 'Chat' },
     { id: 'gemini-3.1-pro-preview', provider: 'google', type: 'Chat' },
     { id: 'gemini-3.1-flash-preview', provider: 'google', type: 'Chat' },
     { id: 'gemini-3-flash-preview', provider: 'google', type: 'Chat' },
     { id: 'gemini-3-pro-image-preview', provider: 'google', type: 'ChatImage' },
 
-    // Image Models
-    { id: 'MJ V6', provider: 'midjourney', type: 'Image' },
+    // Image / ChatImage Models (V3.8.8+: expanded ChatImage support)
+    { id: 'gpt-image-2', provider: 'openai', type: 'ChatImage', modelName: 'gpt-image-2' },
     { id: 'gpt-4o-image', provider: 'openai', type: 'Image' },
-    { id: 'gemini-3-pro-image-preview', provider: 'yunwu', type: 'Image' },
-    { id: 'jimeng-4.5', provider: 'jimeng', type: 'Image' },
-    { id: 'jimeng-4.1', provider: 'jimeng', type: 'Image' },
-    { id: 'jimeng-4.0', provider: 'jimeng', type: 'Image' },
-    { id: 'jimeng-3.1', provider: 'jimeng', type: 'Image' },
-    { id: 'jimeng-3.0', provider: 'jimeng', type: 'Image' },
-    { id: 'jimeng-2.1', provider: 'jimeng', type: 'Image' },
-    { id: 'jimeng-xl-pro', provider: 'jimeng', type: 'Image' },
-    { id: 'nanobananapro', provider: 'jimeng', type: 'Image' },
-    { id: 'nanobanana', provider: 'jimeng', type: 'Image' },
+    { id: 'gpt-5.4-image', provider: 'openai', type: 'ChatImage', modelName: 'gpt-5.4' },
+    { id: 'gpt-5.5-image', provider: 'openai', type: 'ChatImage', modelName: 'gpt-5.5' },
 
     // Video Models
     { id: 'sora-2', provider: 'openai', type: 'Video', durations: ['5s', '10s'] },
     { id: 'sora-2-pro', provider: 'openai', type: 'Video', durations: ['15s', '25s'] },
-    { id: 'jimeng-video-3.5-pro', provider: 'jimeng', type: 'Video', durations: ['5s', '10s'] },
-    { id: 'jimeng-video-veo3', provider: 'jimeng', type: 'Video', durations: ['8s'] },
-    { id: 'jimeng-video-veo3.1', provider: 'jimeng', type: 'Video', durations: ['8s'] },
-    { id: 'jimeng-video-sora2', provider: 'jimeng', type: 'Video', durations: ['4s', '8s', '12s'] },
-    { id: 'jimeng-video-3.0-pro', provider: 'jimeng', type: 'Video', durations: ['5s', '10s'] },
-    { id: 'jimeng-video-3.0', provider: 'jimeng', type: 'Video', durations: ['5s', '10s'] },
-    { id: 'jimeng-video-3.0-fast', provider: 'jimeng', type: 'Video', durations: ['5s', '10s'] },
-    { id: 'jimeng-video-2.0-pro', provider: 'jimeng', type: 'Video', durations: ['5s', '10s'] },
-    { id: 'jimeng-video-2.0', provider: 'jimeng', type: 'Video', durations: ['5s', '10s'] },
-    { id: 'grok-video-3', provider: 'grok', type: 'Video', durations: ['8s', '5s'] },
+    { id: 'seedance-1-0-pro-250528', provider: 'seedance', type: 'Video', durations: ['5s', '10s'] },
+    { id: 'seedance-1-0-lite-t2v-250428', provider: 'seedance', type: 'Video', durations: ['5s', '10s'] },
+    { id: 'seedance-1-0-lite-i2v-250428', provider: 'seedance', type: 'Video', durations: ['5s', '10s'] },
 ];
 
 const RATIOS = ['Auto', '1:1', '16:9', '9:16', '4:3', '3:4', '21:9', '3:2', '2:3'];
@@ -2461,9 +3016,22 @@ const VIDEO_RES_OPTIONS = ['1080P', '720P'];
 const PROMPT_LIBRARY_KEY = 'tapnow_prompt_library';
 const GRID_PROMPT_TEXT = `基于我上传的这张参考图，生成一张九宫格（3x3 grid）布局的分镜脚本。请严格保持角色与参考图一致（Keep character strictly consistent），但在9个格子中展示该角色不同的动作、表情和拍摄角度（如正面、侧面、背面、特写等）。要求风格高度统一，形成一张完整的角色动态表（Character Sheet）。`;
 const UPSCALE_PROMPT_TEXT = `请对参考图片进行无损高清放大（Upscale）。请严格保持原图的构图、色彩、光影和所有细节元素不变，不要进行任何创造性的重绘或添加新内容。仅专注于提升分辨率、锐化边缘（Sharpening）和去除噪点（Denoising），实现像素级的高清修复。Best quality, 8k, masterpiece, highres, ultra detailed, sharp focus, image restoration, upscale, faithful to original.`;
-const INPAINT_PROMPT_TEXT = `请仅修改我提供遮罩覆盖的区域，其余未遮罩区域必须保持像素级一致。优先执行局部重绘、局部替换、瑕疵修复、文字擦除与版面微调，边缘过渡自然，不要破坏原图构图与材质。`;
-const TEXT_RETOUCH_PROMPT_TEXT = `请基于遮罩区域进行无痕文字修改。保持原海报/包装/画面的视觉风格、字体气质、透视、阴影、反光与排版节奏一致，只替换或重绘指定文案，不要影响未遮罩区域。`;
+const INPAINT_PROMPT_TEXT = `请仅修改透明遮罩区域，其余未遮罩区域必须保持像素级一致。优先执行局部重绘、局部替换、瑕疵修复、文字擦除与版面微调，边缘过渡自然，不要破坏原图构图、材质、反光、阴影和文字排版。`;
+const TEXT_RETOUCH_PROMPT_TEXT = `请基于透明遮罩区域进行无痕文字修改。保持原海报/包装/画面的视觉风格、字体气质、字重、基线、字距、透视、阴影、反光与排版节奏一致，只替换或重绘指定文案，不要影响未遮罩区域。`;
 const CUTOUT_PROMPT_TEXT = `请精准识别主体并完成抠图/换底级编辑：保留主体轮廓、发丝、透明材质与阴影细节，清理杂乱背景，输出适合继续排版或换底合成的干净结果。`;
+const LAYER_DECOMPOSE_PROMPT_TEXT = `请将输入图像严格分解为{N}个独立透明图层，每个图层必须是生产级干净素材图（非棋盘格背景、非网格背景、非占位背景）：
+
+图层1 - 主体层：仅产品/人物主体，完整轮廓保留发丝与边缘细节，所有非主体区域必须完全透明。
+图层2 - 背景层：独立的背景场景或纯色背景，主体位置完全透明（挖空），无主体残留像素。
+图层3 - 文案层：纯文字与排版元素，无背景纹理，非文字区域完全透明。
+图层4 - 渲染层：光效、高光、阴影、反射、颗粒等叠加特效，透明背景，仅视觉效果元素。
+
+严格要求：
+- 每个图层都是可直接用于后期合成的干净素材
+- 图层之间无像素重叠（pixel-perfect separation）
+- 不要生成带棋盘格或网格背景的假素材
+- 不要添加任何水印、标注或文字说明
+- 输出{N}张独立PNG图像`;
 const splitPromptSegments = (text) => String(text || '').split(/[,;\n]/).map((item) => item.trim()).filter(Boolean);
 const IMAGE_BACKGROUND_PRESETS = Object.freeze([
     { id: 'auto', label: '跟随提示词', prompt: '' },
@@ -2851,6 +3419,72 @@ const REQUEST_CHAIN_TEMPLATE = {
     ]
 };
 const REQUEST_CHAIN_TEMPLATE_TEXT = JSON.stringify(REQUEST_CHAIN_TEMPLATE, null, 2);
+const CHAT_RUNTIME_TOOLS_TEMPLATE = [
+    {
+        id: 'skill-ecommerce-image',
+        kind: 'skill',
+        enabled: true,
+        description: '电商商品图、主图、详情页、参考图编辑、批量 SKU 视觉规划',
+        path: 'C:/Users/jun/.codex/skills/ecommerce-image-generator/SKILL.md',
+        mode: 'read',
+        maxBytes: 24000
+    },
+    {
+        id: 'skill-gemini-image',
+        kind: 'skill',
+        enabled: true,
+        description: 'Gemini 文生图、图生图、多参考图合成与图片编辑指南',
+        path: 'C:/Users/jun/.codex/skills/image-generation/SKILL.md',
+        mode: 'read',
+        maxBytes: 22000
+    },
+    {
+        id: 'skill-graphic-design',
+        kind: 'skill',
+        enabled: true,
+        description: '版式、品牌、UI/UX、海报、视觉层级和设计审查',
+        path: 'C:/Users/jun/.codex/skills/graphic-design-expert/SKILL.md',
+        mode: 'read',
+        maxBytes: 22000
+    },
+    {
+        id: 'skill-google-genai',
+        kind: 'skill',
+        enabled: true,
+        description: 'Google GenAI / Gemini API、多模态、工具调用、结构化输出开发指南',
+        path: 'C:/Users/jun/.codex/skills/google-genai-sdk-python/SKILL.md',
+        mode: 'read',
+        maxBytes: 22000
+    },
+    {
+        id: 'skill-video-processing',
+        kind: 'skill',
+        enabled: true,
+        description: 'FFmpeg 视频裁剪、拼接、字幕、转码和批处理后期',
+        path: 'C:/Users/jun/.codex/skills/video-processing-editing/SKILL.md',
+        mode: 'read',
+        maxBytes: 22000
+    },
+    {
+        id: 'skill-marketing-video',
+        kind: 'skill',
+        enabled: true,
+        description: '广告视频、产品 promo、品牌短片和社媒投放脚本规划',
+        path: 'C:/Users/jun/.codex/skills/ai-marketing-videos/SKILL.md',
+        mode: 'read',
+        maxBytes: 20000
+    },
+    {
+        id: 'skill-frontend-design',
+        kind: 'skill',
+        enabled: true,
+        description: '项目 UI 页面、组件、前端视觉风格和交互打磨',
+        path: 'C:/Users/jun/.codex/skills/skills/skills/frontend-design/SKILL.md',
+        mode: 'read',
+        maxBytes: 20000
+    }
+];
+const CHAT_RUNTIME_TOOLS_TEMPLATE_TEXT = JSON.stringify(CHAT_RUNTIME_TOOLS_TEMPLATE, null, 2);
 const buildEmptyAsyncConfig = () => ({
     enabled: false,
     requestIdPaths: ['requestId', 'request_id'],
@@ -3514,6 +4148,8 @@ function getDefaultRequestTemplateForType(type) {
         body
     };
 }
+const isOpenAIGptImage2ModelId = (value) => /^gpt-image-2(?:$|-)/i.test(String(value || '').trim());
+const isOpenAIGptImageModelId = (value) => /^gpt-image-(?:1(?:\.5|-mini)?|2)(?:$|-)/i.test(String(value || '').trim());
 function isJimengVideoModelId(value) {
     const raw = String(value || '').toLowerCase();
     if (!raw) return false;
@@ -3841,16 +4477,25 @@ const normalizeTransportOptions = (options) => {
         wsDoneToken: String(options.wsDoneToken || DEFAULT_TRANSPORT_OPTIONS.wsDoneToken)
     };
 };
+// V3.8.8+: Extended capability schema for advanced image editing models
 function buildDefaultCapabilitySchema(type) {
     const modelType = String(type || 'Chat');
     const isChat = modelType === 'Chat' || modelType === 'ChatImage';
     const isMedia = modelType === 'Image' || modelType === 'Video' || modelType === 'ChatImage';
+    const isChatImage = modelType === 'ChatImage';
     return {
         supportsMultipart: isMedia,
         supportsRequestChain: false,
         supportsSSE: false,
         supportsWS: false,
-        supportsTools: isChat
+        supportsTools: isChat,
+        // V3.8.8+: New capabilities for advanced image models
+        supportsNativeImageEdit: isChatImage,
+        supportsMultiImageOutput: isChatImage,
+        supportsInpainting: isChatImage,
+        supportsLayerDecomposition: isChatImage,
+        maxImageInputs: isChatImage ? 10 : 1,
+        maxOutputImages: isChatImage ? 4 : 1,
     };
 }
 const normalizeCapabilitySchema = (capabilities, type) => {
@@ -3863,7 +4508,14 @@ const normalizeCapabilitySchema = (capabilities, type) => {
         supportsRequestChain: capabilities.supportsRequestChain === true,
         supportsSSE: capabilities.supportsSSE === true,
         supportsWS: capabilities.supportsWS === true,
-        supportsTools: capabilities.supportsTools === true
+        supportsTools: capabilities.supportsTools === true,
+        // V3.8.8+: New capabilities
+        supportsNativeImageEdit: capabilities.supportsNativeImageEdit === true,
+        supportsMultiImageOutput: capabilities.supportsMultiImageOutput === true,
+        supportsInpainting: capabilities.supportsInpainting === true,
+        supportsLayerDecomposition: capabilities.supportsLayerDecomposition === true,
+        maxImageInputs: Number.isFinite(Number(capabilities.maxImageInputs)) ? Number(capabilities.maxImageInputs) : defaults.maxImageInputs,
+        maxOutputImages: Number.isFinite(Number(capabilities.maxOutputImages)) ? Number(capabilities.maxOutputImages) : defaults.maxOutputImages,
     };
 };
 const validateModelLibraryContract = (entry) => {
@@ -4105,6 +4757,7 @@ const normalizeModelLibraryEntry = (entry, index = 0) => {
         transport: normalizeTransportMode(entry.transport),
         transportOptions: normalizeTransportOptions(entry.transportOptions),
         capabilities: normalizeCapabilitySchema(entry.capabilities, entry.type),
+        chatRuntimeTools: normalizeChatRuntimeToolDefinitions(entry.chatRuntimeTools),
         previewOverrideEnabled: !!entry.previewOverrideEnabled,
         previewOverridePatch: normalizePreviewOverridePatch(entry.previewOverridePatch),
         requestTemplate: normalizeRequestTemplate(entry.requestTemplate || getDefaultRequestTemplateForEntry(entry)),
@@ -4262,8 +4915,12 @@ const collectImmediateImageUrls = (data) => {
         if (typeof value === 'object') {
             const directUrl = value.url || value.image_url || value.imageUrl || value.object_url || value.objectUrl || value.path || value.uri || value.file_uri || value.fileUri;
             if (directUrl) pushUrl(directUrl);
-            const b64 = value.b64_json || value.base64 || value.data;
-            if (typeof b64 === 'string' && b64.trim()) urls.add(b64.trim());
+            const b64 = value.b64_json || value.base64 || value.data || value.result;
+            if (typeof b64 === 'string' && b64.trim()) {
+                const trimmed = b64.trim();
+                const base64Like = /^[A-Za-z0-9+/=]+$/.test(trimmed);
+                urls.add(base64Like && trimmed.length > 64 ? `data:image/png;base64,${trimmed}` : trimmed);
+            }
         }
     };
     const sources = [
@@ -6194,13 +6851,14 @@ function TapnowApp() {
 
                 // 过滤掉已删除的模型配置
                 configs = configs.filter(c => !DELETED_MODEL_IDS.includes(c.id));
+                configs = configs.filter(c => DEFAULT_PROVIDER_KEYS.has(c.provider));
 
                 // V3.7.22: 允许同名模型共存（不再按 id 去重）
                 const existingIds = new Set(configs.map(c => c.id).filter(Boolean));
 
-                // V3.7.24: 确保 Chat 模型存在（旧版本可能没有 Chat 类型）
-                const chatModels = DEFAULT_API_CONFIGS.filter(m => isChatModelType(m.type));
-                chatModels.forEach(m => {
+                // V3.8.x: 确保默认允许的供应商模型存在（旧版本可能没有 Seedance / GPT Image 2）
+                const defaultAllowedModels = DEFAULT_API_CONFIGS.filter(m => DEFAULT_PROVIDER_KEYS.has(m.provider));
+                defaultAllowedModels.forEach(m => {
                     if (!existingIds.has(m.id)) {
                         configs.push(m);
                         existingIds.add(m.id);
@@ -6228,9 +6886,13 @@ function TapnowApp() {
             const saved = localStorage.getItem('tapnow_providers');
             if (saved) {
                 const parsed = JSON.parse(saved);
-                // 直接使用用户保存的数据，不再自动补充默认Provider
-                // 如果用户删除了一个Provider，它就不会再出现
-                return Object.fromEntries(Object.entries(parsed).map(([key, config]) => [key, normalizeProviderConfig(key, config)]));
+                const savedAllowedProviders = Object.fromEntries(Object.entries(parsed)
+                    .filter(([key]) => DEFAULT_PROVIDER_KEYS.has(key))
+                    .map(([key, config]) => [key, normalizeProviderConfig(key, config)]));
+                return {
+                    ...Object.fromEntries(Object.entries(DEFAULT_PROVIDERS).map(([key, config]) => [key, normalizeProviderConfig(key, config)])),
+                    ...savedAllowedProviders
+                };
             }
         } catch (e) {
             console.error('加载 providers 配置失败:', e);
@@ -7168,6 +7830,7 @@ function TapnowApp() {
     const [libraryRequestPreviewDrafts, setLibraryRequestPreviewDrafts] = useState(() => ({}));
     const [libraryRequestTemplateDrafts, setLibraryRequestTemplateDrafts] = useState(() => ({}));
     const [libraryTransportOptionsDrafts, setLibraryTransportOptionsDrafts] = useState(() => ({}));
+    const [libraryChatRuntimeToolDrafts, setLibraryChatRuntimeToolDrafts] = useState(() => ({}));
     const [libraryAsyncConfigDrafts, setLibraryAsyncConfigDrafts] = useState(() => ({}));
     const [libraryRequestChainDrafts, setLibraryRequestChainDrafts] = useState(() => ({}));
     const [libraryAsyncPreviewModels, setLibraryAsyncPreviewModels] = useState(() => new Set());
@@ -9853,6 +10516,7 @@ function TapnowApp() {
             transport: normalizeTransportMode(resolvedLibrary?.transport || config.transport),
             transportOptions: normalizeTransportOptions(resolvedLibrary?.transportOptions || config.transportOptions),
             capabilities: normalizeCapabilitySchema(resolvedLibrary?.capabilities || config.capabilities, resolvedLibrary?.type || config.type),
+            chatRuntimeTools: normalizeChatRuntimeToolDefinitions(resolvedLibrary?.chatRuntimeTools || config.chatRuntimeTools),
             previewOverrideEnabled: resolvedLibrary ? !!resolvedLibrary.previewOverrideEnabled : !!config.previewOverrideEnabled,
             previewOverridePatch: normalizePreviewOverridePatch(resolvedLibrary?.previewOverridePatch || config.previewOverridePatch),
             requestTemplate: normalizeRequestTemplate(resolvedLibrary?.requestTemplate || config.requestTemplate),
@@ -12510,6 +13174,7 @@ function TapnowApp() {
             transport: TRANSPORT_HTTP_JSON,
             transportOptions: { ...DEFAULT_TRANSPORT_OPTIONS },
             capabilities: buildDefaultCapabilitySchema('Image'),
+            chatRuntimeTools: [],
             previewOverrideEnabled: false,
             previewOverridePatch: null,
             requestOverrideEnabled: false,
@@ -12556,6 +13221,7 @@ function TapnowApp() {
             transport: normalizeTransportMode(cloned.transport),
             transportOptions: normalizeTransportOptions(cloned.transportOptions),
             capabilities: normalizeCapabilitySchema(cloned.capabilities, cloned.type || source.type),
+            chatRuntimeTools: normalizeChatRuntimeToolDefinitions(cloned.chatRuntimeTools),
             requestTemplate: normalizeRequestTemplate(cloned.requestTemplate || getDefaultRequestTemplateForEntry(cloned)),
             previewOverridePatch: normalizePreviewOverridePatch(cloned.previewOverridePatch),
             requestOverridePatch: normalizeRequestOverridePatch(cloned.requestOverridePatch)
@@ -12695,6 +13361,11 @@ function TapnowApp() {
             return rest;
         });
         setLibraryTransportOptionsDrafts(prev => {
+            if (!prev[id]) return prev;
+            const { [id]: _removed, ...rest } = prev;
+            return rest;
+        });
+        setLibraryChatRuntimeToolDrafts(prev => {
             if (!prev[id]) return prev;
             const { [id]: _removed, ...rest } = prev;
             return rest;
@@ -13147,6 +13818,10 @@ function TapnowApp() {
         const providerApiType = String(currentChatModelConfig?.apiType || providers?.[currentChatModelConfig.provider]?.apiType || '').toLowerCase();
         return providerApiType === 'gemini' && isOfficialGeminiProvider(currentChatModelConfig.provider);
     }, [currentChatModelConfig, providers, isOfficialGeminiProvider]);
+    const currentChatRuntimeTools = useMemo(() => (
+        normalizeChatRuntimeToolDefinitions(currentChatModelConfig?.chatRuntimeTools || [])
+            .filter((tool) => tool?.enabled !== false && tool?.id)
+    ), [currentChatModelConfig]);
     const chatCanvasContextPreview = useMemo(() => {
         if (!isChatOpen || !chatCanvasContextEnabled) return null;
         return buildChatCanvasContext();
@@ -13537,12 +14212,20 @@ function TapnowApp() {
         const arrayCandidates = [
             data?.images,
             data?.output_images,
+            data?.output,
             data?.data?.output_images,
-            data?.data?.images
+            data?.data?.images,
+            data?.data?.output
         ];
         arrayCandidates.forEach((arr) => {
             if (!Array.isArray(arr)) return;
-            arr.forEach((item) => pushUrl(item?.url || item?.image_url || item?.imageUrl || item));
+            arr.forEach((item) => {
+                if (item?.type === 'image_generation_call') {
+                    pushUrl(item.result || item.image || item);
+                    return;
+                }
+                pushUrl(item?.url || item?.image_url || item?.imageUrl || item?.result || item);
+            });
         });
 
         extractImageUrlsFromText(textContent).forEach((url) => urls.add(url));
@@ -13990,8 +14673,679 @@ function TapnowApp() {
         return vars;
     };
 
-    const sendChatMessage = async () => {
-        if ((!chatInput.trim() && chatFiles.length === 0) || isChatSending) return;
+    const formatChatRuntimeToolResultsForModel = useCallback((results = []) => {
+        const normalizedResults = Array.isArray(results) ? results : [];
+        const compactResults = normalizedResults.map((item) => ({
+            requestId: item?.requestId || item?.id || '',
+            tool: item?.tool || item?.toolId || '',
+            kind: item?.kind || '',
+            success: item?.success !== false,
+            outputText: String(
+                item?.outputText
+                || item?.stdout
+                || item?.text
+                || item?.summary
+                || ''
+            ).trim(),
+            output: item?.output ?? item?.result ?? item?.data ?? null,
+            error: item?.error || item?.message || ''
+        }));
+        return [
+            '[宿主工具返回]',
+            '请基于这些结果继续完成本轮回答。不要原样复读 JSON；如需引用，只提炼关键事实。',
+            '```json',
+            JSON.stringify(compactResults, null, 2),
+            '```'
+        ].join('\n');
+    }, []);
+
+    const executeChatRuntimeToolRequests = useCallback(async (toolRequests = [], runtimeTools = [], context = {}) => {
+        const requests = normalizeChatToolRequests(toolRequests);
+        const tools = normalizeChatRuntimeToolDefinitions(runtimeTools).filter((tool) => tool?.enabled !== false && tool?.id);
+        if (requests.length === 0) {
+            return { success: true, results: [] };
+        }
+        const serverBase = String(localServerUrl || '').trim().replace(/\/+$/, '');
+        if (!serverBase) {
+            return {
+                success: false,
+                results: requests.map((request) => ({
+                    requestId: request.id,
+                    tool: request.tool,
+                    success: false,
+                    error: '未配置本地服务地址，无法执行热加载工具'
+                }))
+            };
+        }
+        try {
+            const response = await fetch(`${serverBase}/runtime-tools/execute`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    toolRequests: requests,
+                    runtimeTools: tools,
+                    context
+                })
+            });
+            const rawText = await response.text();
+            let payload = null;
+            try {
+                payload = rawText ? JSON.parse(rawText) : null;
+            } catch {
+                payload = null;
+            }
+            if (!response.ok) {
+                throw new Error(
+                    payload?.error
+                    || payload?.message
+                    || rawText
+                    || `HTTP ${response.status || 0}`
+                );
+            }
+            return {
+                success: payload?.success !== false,
+                results: Array.isArray(payload?.results) ? payload.results : []
+            };
+        } catch (error) {
+            return {
+                success: false,
+                results: requests.map((request) => ({
+                    requestId: request.id,
+                    tool: request.tool,
+                    success: false,
+                    error: error?.message || '工具执行失败'
+                }))
+            };
+        }
+    }, [localServerUrl]);
+
+    const runChatAssistantCompletion = useCallback(async ({
+        config,
+        apiKey,
+        baseUrl,
+        modelName,
+        chatModelKey,
+        systemPrompt,
+        historyMessages = [],
+        userMessage = null,
+        extraTexts = [],
+        usesOfficialGemini = false,
+        supportsDesignAgent = false,
+        enableGeminiSearch = false,
+        enableGeminiThinking = false
+    }) => {
+        const attachmentMetas = (Array.isArray(userMessage?.files) ? userMessage.files : []).map((file, idx) => {
+            const rawContent = typeof file?.content === 'string' ? file.content : '';
+            const isDataUrl = rawContent.startsWith('data:');
+            const isHttpUrl = rawContent.startsWith('http://') || rawContent.startsWith('https://');
+            return {
+                index: idx + 1,
+                name: file?.name || `file-${idx + 1}`,
+                type: file?.type || 'application/octet-stream',
+                fileExt: file?.fileExt || '',
+                isImage: !!file?.isImage,
+                isVideo: !!file?.isVideo,
+                isAudio: !!file?.isAudio,
+                isPDF: !!file?.isPDF,
+                isDoc: !!file?.isDoc,
+                isExcel: !!file?.isExcel,
+                isCode: !!file?.isCode,
+                rawContent,
+                url: isDataUrl || isHttpUrl ? rawContent : '',
+                dataUrl: isDataUrl ? rawContent : ''
+            };
+        });
+        const buildAttachmentBlob = async (attachment) => {
+            if (!attachment) return null;
+            if (attachment.dataUrl) {
+                try {
+                    return dataUrlToBlob(attachment.dataUrl);
+                } catch {
+                    return null;
+                }
+            }
+            if (attachment.url) {
+                try {
+                    const useProxy = getProxyPreferenceForUrl(attachment.url, false);
+                    return await getBlobFromUrl(attachment.url, { useProxy });
+                } catch {
+                    return null;
+                }
+            }
+            if (attachment.rawContent) {
+                return new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
+            }
+            return null;
+        };
+        const imageAttachments = attachmentMetas.filter((attachment) => attachment.isImage || attachment.isVideo);
+        let data = null;
+        let aiContent = '';
+        let assistantFiles = [];
+
+        if (usesOfficialGemini) {
+            const buildGeminiFilePart = async (file) => {
+                if (!file?.isImage || !file?.content) return null;
+                const rawContent = String(file.content || '');
+                try {
+                    if (rawContent.startsWith('data:')) {
+                        const normalized = normalizeDataUrl(rawContent);
+                        const mimeMatch = normalized.match(/^data:([^;,]+)[;,]/i);
+                        return {
+                            inline_data: {
+                                mime_type: mimeMatch?.[1] || file.type || 'image/png',
+                                data: normalized.split(',')[1] || ''
+                            }
+                        };
+                    }
+                    const useProxy = getProxyPreferenceForUrl(rawContent, false);
+                    const base64 = await getBase64FromUrl(rawContent, { useProxy });
+                    return {
+                        inline_data: {
+                            mime_type: file.type || 'image/png',
+                            data: base64
+                        }
+                    };
+                } catch {
+                    return null;
+                }
+            };
+            const buildGeminiFallbackText = (file) => {
+                if (file?.isVideo) return `[附加视频素材: ${file.canvasRef || file.name || 'video'}]`;
+                if (file?.isAudio) return `[附加音频素材: ${file.name || 'audio'}]`;
+                if (file?.isPDF || file?.isDoc || file?.isExcel) return `[附加文档: ${file.name || 'document'}]`;
+                if (file?.isCode || (file?.content && typeof file.content === 'string' && file.content.length < 50000)) {
+                    return `\n[文件: ${file.name}]\n\`\`\`${file.fileExt || 'text'}\n${file.content}\n\`\`\`\n`;
+                }
+                return `[附加文件: ${file?.name || 'file'}]`;
+            };
+            const buildGeminiParts = async (message, turnExtraTexts = [], includeFiles = false) => {
+                const parts = [];
+                if (message?.content) parts.push({ text: String(message.content) });
+                (Array.isArray(turnExtraTexts) ? turnExtraTexts : []).filter(Boolean).forEach((text) => {
+                    parts.push({ text: String(text) });
+                });
+                if (includeFiles) {
+                    for (const file of (Array.isArray(message?.files) ? message.files : [])) {
+                        const inlinePart = await buildGeminiFilePart(file);
+                        if (inlinePart) {
+                            parts.push(inlinePart);
+                        } else {
+                            parts.push({ text: buildGeminiFallbackText(file) });
+                        }
+                    }
+                } else if (!message?.content && Array.isArray(message?.files) && message.files.length > 0) {
+                    parts.push({ text: `[${message.files.length} 个多模态素材已在前文提供]` });
+                }
+                return parts.length > 0 ? parts : [{ text: '继续' }];
+            };
+            const geminiContents = [];
+            for (const message of historyMessages) {
+                geminiContents.push({
+                    role: message.role === 'assistant' ? 'model' : 'user',
+                    parts: await buildGeminiParts(message, [], false)
+                });
+            }
+            const currentGeminiParts = await buildGeminiParts(userMessage, extraTexts, true);
+            const requestBody = {
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                contents: [
+                    ...geminiContents,
+                    { role: 'user', parts: currentGeminiParts }
+                ]
+            };
+            if (enableGeminiSearch && supportsDesignAgent) {
+                requestBody.tools = [{ google_search: {} }];
+            }
+            if (enableGeminiThinking && supportsDesignAgent) {
+                requestBody.generationConfig = {
+                    thinkingConfig: {
+                        thinkingBudget: CHAT_GEMINI_THINKING_BUDGET
+                    }
+                };
+            }
+            const geminiModelName = stripGoogleModelPrefix(modelName || config?.modelName || config?.id || chatModelKey);
+            const requestUrl = `${String(baseUrl || '').replace(/\/+$/, '')}/v1beta/models/${encodeURIComponent(geminiModelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+            const targetUrl = config?.provider ? buildProxyUrl(requestUrl, config.provider) : requestUrl;
+            const response = await fetch(targetUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json'
+                },
+                body: JSON.stringify(requestBody)
+            });
+            const rawText = await response.text();
+            try {
+                data = rawText ? JSON.parse(rawText) : null;
+            } catch {
+                data = null;
+            }
+            if (!response.ok) {
+                throw new Error(
+                    data?.error?.message
+                    || data?.message
+                    || rawText
+                    || `API Error: ${response.status || 0}`
+                );
+            }
+            const parsedGemini = parseGeminiAssistantPayload(data);
+            aiContent = parsedGemini.text;
+            assistantFiles = parsedGemini.files;
+        } else {
+            const normalizeOpenAIInputImageUrl = async (file) => {
+                const rawContent = typeof file?.content === 'string' ? file.content.trim() : '';
+                if (!rawContent) return '';
+                const mimeHint = file?.type || 'image/png';
+                const imageMime = /^image\//i.test(mimeHint) ? mimeHint : 'image/png';
+                if (rawContent.startsWith('data:')) {
+                    const normalized = normalizeDataUrl(rawContent);
+                    if (/^data:image\/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(normalized)) {
+                        return normalized;
+                    }
+                    try {
+                        const blob = dataUrlToBlob(normalized);
+                        return blob ? normalizeDataUrl(await blobToDataURL(blob)) : '';
+                    } catch {
+                        return '';
+                    }
+                }
+                if (rawContent.startsWith('http://') || rawContent.startsWith('https://')) {
+                    return rawContent;
+                }
+                if (LocalImageManager.isImageId(rawContent) || rawContent.startsWith('asset://') || rawContent.startsWith('blob:')) {
+                    try {
+                        const resolved = await resolveSpecialUrl(rawContent);
+                        if (typeof resolved === 'string' && resolved.startsWith('data:')) {
+                            return normalizeDataUrl(resolved);
+                        }
+                        if (typeof resolved === 'string' && (resolved.startsWith('http://') || resolved.startsWith('https://'))) {
+                            return resolved;
+                        }
+                    } catch { }
+                    try {
+                        const blob = await getBlobFromUrl(rawContent, { useProxy: false });
+                        return blob ? normalizeDataUrl(await blobToDataURL(blob)) : '';
+                    } catch {
+                        return '';
+                    }
+                }
+                const base64Like = /^[A-Za-z0-9+/_=-]+$/.test(rawContent) && rawContent.length > 64;
+                if (base64Like) {
+                    return `data:${imageMime};base64,${normalizeBase64Payload(rawContent)}`;
+                }
+                return '';
+            };
+            const currentContent = [];
+            if (userMessage?.content) currentContent.push({ type: 'text', text: userMessage.content });
+            extraTexts.forEach((text) => {
+                currentContent.push({ type: 'text', text: `\n${text}\n` });
+            });
+
+            for (const file of (Array.isArray(userMessage?.files) ? userMessage.files : [])) {
+                const isGeminiLike = supportsDesignAgent || (config?.modelName ?? '').toLowerCase().includes('gemini');
+                if (file.isImage) {
+                    const imageUrl = await normalizeOpenAIInputImageUrl(file);
+                    if (imageUrl) {
+                        currentContent.push({
+                            type: 'image_url',
+                            image_url: { url: imageUrl }
+                        });
+                    } else {
+                        currentContent.push({
+                            type: 'text',
+                            text: `\n[User attached image could not be converted to a valid image URL: ${file.name || 'image'}]\n`
+                        });
+                    }
+                } else if (file.isVideo) {
+                    if (isGeminiLike) {
+                        const imageUrl = await normalizeOpenAIInputImageUrl(file);
+                        if (imageUrl) {
+                            currentContent.push({
+                                type: 'image_url',
+                                image_url: { url: imageUrl }
+                            });
+                        } else {
+                            currentContent.push({
+                                type: 'text',
+                                text: `\n[User attached video: ${file.name}]\n`
+                            });
+                        }
+                    } else {
+                        currentContent.push({
+                            type: 'text',
+                            text: `\n[User attached video: ${file.name}]\n`
+                        });
+                    }
+                } else if (file.isAudio) {
+                    currentContent.push({
+                        type: 'text',
+                        text: `\n[User attached audio: ${file.name}]\n`
+                    });
+                } else if (file.isPDF || file.isDoc || file.isExcel) {
+                    currentContent.push({
+                        type: 'text',
+                        text: `\n[User attached document: ${file.name} (${file.isPDF ? 'PDF' : file.isDoc ? 'Word' : 'Excel'})]\n`
+                    });
+                } else if (file.isCode || (file.content && typeof file.content === 'string' && file.content.length < 50000)) {
+                    currentContent.push({
+                        type: 'text',
+                        text: `\n[File: ${file.name}]\n\`\`\`${file.fileExt || 'text'}\n${file.content}\n\`\`\`\n`
+                    });
+                } else {
+                    currentContent.push({
+                        type: 'text',
+                        text: `\n[User attached file: ${file.name}]\n`
+                    });
+                }
+            }
+
+            const apiMessages = [
+                {
+                    role: 'system',
+                    content: systemPrompt
+                },
+                ...historyMessages.map((message) => ({
+                    role: message.role === 'assistant' ? 'assistant' : 'user',
+                    content: message.content
+                })),
+                { role: 'user', content: currentContent.length > 0 ? currentContent : [{ type: 'text', text: '继续' }] }
+            ];
+            const convertChatContentToResponsesContent = (content) => {
+                if (typeof content === 'string') return [{ type: 'input_text', text: content }];
+                if (!Array.isArray(content)) return [{ type: 'input_text', text: String(content || '') }];
+                return content.map((part) => {
+                    if (!part || typeof part !== 'object') return null;
+                    if (part.type === 'text') {
+                        return { type: 'input_text', text: String(part.text || '') };
+                    }
+                    if (part.type === 'image_url') {
+                        const imageUrl = typeof part.image_url === 'string'
+                            ? part.image_url
+                            : (part.image_url?.url || part.imageUrl?.url || part.imageUrl || '');
+                        return imageUrl ? { type: 'input_image', image_url: imageUrl } : null;
+                    }
+                    if (part.type === 'input_text' || part.type === 'input_image') return part;
+                    return part.text ? { type: 'input_text', text: String(part.text) } : null;
+                }).filter(Boolean);
+            };
+            const responsesInput = apiMessages.map((message) => ({
+                role: message.role === 'assistant' ? 'assistant' : (message.role === 'system' ? 'system' : 'user'),
+                content: convertChatContentToResponsesContent(message.content)
+            }));
+
+            const contractIssues = validateModelLibraryContract(config || {});
+            const blockingIssue = contractIssues.find((issue) => issue.level === 'error');
+            if (blockingIssue) {
+                throw new Error(`[配置校验阻断] ${blockingIssue.message}`);
+            }
+
+            const fallbackTemplate = getDefaultRequestTemplateForType(config?.type || 'Chat');
+            const requestTemplate = normalizeRequestTemplate(config?.requestTemplate || fallbackTemplate)
+                || normalizeRequestTemplate(fallbackTemplate);
+            if (!requestTemplate?.endpoint) {
+                throw new Error('聊天请求模板未配置 endpoint');
+            }
+            const requestChain = normalizeRequestChain(config?.requestChain);
+            const transportMode = normalizeTransportMode(config?.transport);
+            const transportOptions = normalizeTransportOptions(config?.transportOptions);
+            const requestOverrideEnabled = !!config?.requestOverrideEnabled;
+            const requestOverridePatch = normalizeRequestOverridePatch(config?.requestOverridePatch);
+
+            const templateText = JSON.stringify(requestTemplate || {});
+            const needsBlob = (requestTemplate?.bodyType || '').toLowerCase() === 'multipart'
+                || /:blob\s*}}/.test(templateText);
+            const needsDataUrl = /:blob\s*}}/.test(templateText);
+            const templateVars = {
+                modelName: modelName || chatModelKey,
+                prompt: userMessage?.content || '',
+                input: userMessage?.content || '',
+                responsesInput,
+                responseInput: responsesInput,
+                inputMessages: responsesInput,
+                stream: false,
+                messages: apiMessages,
+                chatMessages: apiMessages,
+                provider: {
+                    key: apiKey,
+                    baseUrl,
+                    id: config?.provider,
+                    useProxy: !!(config?.provider && providers?.[config.provider]?.useProxy)
+                },
+                files: attachmentMetas,
+                attachments: attachmentMetas,
+                fileCount: attachmentMetas.length
+            };
+
+            if (attachmentMetas.length > 0) {
+                const firstAttachment = attachmentMetas[0];
+                templateVars.fileName = firstAttachment.name;
+                templateVars.fileUrl = firstAttachment.url;
+                templateVars.fileDataUrl = firstAttachment.dataUrl;
+                templateVars.fileDataURL = firstAttachment.dataUrl;
+                templateVars.fileUrls = attachmentMetas.map(item => item.url).filter(Boolean);
+                templateVars.fileNames = attachmentMetas.map(item => item.name);
+                attachmentMetas.forEach((attachment) => {
+                    const index = attachment.index;
+                    templateVars[`fileName${index}`] = attachment.name;
+                    templateVars[`file${index}Name`] = attachment.name;
+                    templateVars[`fileUrl${index}`] = attachment.url;
+                    templateVars[`file${index}Url`] = attachment.url;
+                    templateVars[`fileDataUrl${index}`] = attachment.dataUrl;
+                    templateVars[`fileDataURL${index}`] = attachment.dataUrl;
+                    templateVars[`file${index}DataUrl`] = attachment.dataUrl;
+                    templateVars[`file${index}DataURL`] = attachment.dataUrl;
+                });
+            }
+
+            const imageSources = imageAttachments
+                .map((attachment) => attachment.url || attachment.dataUrl)
+                .filter(Boolean);
+            if (imageSources.length > 0) {
+                templateVars.imageUrl = imageSources[0];
+                templateVars.imageUrls = imageSources;
+                templateVars.imagesUrl = imageSources;
+                templateVars.imagesUrls = imageSources;
+                imageSources.forEach((url, idx) => {
+                    const index = idx + 1;
+                    templateVars[`imageUrl${index}`] = url;
+                    templateVars[`image${index}Url`] = url;
+                });
+            }
+
+            if (needsDataUrl && attachmentMetas.length > 0) {
+                const dataUrls = await Promise.all(attachmentMetas.map(async (attachment) => {
+                    if (attachment.dataUrl) return attachment.dataUrl;
+                    if (attachment.url) {
+                        try {
+                            const useProxy = getProxyPreferenceForUrl(attachment.url, false);
+                            const base64 = await getBase64FromUrl(attachment.url, { useProxy });
+                            const mimeType = attachment.type || 'application/octet-stream';
+                            return `data:${mimeType};base64,${base64}`;
+                        } catch {
+                            return '';
+                        }
+                    }
+                    if (attachment.rawContent) {
+                        const blob = new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
+                        try {
+                            return await blobToDataURL(blob);
+                        } catch {
+                            return '';
+                        }
+                    }
+                    return '';
+                }));
+                if (dataUrls.length > 0) {
+                    templateVars.fileDataUrls = dataUrls.filter(Boolean);
+                    dataUrls.forEach((dataUrl, idx) => {
+                        const index = idx + 1;
+                        templateVars[`fileDataUrl${index}`] = dataUrl;
+                        templateVars[`fileDataURL${index}`] = dataUrl;
+                        templateVars[`file${index}DataUrl`] = dataUrl;
+                        templateVars[`file${index}DataURL`] = dataUrl;
+                    });
+                    if (dataUrls[0]) {
+                        templateVars.fileDataUrl = dataUrls[0];
+                        templateVars.fileDataURL = dataUrls[0];
+                    }
+                    const imageDataUrls = dataUrls.filter(Boolean);
+                    if (imageDataUrls.length > 0) {
+                        templateVars.imageDataUrl = imageDataUrls[0];
+                        templateVars.imageDataURL = imageDataUrls[0];
+                        templateVars.imageDataUrls = imageDataUrls;
+                        templateVars.imagesDataUrl = imageDataUrls;
+                        templateVars.imagesDataURL = imageDataUrls;
+                        imageDataUrls.forEach((dataUrl, idx) => {
+                            const index = idx + 1;
+                            templateVars[`imageDataUrl${index}`] = dataUrl;
+                            templateVars[`imageDataURL${index}`] = dataUrl;
+                            templateVars[`image${index}DataUrl`] = dataUrl;
+                            templateVars[`image${index}DataURL`] = dataUrl;
+                        });
+                    }
+                }
+            }
+
+            if (needsBlob && attachmentMetas.length > 0) {
+                const attachmentBlobs = await Promise.all(attachmentMetas.map((attachment) => buildAttachmentBlob(attachment)));
+                templateVars.fileBlob = attachmentBlobs[0] || null;
+                templateVars.fileBlobs = attachmentBlobs.filter(Boolean);
+                attachmentBlobs.forEach((blob, idx) => {
+                    const index = idx + 1;
+                    templateVars[`fileBlob${index}`] = blob;
+                    templateVars[`file${index}Blob`] = blob;
+                });
+
+                const imageBlobs = [];
+                for (const attachment of imageAttachments) {
+                    const blob = await buildAttachmentBlob(attachment);
+                    if (blob) imageBlobs.push(blob);
+                }
+                if (imageBlobs.length > 0) {
+                    templateVars.imageBlob = imageBlobs[0];
+                    templateVars.imageBlobs = imageBlobs;
+                    templateVars.imagesBlob = imageBlobs;
+                    imageBlobs.forEach((blob, idx) => {
+                        const index = idx + 1;
+                        templateVars[`imageBlob${index}`] = blob;
+                        templateVars[`image${index}Blob`] = blob;
+                    });
+                }
+            }
+
+            const requestVars = await runRequestChain(
+                requestChain,
+                templateVars,
+                config?.provider,
+                transportMode,
+                transportOptions
+            );
+            let request = buildRequestFromTemplate(requestTemplate, requestVars, { bodyType: requestTemplate.bodyType });
+            if (!request || !request.url) {
+                throw new Error('聊天请求模板构建失败');
+            }
+            request = requestOverrideEnabled && requestOverridePatch
+                ? applyRequestOverridePatch({ ...request }, requestOverridePatch)
+                : request;
+            const coerceResponsesRequestBody = (body) => {
+                if (!body || typeof body !== 'object' || body instanceof FormData) return body;
+                const nextBody = { ...body };
+                const coerceInputMessages = (messages) => {
+                    if (!Array.isArray(messages)) return messages;
+                    return messages.map((message) => {
+                        if (!message || typeof message !== 'object') return message;
+                        return {
+                            ...message,
+                            content: convertChatContentToResponsesContent(message.content)
+                        };
+                    });
+                };
+                if (Array.isArray(nextBody.input)) {
+                    nextBody.input = coerceInputMessages(nextBody.input);
+                } else if (!nextBody.input && Array.isArray(nextBody.messages)) {
+                    nextBody.input = coerceInputMessages(nextBody.messages);
+                    delete nextBody.messages;
+                }
+                return nextBody;
+            };
+            if (/\/responses(?:\?|$|\/)/i.test(String(request?.url || ''))) {
+                request = {
+                    ...request,
+                    body: coerceResponsesRequestBody(request.body)
+                };
+            }
+
+            const requestHeaders = request?.headers && typeof request.headers === 'object'
+                ? { ...request.headers }
+                : {};
+            if (apiKey && !requestHeaders.Authorization && !requestHeaders.authorization) {
+                requestHeaders.Authorization = `Bearer ${apiKey}`;
+                request = { ...request, headers: requestHeaders };
+            }
+
+            const transportResult = await executeTransportRequest({
+                request,
+                baseUrl,
+                providerKey: config?.provider,
+                transport: transportMode,
+                transportOptions
+            });
+
+            if (!transportResult.ok) {
+                const errorText = transportResult?.data?.message
+                    || transportResult?.data?.error?.message
+                    || transportResult?.errorMessage
+                    || transportResult?.text;
+                throw new Error(errorText || `API Error: ${transportResult.status || 0}`);
+            }
+
+            data = transportResult.data;
+            aiContent = extractModelTextContent(data);
+            if ((!aiContent || String(aiContent).trim() === '') && transportResult.aggregateText) {
+                aiContent = transportResult.aggregateText;
+            }
+            if ((!aiContent || String(aiContent).trim() === '') && data === null && transportResult.text) {
+                aiContent = transportResult.text;
+            }
+        }
+
+        if (aiContent && typeof aiContent !== 'string') {
+            aiContent = JSON.stringify(aiContent);
+        }
+        if (!aiContent || String(aiContent).trim() === '') {
+            console.error('[聊天] API 响应内容为空:', data);
+            aiContent = 'No response';
+        }
+
+        return {
+            data,
+            aiContent: String(aiContent || ''),
+            assistantFiles
+        };
+    }, [
+        getProxyPreferenceForUrl,
+        getBlobFromUrl,
+        getBase64FromUrl,
+        blobToDataURL,
+        resolveSpecialUrl,
+        stripGoogleModelPrefix,
+        buildProxyUrl,
+        parseGeminiAssistantPayload,
+        providers,
+        runRequestChain,
+        executeTransportRequest
+    ]);
+
+    const sendChatMessage = async (options = {}) => {
+        const inputOverride = typeof options === 'string' ? options : options?.input;
+        const filesOverride = Array.isArray(options?.files) ? options.files : null;
+        const rawInputSeed = inputOverride !== undefined ? String(inputOverride || '') : String(chatInput || '');
+        const manualFilesSeed = filesOverride !== null ? filesOverride : [...chatFiles];
+        if ((!rawInputSeed.trim() && manualFilesSeed.length === 0) || isChatSending) return;
 
         const config = currentChatModelConfig || getApiConfigByKey(chatModel);
         const { key: apiKey, url: baseUrl, modelName } = getApiCredentials(chatModel);
@@ -14009,8 +15363,8 @@ function TapnowApp() {
 
         setIsChatSending(true);
 
-        const rawUserInput = chatInput;
-        const manualFiles = [...chatFiles];
+        const rawUserInput = rawInputSeed;
+        const manualFiles = manualFilesSeed;
         let urlAutoContext = { files: [], extraTexts: [], pages: [] };
         try {
             urlAutoContext = await buildChatUrlAutoContext(rawUserInput, manualFiles);
@@ -14064,6 +15418,14 @@ function TapnowApp() {
         const historyMessages = currentSessionMessages.length > MAX_HISTORY_MESSAGES
             ? currentSessionMessages.slice(-MAX_HISTORY_MESSAGES)
             : currentSessionMessages;
+        const modelHistoryMessages = historyMessages.map((message) => {
+            if (message?.role !== 'assistant') return message;
+            const envelope = resolveChatAssistantEnvelopeInput(message);
+            return {
+                ...message,
+                content: envelope.rawText || message.content || ''
+            };
+        });
         const chatTargetImageModelKey = preferredWorkflowImageModel;
         const chatTargetImageModelConfig = getApiConfigByKey(chatTargetImageModelKey);
         const agentSystemPrompt = buildAdaptiveChatSystemPrompt(chatIntentRoute, {
@@ -14073,501 +15435,122 @@ function TapnowApp() {
             imageModelId: chatTargetImageModelConfig?.id || chatTargetImageModelKey,
             imageModelLabel: chatTargetImageModelConfig
                 ? `${chatTargetImageModelConfig.displayName || chatTargetImageModelConfig.modelName || chatTargetImageModelConfig.id}${chatTargetImageModelConfig.provider ? ` / ${chatTargetImageModelConfig.provider}` : ''}`
-                : chatTargetImageModelKey
+                : chatTargetImageModelKey,
+            runtimeTools: currentChatRuntimeTools
         });
 
         try {
-            const parseChatContent = (payload) => {
-                if (!payload || typeof payload !== 'object') return null;
-                const primaryMessage = payload?.choices?.[0]?.message || payload?.data?.choices?.[0]?.message;
-                if (primaryMessage?.content !== undefined) {
-                    if (Array.isArray(primaryMessage.content)) {
-                        return primaryMessage.content
-                            .map(part => (typeof part?.text === 'string' ? part.text : ''))
-                            .filter(Boolean)
-                            .join('\n');
-                    }
-                    return primaryMessage.content;
-                }
-                if (payload.content !== undefined) return payload.content;
-                if (payload.text !== undefined) return payload.text;
-                if (payload.message !== undefined) {
-                    return typeof payload.message === 'string' ? payload.message : payload.message?.content;
-                }
-                if (payload.result !== undefined) {
-                    return typeof payload.result === 'string' ? payload.result : payload.result?.content;
-                }
-                if (payload.data?.content !== undefined) return payload.data.content;
-                if (payload.data?.text !== undefined) return payload.data.text;
-                if (payload.data?.message !== undefined) {
-                    return typeof payload.data.message === 'string' ? payload.data.message : payload.data.message?.content;
-                }
-                if (payload.data?.result !== undefined) {
-                    return typeof payload.data.result === 'string' ? payload.data.result : payload.data.result?.content;
-                }
-                return null;
-            };
+            let finalData = null;
+            let finalAiContent = '';
+            let finalAssistantFiles = [];
+            let finalEnvelope = null;
+            const toolRuns = [];
+            const seenToolRequestSignatures = new Set();
+            let roundHistoryMessages = modelHistoryMessages;
+            let roundUserMessage = newUserMsg;
+            let roundExtraTexts = [
+                ...(canvasContext?.text ? [`[画布上下文]\n${canvasContext.text}`] : []),
+                ...urlAutoContext.extraTexts
+            ];
+            const maxRounds = currentChatRuntimeTools.length > 0 ? 3 : 1;
 
-            const attachmentMetas = effectiveFiles.map((file, idx) => {
-                const rawContent = typeof file?.content === 'string' ? file.content : '';
-                const isDataUrl = rawContent.startsWith('data:');
-                const isHttpUrl = rawContent.startsWith('http://') || rawContent.startsWith('https://');
-                return {
-                    index: idx + 1,
-                    name: file?.name || `file-${idx + 1}`,
-                    type: file?.type || 'application/octet-stream',
-                    fileExt: file?.fileExt || '',
-                    isImage: !!file?.isImage,
-                    isVideo: !!file?.isVideo,
-                    isAudio: !!file?.isAudio,
-                    isPDF: !!file?.isPDF,
-                    isDoc: !!file?.isDoc,
-                    isExcel: !!file?.isExcel,
-                    isCode: !!file?.isCode,
-                    rawContent,
-                    url: isDataUrl || isHttpUrl ? rawContent : '',
-                    dataUrl: isDataUrl ? rawContent : ''
-                };
-            });
-            const buildAttachmentBlob = async (attachment) => {
-                if (!attachment) return null;
-                if (attachment.dataUrl) {
-                    try {
-                        return dataUrlToBlob(attachment.dataUrl);
-                    } catch {
-                        return null;
-                    }
-                }
-                if (attachment.url) {
-                    try {
-                        const useProxy = getProxyPreferenceForUrl(attachment.url, false);
-                        return await getBlobFromUrl(attachment.url, { useProxy });
-                    } catch {
-                        return null;
-                    }
-                }
-                if (attachment.rawContent) {
-                    return new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
-                }
-                return null;
-            };
-            const imageAttachments = attachmentMetas.filter((attachment) => attachment.isImage || attachment.isVideo);
-
-            let data = null;
-            let aiContent = '';
-            let assistantFiles = [];
-
-            if (currentChatUsesOfficialGemini) {
-                const buildGeminiFilePart = async (file) => {
-                    if (!file?.isImage || !file?.content) return null;
-                    const rawContent = String(file.content || '');
-                    try {
-                        if (rawContent.startsWith('data:')) {
-                            const normalized = normalizeDataUrl(rawContent);
-                            const mimeMatch = normalized.match(/^data:([^;,]+)[;,]/i);
-                            return {
-                                inline_data: {
-                                    mime_type: mimeMatch?.[1] || file.type || 'image/png',
-                                    data: normalized.split(',')[1] || ''
-                                }
-                            };
-                        }
-                        const useProxy = getProxyPreferenceForUrl(rawContent, false);
-                        const base64 = await getBase64FromUrl(rawContent, { useProxy });
-                        return {
-                            inline_data: {
-                                mime_type: file.type || 'image/png',
-                                data: base64
-                            }
-                        };
-                    } catch {
-                        return null;
-                    }
-                };
-                const buildGeminiFallbackText = (file) => {
-                    if (file?.isVideo) return `[附加视频素材: ${file.canvasRef || file.name || 'video'}]`;
-                    if (file?.isAudio) return `[附加音频素材: ${file.name || 'audio'}]`;
-                    if (file?.isPDF || file?.isDoc || file?.isExcel) return `[附加文档: ${file.name || 'document'}]`;
-                    if (file?.isCode || (file?.content && typeof file.content === 'string' && file.content.length < 50000)) {
-                        return `\n[文件: ${file.name}]\n\`\`\`${file.fileExt || 'text'}\n${file.content}\n\`\`\`\n`;
-                    }
-                    return `[附加文件: ${file?.name || 'file'}]`;
-                };
-                const buildGeminiParts = async (message, extraTexts = [], includeFiles = false) => {
-                    const parts = [];
-                    if (message?.content) parts.push({ text: String(message.content) });
-                    (Array.isArray(extraTexts) ? extraTexts : []).filter(Boolean).forEach((text) => {
-                        parts.push({ text: String(text) });
-                    });
-                    if (includeFiles) {
-                        for (const file of (Array.isArray(message?.files) ? message.files : [])) {
-                            const inlinePart = await buildGeminiFilePart(file);
-                            if (inlinePart) {
-                                parts.push(inlinePart);
-                            } else {
-                                parts.push({ text: buildGeminiFallbackText(file) });
-                            }
-                        }
-                    } else if (!message?.content && Array.isArray(message?.files) && message.files.length > 0) {
-                        parts.push({ text: `[${message.files.length} 个多模态素材已在前文提供]` });
-                    }
-                    return parts.length > 0 ? parts : [{ text: '继续' }];
-                };
-
-                const geminiContents = [];
-                for (const message of historyMessages) {
-                    geminiContents.push({
-                        role: message.role === 'assistant' ? 'model' : 'user',
-                        parts: await buildGeminiParts(message, [], false)
-                    });
-                }
-                const currentGeminiParts = await buildGeminiParts(
-                    newUserMsg,
-                    [
-                        ...(canvasContext?.text ? [`\n[画布上下文]\n${canvasContext.text}`] : []),
-                        ...urlAutoContext.extraTexts
-                    ],
-                    true
-                );
-                const requestBody = {
-                    systemInstruction: {
-                        parts: [{ text: agentSystemPrompt }]
-                    },
-                    contents: [
-                        ...geminiContents,
-                        { role: 'user', parts: currentGeminiParts }
-                    ]
-                };
-                if (chatGeminiSearchEnabled && currentChatSupportsDesignAgent) {
-                    requestBody.tools = [{ google_search: {} }];
-                }
-                if (chatGeminiThinkingEnabled && currentChatSupportsDesignAgent) {
-                    requestBody.generationConfig = {
-                        thinkingConfig: {
-                            thinkingBudget: CHAT_GEMINI_THINKING_BUDGET
-                        }
-                    };
-                }
-
-                const geminiModelName = stripGoogleModelPrefix(modelName || config?.modelName || config?.id || chatModel);
-                const requestUrl = `${String(baseUrl || '').replace(/\/+$/, '')}/v1beta/models/${encodeURIComponent(geminiModelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-                const targetUrl = config?.provider ? buildProxyUrl(requestUrl, config.provider) : requestUrl;
-                const response = await fetch(targetUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Accept: 'application/json'
-                    },
-                    body: JSON.stringify(requestBody)
-                });
-                const rawText = await response.text();
-                try {
-                    data = rawText ? JSON.parse(rawText) : null;
-                } catch {
-                    data = null;
-                }
-                if (!response.ok) {
-                    throw new Error(
-                        data?.error?.message
-                        || data?.message
-                        || rawText
-                        || `API Error: ${response.status || 0}`
-                    );
-                }
-                const parsedGemini = parseGeminiAssistantPayload(data);
-                aiContent = parsedGemini.text;
-                assistantFiles = parsedGemini.files;
-            } else {
-                const currentContent = [];
-                if (newUserMsg.content) currentContent.push({ type: 'text', text: newUserMsg.content });
-                if (canvasContext?.text) {
-                    currentContent.push({ type: 'text', text: `\n[画布上下文]\n${canvasContext.text}\n` });
-                }
-                urlAutoContext.extraTexts.forEach((text) => {
-                    currentContent.push({ type: 'text', text: `\n${text}\n` });
-                });
-
-                effectiveFiles.forEach((file) => {
-                    const isGeminiLike = currentChatSupportsDesignAgent || (config?.modelName ?? '').toLowerCase().includes('gemini');
-                    if (file.isImage) {
-                        currentContent.push({
-                            type: 'image_url',
-                            image_url: { url: file.content }
-                        });
-                    } else if (file.isVideo) {
-                        if (isGeminiLike) {
-                            currentContent.push({
-                                type: 'image_url',
-                                image_url: { url: file.content }
-                            });
-                        } else {
-                            currentContent.push({
-                                type: 'text',
-                                text: `\n[User attached video: ${file.name}]\n`
-                            });
-                        }
-                    } else if (file.isAudio) {
-                        currentContent.push({
-                            type: 'text',
-                            text: `\n[User attached audio: ${file.name}]\n`
-                        });
-                    } else if (file.isPDF || file.isDoc || file.isExcel) {
-                        currentContent.push({
-                            type: 'text',
-                            text: `\n[User attached document: ${file.name} (${file.isPDF ? 'PDF' : file.isDoc ? 'Word' : 'Excel'})]\n`
-                        });
-                    } else if (file.isCode || (file.content && typeof file.content === 'string' && file.content.length < 50000)) {
-                        currentContent.push({
-                            type: 'text',
-                            text: `\n[File: ${file.name}]\n\`\`\`${file.fileExt || 'text'}\n${file.content}\n\`\`\`\n`
-                        });
-                    } else {
-                        currentContent.push({
-                            type: 'text',
-                            text: `\n[User attached file: ${file.name}]\n`
-                        });
-                    }
-                });
-
-                const apiMessages = [
-                    {
-                        role: 'system',
-                        content: agentSystemPrompt
-                    },
-                    ...historyMessages.map(m => ({
-                        role: m.role,
-                        content: m.content
-                    })),
-                    { role: 'user', content: currentContent }
-                ];
-
-                const contractIssues = validateModelLibraryContract(config || {});
-                const blockingIssue = contractIssues.find((issue) => issue.level === 'error');
-                if (blockingIssue) {
-                    throw new Error(`[配置校验阻断] ${blockingIssue.message}`);
-                }
-
-                const fallbackTemplate = getDefaultRequestTemplateForType(config?.type || 'Chat');
-                const requestTemplate = normalizeRequestTemplate(config?.requestTemplate || fallbackTemplate)
-                    || normalizeRequestTemplate(fallbackTemplate);
-                if (!requestTemplate?.endpoint) {
-                    throw new Error('聊天请求模板未配置 endpoint');
-                }
-                const requestChain = normalizeRequestChain(config?.requestChain);
-                const transportMode = normalizeTransportMode(config?.transport);
-                const transportOptions = normalizeTransportOptions(config?.transportOptions);
-                const requestOverrideEnabled = !!config?.requestOverrideEnabled;
-                const requestOverridePatch = normalizeRequestOverridePatch(config?.requestOverridePatch);
-
-                const templateText = JSON.stringify(requestTemplate || {});
-                const needsBlob = (requestTemplate?.bodyType || '').toLowerCase() === 'multipart'
-                    || /:blob\s*}}/.test(templateText);
-                const needsDataUrl = /:blob\s*}}/.test(templateText);
-                const templateVars = {
-                    modelName: modelName || chatModel,
-                    prompt: newUserMsg.content || '',
-                    input: newUserMsg.content || '',
-                    stream: false,
-                    messages: apiMessages,
-                    chatMessages: apiMessages,
-                    provider: {
-                        key: apiKey,
-                        baseUrl,
-                        id: config?.provider,
-                        useProxy: !!(config?.provider && providers?.[config.provider]?.useProxy)
-                    },
-                    files: attachmentMetas,
-                    attachments: attachmentMetas,
-                    fileCount: attachmentMetas.length
-                };
-
-                if (canvasContext?.text) {
-                    templateVars.canvasContext = canvasContext.text;
-                    templateVars.canvasNodes = canvasContext.nodes;
-                    templateVars.canvasAssets = canvasContext.assets;
-                }
-
-                if (attachmentMetas.length > 0) {
-                    const firstAttachment = attachmentMetas[0];
-                    templateVars.fileName = firstAttachment.name;
-                    templateVars.fileUrl = firstAttachment.url;
-                    templateVars.fileDataUrl = firstAttachment.dataUrl;
-                    templateVars.fileDataURL = firstAttachment.dataUrl;
-                    templateVars.fileUrls = attachmentMetas.map(item => item.url).filter(Boolean);
-                    templateVars.fileNames = attachmentMetas.map(item => item.name);
-
-                    attachmentMetas.forEach((attachment) => {
-                        const index = attachment.index;
-                        templateVars[`fileName${index}`] = attachment.name;
-                        templateVars[`file${index}Name`] = attachment.name;
-                        templateVars[`fileUrl${index}`] = attachment.url;
-                        templateVars[`file${index}Url`] = attachment.url;
-                        templateVars[`fileDataUrl${index}`] = attachment.dataUrl;
-                        templateVars[`fileDataURL${index}`] = attachment.dataUrl;
-                        templateVars[`file${index}DataUrl`] = attachment.dataUrl;
-                        templateVars[`file${index}DataURL`] = attachment.dataUrl;
-                    });
-                }
-
-                const imageSources = imageAttachments
-                    .map((attachment) => attachment.url || attachment.dataUrl)
-                    .filter(Boolean);
-                if (imageSources.length > 0) {
-                    templateVars.imageUrl = imageSources[0];
-                    templateVars.imageUrls = imageSources;
-                    templateVars.imagesUrl = imageSources;
-                    templateVars.imagesUrls = imageSources;
-                    imageSources.forEach((url, idx) => {
-                        const index = idx + 1;
-                        templateVars[`imageUrl${index}`] = url;
-                        templateVars[`image${index}Url`] = url;
-                    });
-                }
-
-                if (needsDataUrl && attachmentMetas.length > 0) {
-                    const dataUrls = await Promise.all(attachmentMetas.map(async (attachment) => {
-                        if (attachment.dataUrl) return attachment.dataUrl;
-                        if (attachment.url) {
-                            try {
-                                const useProxy = getProxyPreferenceForUrl(attachment.url, false);
-                                const base64 = await getBase64FromUrl(attachment.url, { useProxy });
-                                const mimeType = attachment.type || 'application/octet-stream';
-                                return `data:${mimeType};base64,${base64}`;
-                            } catch {
-                                return '';
-                            }
-                        }
-                        if (attachment.rawContent) {
-                            const blob = new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
-                            try {
-                                return await blobToDataURL(blob);
-                            } catch {
-                                return '';
-                            }
-                        }
-                        return '';
-                    }));
-                    if (dataUrls.length > 0) {
-                        templateVars.fileDataUrls = dataUrls.filter(Boolean);
-                        dataUrls.forEach((dataUrl, idx) => {
-                            const index = idx + 1;
-                            templateVars[`fileDataUrl${index}`] = dataUrl;
-                            templateVars[`fileDataURL${index}`] = dataUrl;
-                            templateVars[`file${index}DataUrl`] = dataUrl;
-                            templateVars[`file${index}DataURL`] = dataUrl;
-                        });
-                        if (dataUrls[0]) {
-                            templateVars.fileDataUrl = dataUrls[0];
-                            templateVars.fileDataURL = dataUrls[0];
-                        }
-                        const imageDataUrls = dataUrls.filter(Boolean);
-                        if (imageDataUrls.length > 0) {
-                            templateVars.imageDataUrl = imageDataUrls[0];
-                            templateVars.imageDataURL = imageDataUrls[0];
-                            templateVars.imageDataUrls = imageDataUrls;
-                            templateVars.imagesDataUrl = imageDataUrls;
-                            templateVars.imagesDataURL = imageDataUrls;
-                            imageDataUrls.forEach((dataUrl, idx) => {
-                                const index = idx + 1;
-                                templateVars[`imageDataUrl${index}`] = dataUrl;
-                                templateVars[`imageDataURL${index}`] = dataUrl;
-                                templateVars[`image${index}DataUrl`] = dataUrl;
-                                templateVars[`image${index}DataURL`] = dataUrl;
-                            });
-                        }
-                    }
-                }
-
-                if (needsBlob && attachmentMetas.length > 0) {
-                    const attachmentBlobs = await Promise.all(attachmentMetas.map((attachment) => buildAttachmentBlob(attachment)));
-                    templateVars.fileBlob = attachmentBlobs[0] || null;
-                    templateVars.fileBlobs = attachmentBlobs.filter(Boolean);
-                    attachmentBlobs.forEach((blob, idx) => {
-                        const index = idx + 1;
-                        templateVars[`fileBlob${index}`] = blob;
-                        templateVars[`file${index}Blob`] = blob;
-                    });
-
-                    const imageBlobs = [];
-                    for (const attachment of imageAttachments) {
-                        const blob = await buildAttachmentBlob(attachment);
-                        if (blob) imageBlobs.push(blob);
-                    }
-                    if (imageBlobs.length > 0) {
-                        templateVars.imageBlob = imageBlobs[0];
-                        templateVars.imageBlobs = imageBlobs;
-                        templateVars.imagesBlob = imageBlobs;
-                        imageBlobs.forEach((blob, idx) => {
-                            const index = idx + 1;
-                            templateVars[`imageBlob${index}`] = blob;
-                            templateVars[`image${index}Blob`] = blob;
-                        });
-                    }
-                }
-
-                const requestVars = await runRequestChain(
-                    requestChain,
-                    templateVars,
-                    config?.provider,
-                    transportMode,
-                    transportOptions
-                );
-                let request = buildRequestFromTemplate(requestTemplate, requestVars, { bodyType: requestTemplate.bodyType });
-                if (!request || !request.url) {
-                    throw new Error('聊天请求模板构建失败');
-                }
-                request = requestOverrideEnabled && requestOverridePatch
-                    ? applyRequestOverridePatch({ ...request }, requestOverridePatch)
-                    : request;
-
-                const requestHeaders = request?.headers && typeof request.headers === 'object'
-                    ? { ...request.headers }
-                    : {};
-                if (apiKey && !requestHeaders.Authorization && !requestHeaders.authorization) {
-                    requestHeaders.Authorization = `Bearer ${apiKey}`;
-                    request = { ...request, headers: requestHeaders };
-                }
-
-                const transportResult = await executeTransportRequest({
-                    request,
+            for (let roundIndex = 0; roundIndex < maxRounds; roundIndex += 1) {
+                const roundResult = await runChatAssistantCompletion({
+                    config,
+                    apiKey,
                     baseUrl,
-                    providerKey: config?.provider,
-                    transport: transportMode,
-                    transportOptions
+                    modelName,
+                    chatModelKey: chatModel,
+                    systemPrompt: agentSystemPrompt,
+                    historyMessages: roundHistoryMessages,
+                    userMessage: roundUserMessage,
+                    extraTexts: roundExtraTexts,
+                    usesOfficialGemini: currentChatUsesOfficialGemini,
+                    supportsDesignAgent: currentChatSupportsDesignAgent,
+                    enableGeminiSearch: chatGeminiSearchEnabled,
+                    enableGeminiThinking: chatGeminiThinkingEnabled
                 });
+                finalData = roundResult.data;
+                finalAiContent = roundResult.aiContent;
+                finalAssistantFiles = roundResult.assistantFiles;
+                finalEnvelope = parseChatAssistantEnvelope(finalAiContent);
 
-                if (!transportResult.ok) {
-                    const errorText = transportResult?.data?.message
-                        || transportResult?.data?.error?.message
-                        || transportResult?.errorMessage
-                        || transportResult?.text;
-                    throw new Error(errorText || `API Error: ${transportResult.status || 0}`);
-                }
+                const toolRequests = normalizeChatToolRequests(finalEnvelope?.meta?.toolRequests || []);
+                const toolRequestSignature = JSON.stringify(toolRequests.map((request) => ({
+                    tool: request.tool,
+                    args: request.args || {}
+                })));
+                const shouldRunTools = (
+                    toolRequests.length > 0
+                    && currentChatRuntimeTools.length > 0
+                    && roundIndex < maxRounds - 1
+                    && !seenToolRequestSignatures.has(toolRequestSignature)
+                );
 
-                data = transportResult.data;
-                aiContent = parseChatContent(data);
-                if ((!aiContent || String(aiContent).trim() === '') && transportResult.aggregateText) {
-                    aiContent = transportResult.aggregateText;
-                }
-                if ((!aiContent || String(aiContent).trim() === '') && data === null && transportResult.text) {
-                    aiContent = transportResult.text;
-                }
+                if (!shouldRunTools) break;
+
+                seenToolRequestSignatures.add(toolRequestSignature);
+                const toolExecution = await executeChatRuntimeToolRequests(toolRequests, currentChatRuntimeTools, {
+                    chatId: chatIdToUse,
+                    messageId: newUserMsg.id,
+                    modelId: chatModel,
+                    userInput: rawUserInput,
+                    displayText: finalEnvelope?.displayText || '',
+                    rawAssistantText: finalEnvelope?.rawText || finalAiContent || ''
+                });
+                const toolResults = Array.isArray(toolExecution?.results) ? toolExecution.results : [];
+                toolRuns.push(...toolResults);
+                roundHistoryMessages = [
+                    ...roundHistoryMessages,
+                    {
+                        role: 'assistant',
+                        content: finalEnvelope?.rawText || finalAiContent || ''
+                    },
+                    {
+                        role: 'user',
+                        content: formatChatRuntimeToolResultsForModel(toolResults)
+                    }
+                ];
+                roundUserMessage = {
+                    role: 'user',
+                    content: '请基于上面的宿主工具结果继续完成最终回答。除非确实缺关键数据，否则不要再次请求同一工具。',
+                    files: []
+                };
+                roundExtraTexts = [];
+                finalAssistantFiles = [];
             }
 
-            if (aiContent && typeof aiContent !== 'string') {
-                aiContent = JSON.stringify(aiContent);
+            const finalMeta = normalizeChatAssistantMeta(finalEnvelope?.meta || null);
+            const fallbackDisplayText = buildChatAssistantDisplayFallback(finalMeta);
+            let finalDisplayText = String(finalEnvelope?.displayText || '').trim();
+            if (
+                (!finalDisplayText || finalDisplayText === fallbackDisplayText)
+                && toolRuns.length > 0
+                && (finalMeta?.toolRequests || []).length > 0
+            ) {
+                const failedToolRuns = toolRuns.filter((item) => item?.success === false);
+                finalDisplayText = failedToolRuns.length > 0
+                    ? `工具执行未完成：${failedToolRuns.map((item) => `${item.tool || item.requestId || 'tool'} ${item.error || '失败'}`).join('；')}`
+                    : '工具已执行完成，但模型没有返回最终说明，你可以重试一次。';
             }
-            if (!aiContent || aiContent.trim() === '') {
-                console.error('[聊天] API 响应内容为空:', data);
-                aiContent = 'No response';
-            }
-            const assistantActions = evaluateChatAssistantActions(aiContent, newUserMsg);
+            const finalWorkflowPayload = extractChatAssistantWorkflowPayload(finalMeta);
+            const assistantActions = evaluateChatAssistantActions({
+                content: finalDisplayText || finalAiContent,
+                rawContent: finalEnvelope?.rawText || finalAiContent,
+                assistantMeta: finalMeta,
+                workflowPayload: finalWorkflowPayload
+            }, newUserMsg);
 
             const newAssistantMsg = {
                 id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                 role: 'assistant',
-                content: aiContent,
-                files: assistantFiles.length > 0 ? assistantFiles : undefined,
+                content: finalDisplayText || finalAiContent,
+                rawContent: finalEnvelope?.rawText || finalAiContent,
+                assistantMeta: finalMeta,
+                workflowPayload: finalWorkflowPayload || null,
+                suggestedReplies: finalMeta?.suggestedReplies || [],
+                files: finalAssistantFiles.length > 0 ? finalAssistantFiles : undefined,
+                toolRuns: toolRuns.length > 0 ? toolRuns : undefined,
                 intentMode: chatIntentRoute.mode,
                 canCreateWorkflow: assistantActions.canCreateWorkflow,
                 canSyncPrompt: assistantActions.canSyncPrompt,
@@ -14582,9 +15565,10 @@ function TapnowApp() {
                 return s;
             }));
 
+            const assistantRawText = finalEnvelope?.rawText || finalAiContent;
             const chatImageUrls = [
-                ...assistantFiles.filter(file => file?.isImage).map(file => file.content),
-                ...extractChatImageUrls(data || {}, aiContent)
+                ...finalAssistantFiles.filter(file => file?.isImage).map(file => file.content),
+                ...extractChatImageUrls(finalData || {}, assistantRawText)
             ].filter((url, index, arr) => !!url && arr.indexOf(url) === index);
             if (chatImageUrls.length > 0) {
                 const now = Date.now();
@@ -17784,8 +18768,8 @@ function TapnowApp() {
             });
     };
 
-    // 处理蒙版用于 Inpainting：将"透明背景上的白色笔触"转换为"白色背景上的透明区域"
-    const processMaskForInpainting = async (maskContent) => {
+    // 处理蒙版用于 Inpainting：将"透明背景上的白色笔触"转换为"不透明保留区 + 透明编辑区"的 PNG
+    const processMaskForInpainting = async (maskContent, sourceImageUrl = '', sourceDimensions = null, options = {}) => {
         if (!maskContent) return null;
 
         try {
@@ -17798,10 +18782,41 @@ function TapnowApp() {
                 maskImg.src = maskContent;
             });
 
-            // 创建新 Canvas
+            let targetWidth = Math.round(Number(sourceDimensions?.w || sourceDimensions?.width || 0));
+            let targetHeight = Math.round(Number(sourceDimensions?.h || sourceDimensions?.height || 0));
+            if ((!targetWidth || !targetHeight) && sourceImageUrl) {
+                try {
+                    const dims = await getImageDimensions(sourceImageUrl);
+                    targetWidth = Math.round(Number(dims?.w || 0));
+                    targetHeight = Math.round(Number(dims?.h || 0));
+                } catch (error) {
+                    console.warn('[Inpainting] 无法读取原图尺寸，回退到蒙版尺寸:', error);
+                }
+            }
+            if (!targetWidth || !targetHeight) {
+                targetWidth = maskImg.naturalWidth || maskImg.width;
+                targetHeight = maskImg.naturalHeight || maskImg.height;
+            }
+
+            const maskCanvas = document.createElement('canvas');
+            maskCanvas.width = targetWidth;
+            maskCanvas.height = targetHeight;
+            const maskCtx = maskCanvas.getContext('2d');
+            maskCtx.clearRect(0, 0, targetWidth, targetHeight);
+            maskCtx.drawImage(maskImg, 0, 0, targetWidth, targetHeight);
+            const maskImageData = maskCtx.getImageData(0, 0, targetWidth, targetHeight);
+            for (let i = 0; i < maskImageData.data.length; i += 4) {
+                const alpha = maskImageData.data[i + 3];
+                maskImageData.data[i] = 255;
+                maskImageData.data[i + 1] = 255;
+                maskImageData.data[i + 2] = 255;
+                maskImageData.data[i + 3] = alpha > 4 ? 255 : 0;
+            }
+            maskCtx.putImageData(maskImageData, 0, 0);
+
             const canvas = document.createElement('canvas');
-            canvas.width = maskImg.width;
-            canvas.height = maskImg.height;
+            canvas.width = targetWidth;
+            canvas.height = targetHeight;
             const ctx = canvas.getContext('2d');
 
             // 填充黑色背景（代表保留区域，不透明 Alpha=1）
@@ -17810,7 +18825,24 @@ function TapnowApp() {
 
             // 使用 destination-out 混合模式：绘制原蒙版，将用户涂抹的区域"挖空"变成透明（代表重绘区域，Alpha=0）
             ctx.globalCompositeOperation = 'destination-out';
-            ctx.drawImage(maskImg, 0, 0);
+            const requestedExpandPx = Number(options.expandPx);
+            const expandPx = clampNumber(
+                Number.isFinite(requestedExpandPx)
+                    ? Math.round(requestedExpandPx)
+                    : Math.round(Math.min(targetWidth, targetHeight) * 0.003),
+                0,
+                16
+            );
+            if (expandPx > 0) {
+                for (let dx = -expandPx; dx <= expandPx; dx += 1) {
+                    for (let dy = -expandPx; dy <= expandPx; dy += 1) {
+                        if ((dx * dx) + (dy * dy) <= expandPx * expandPx) {
+                            ctx.drawImage(maskCanvas, dx, dy);
+                        }
+                    }
+                }
+            }
+            ctx.drawImage(maskCanvas, 0, 0);
 
             // 将 Canvas 转换为 Blob（PNG 格式保留透明度）
             return new Promise((resolve, reject) => {
@@ -17877,6 +18909,7 @@ function TapnowApp() {
         // 处理蒙版：先检查当前节点，如果没有则从上游节点查找
         let finalMaskBlob = null;
         let finalMaskContent = node?.maskContent;
+        let finalMaskSourceNode = finalMaskContent ? node : null;
         if (!finalMaskContent) {
             // 查找连接到当前节点的源节点（优先查找 default 输入，如果没有则查找所有输入）
             let incomingConn = connections.find(c => c.to === nodeId && (!c.inputType || c.inputType === 'default'));
@@ -17889,6 +18922,7 @@ function TapnowApp() {
                 const sourceNode = nodesMap.get(incomingConn.from);
                 if (sourceNode && sourceNode.maskContent) {
                     finalMaskContent = sourceNode.maskContent;
+                    finalMaskSourceNode = sourceNode;
                 }
             }
         } else {
@@ -17896,7 +18930,18 @@ function TapnowApp() {
 
         // 如果存在蒙版，处理蒙版（反转逻辑）
         if (finalMaskContent) {
-            finalMaskBlob = await processMaskForInpainting(finalMaskContent);
+            const maskSourceImage = String(finalMaskSourceNode?.content || sourceImage || '').trim();
+            const maskSourceDimensions = finalMaskSourceNode?.dimensions || node?.dimensions || null;
+            const maskPreset = String(
+                options.sourceEditPreset
+                || node?.settings?.sourceEditPreset
+                || finalMaskSourceNode?.settings?.editWorkbench?.preset
+                || node?.settings?.editWorkbench?.preset
+                || ''
+            ).toLowerCase();
+            finalMaskBlob = await processMaskForInpainting(finalMaskContent, maskSourceImage, maskSourceDimensions, {
+                expandPx: maskPreset === 'text-rewrite' ? 1 : 3
+            });
             if (finalMaskBlob) {
             } else {
                 console.warn('[Inpainting] 蒙版处理失败，将使用原始蒙版');
@@ -18490,29 +19535,85 @@ function TapnowApp() {
                 const imageSizeFlag = getImageSizeFlag();
                 const hasExplicitSize = isExplicitImageResolution(resolution);
                 const aspect = ratio === 'Auto' || hasExplicitSize ? undefined : ratio;
+                const resolvedImageModelName = config?.modelName || modelId;
+                const isOpenAIGptImage2 = isOpenAIGptImage2ModelId(resolvedImageModelName) || isOpenAIGptImage2ModelId(modelId);
+                const isOfficialOpenAIGptImage = isOpenAIGptImageModelId(resolvedImageModelName) || isOpenAIGptImageModelId(modelId);
+                const normalizeOpenAIImageSize = () => {
+                    const normalized = String(sizeStr || '').trim();
+                    return normalized || 'auto';
+                };
+                const appendOpenAIGptImageOptions = (target) => {
+                    if (!target) return;
+                    const append = (key, value) => {
+                        if (value === undefined || value === null || value === '') return;
+                        if (target instanceof FormData) target.append(key, String(value));
+                        else target[key] = value;
+                    };
+                    append('n', requestedImageCountForSubmit);
+                    append('size', normalizeOpenAIImageSize());
+                    append('quality', 'auto');
+                    append('output_format', 'png');
+                    if (!isOpenAIGptImage2) append('background', 'auto');
+                };
+                const buildOpenAIGptImageRequest = async (fallbackPrompt = '') => {
+                    const refs = connectedImages.length > 0
+                        ? connectedImages
+                        : (sourceImage ? [sourceImage] : []);
+                    const modelNameForRequest = resolvedImageModelName || 'gpt-image-2';
+                    const promptForRequest = prompt || fallbackPrompt || t('生成图片');
+                    if (finalMaskBlob && refs.length === 0) {
+                        throw new Error('OpenAI 图片编辑需要先连接参考图，再使用蒙版。');
+                    }
+                    if (refs.length > 0 || finalMaskBlob) {
+                        endpoint = `${baseUrl}/v1/images/edits`;
+                        useMultipart = true;
+                        const formData = new FormData();
+                        formData.append('model', modelNameForRequest);
+                        formData.append('prompt', promptForRequest);
+                        appendOpenAIGptImageOptions(formData);
+                        const blobs = await Promise.all(refs.map((url) => getBlobFromUrl(url, { useProxy: resolveSourceProxy(url) })));
+                        blobs.forEach((blob, index) => {
+                            formData.append('image[]', blob, `input_${index + 1}.png`);
+                        });
+                        if (finalMaskBlob) formData.append('mask', finalMaskBlob, 'mask.png');
+                        return formData;
+                    }
+                    endpoint = `${baseUrl}/v1/images/generations`;
+                    useMultipart = false;
+                    const jsonBody = {
+                        model: modelNameForRequest,
+                        prompt: promptForRequest
+                    };
+                    appendOpenAIGptImageOptions(jsonBody);
+                    return jsonBody;
+                };
 
                 // --- 核心逻辑分支 ---
 
                 // 0. Chat Image (使用 Chat 格式返回图片)
                 if (isChatImage) {
-                    endpoint = '/v1/chat/completions';
-                    const contentParts = [];
-                    if (prompt) contentParts.push({ type: 'text', text: prompt });
-                    const inputImages = connectedImages.length > 0
-                        ? connectedImages
-                        : (sourceImage ? [sourceImage] : []);
-                    inputImages.forEach((img) => {
-                        if (!img) return;
-                        contentParts.push({ type: 'image_url', image_url: { url: img } });
-                    });
-                    if (contentParts.length === 0) {
-                        contentParts.push({ type: 'text', text: t('生成图片') });
+                    if (isOpenAIGptImage2) {
+                        payload = await buildOpenAIGptImageRequest(t('生成图片'));
+                    } else {
+                        endpoint = '/v1/chat/completions';
+                        const contentParts = [];
+                        if (prompt) contentParts.push({ type: 'text', text: prompt });
+                        const inputImages = connectedImages.length > 0
+                            ? connectedImages
+                            : (sourceImage ? [sourceImage] : []);
+                        inputImages.forEach((img) => {
+                            if (!img) return;
+                            contentParts.push({ type: 'image_url', image_url: { url: img } });
+                        });
+                        if (contentParts.length === 0) {
+                            contentParts.push({ type: 'text', text: t('生成图片') });
+                        }
+                        payload = {
+                            model: resolvedImageModelName || modelId,
+                            messages: [{ role: 'user', content: contentParts }],
+                            stream: false
+                        };
                     }
-                    payload = {
-                        model: config?.modelName || modelId,
-                        messages: [{ role: 'user', content: contentParts }],
-                        stream: false
-                    };
                 }
                 // 0. ModelScope Z-Image (异步任务)
                 else if (isModelScope) {
@@ -18672,22 +19773,26 @@ function TapnowApp() {
                 }
                 // 3. OpenAI Image
                 else if (isOpenAIImage) {
-                    let finalPrompt = prompt || '';
-                    const jsonBody = {
-                        model: config?.modelName || 'gpt-4o-image',
-                        prompt: finalPrompt,
-                        n: requestedImageCountForSubmit,
-                        size: sizeStr,
-                        response_format: 'url'
-                    };
-                    if (aspect) jsonBody.aspect_ratio = aspect;
+                    if (isOfficialOpenAIGptImage) {
+                        payload = await buildOpenAIGptImageRequest();
+                    } else {
+                        let finalPrompt = prompt || '';
+                        const jsonBody = {
+                            model: config?.modelName || 'gpt-4o-image',
+                            prompt: finalPrompt,
+                            n: requestedImageCountForSubmit,
+                            size: sizeStr,
+                            response_format: 'url'
+                        };
+                        if (aspect) jsonBody.aspect_ratio = aspect;
 
-                    if (connectedImages.length > 0) {
-                        const b64Promises = connectedImages.map(url => getBase64FromUrl(url, { useProxy: resolveSourceProxy(url) }));
-                        const b64s = await Promise.all(b64Promises);
-                        jsonBody.image = b64s.map(b => `data:image/png;base64,${b}`);
+                        if (connectedImages.length > 0) {
+                            const b64Promises = connectedImages.map(url => getBase64FromUrl(url, { useProxy: resolveSourceProxy(url) }));
+                            const b64s = await Promise.all(b64Promises);
+                            jsonBody.image = b64s.map(b => `data:image/png;base64,${b}`);
+                        }
+                        payload = jsonBody;
                     }
-                    payload = jsonBody;
                 }
                 // 4. [关键] Nano Banana 2 (V2.5-4 核心逻辑，包含异步处理)
                 else if (isNanoBanana2) {
@@ -19226,12 +20331,61 @@ function TapnowApp() {
                         }
                     }
 
-                    const finalUrl = buildProxyUrl(fullUrl, providerKey);
-                    return await fetch(finalUrl, {
+                    const buildLocalProxyUrl = (targetUrl) => {
+                        const proxyBase = String(localServerUrl || '').trim().replace(/\/+$/, '');
+                        if (!proxyBase || !/^https?:\/\//i.test(String(targetUrl || ''))) return '';
+                        try {
+                            const parsed = new URL(targetUrl);
+                            const isLocalHost = parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost';
+                            if (isLocalHost) return '';
+                        } catch { }
+                        return `${proxyBase}/proxy?url=${encodeURIComponent(targetUrl)}`;
+                    };
+                    const shouldRetryViaLocalProxy = (targetUrl, firstUrl, error) => {
+                        if (firstUrl !== targetUrl) return false;
+                        if (!/failed to fetch|networkerror|load failed/i.test(String(error?.message || error || ''))) return false;
+                        const provider = providers?.[providerKey] || {};
+                        const apiTypeForRetry = String(apiType || provider?.apiType || '').toLowerCase();
+                        const providerNameForRetry = String(providerKey || provider?.name || '').toLowerCase();
+                        return apiTypeForRetry === 'openai'
+                            || providerNameForRetry.includes('openai')
+                            || /api\.openai\.com|\/v1\/images\//i.test(String(targetUrl || ''));
+                    };
+                    const shouldPreferLocalProxy = (targetUrl) => {
+                        const provider = providers?.[providerKey] || {};
+                        const apiTypeForProxy = String(apiType || provider?.apiType || '').toLowerCase();
+                        const providerNameForProxy = String(providerKey || provider?.name || '').toLowerCase();
+                        return /^https:\/\/api\.openai\.com\//i.test(String(targetUrl || ''))
+                            && (
+                                apiTypeForProxy === 'openai'
+                                || providerNameForProxy.includes('openai')
+                                || /\/v1\/images\//i.test(String(targetUrl || ''))
+                            );
+                    };
+                    const preferredProxyUrl = shouldPreferLocalProxy(fullUrl) ? buildLocalProxyUrl(fullUrl) : '';
+                    const finalUrl = preferredProxyUrl || buildProxyUrl(fullUrl, providerKey);
+                    const fetchOptions = {
                         method: overrideMethod,
                         headers: overrideHeaders,
                         body: requestBody,
-                    });
+                    };
+                    try {
+                        return await fetch(finalUrl, fetchOptions);
+                    } catch (error) {
+                        if (preferredProxyUrl) {
+                            throw new Error(`OpenAI 图片接口连接失败：本地代理不可用。请先启动本地服务 ${localServerUrl || 'http://127.0.0.1:9527'}，或把 OpenAI Provider 改成支持浏览器跨域的中转地址。原始错误：${error?.message || 'Failed to fetch'}`);
+                        }
+                        const proxyUrl = !preferredProxyUrl && shouldRetryViaLocalProxy(fullUrl, finalUrl, error)
+                            ? buildLocalProxyUrl(fullUrl)
+                            : '';
+                        if (!proxyUrl) throw error;
+                        console.warn('[API Proxy Fallback] Direct request failed, retrying via local proxy:', error?.message || error);
+                        try {
+                            return await fetch(proxyUrl, fetchOptions);
+                        } catch (proxyError) {
+                            throw new Error(`OpenAI 图片接口连接失败：浏览器直连被拦截，本地代理也不可用。请先启动本地服务 ${localServerUrl || 'http://127.0.0.1:9527'}，或把 OpenAI Provider 改成支持浏览器跨域的中转地址。原始错误：${proxyError?.message || error?.message || 'Failed to fetch'}`);
+                        }
+                    }
                 };
 
                 const apiKeysList = apiKeyRaw && apiKeyRaw.includes(',')
@@ -27386,8 +28540,38 @@ ${inputText.substring(0, 15000)} ... (截断)
         }
         return collected.join('\n').trim();
     };
-    const extractActionablePromptFromChatMessage = useCallback((text) => {
-        const stripped = stripChatSourceFooter(text);
+    const resolvePrimaryChatWorkflowPayload = useCallback((meta) => {
+        const workflowPayload = extractChatAssistantWorkflowPayload(meta);
+        if (Array.isArray(workflowPayload)) {
+            return workflowPayload.find((item) => (
+                typeof item === 'string'
+                    ? item.trim()
+                    : item && typeof item === 'object'
+            )) || null;
+        }
+        return workflowPayload || null;
+    }, []);
+    const extractActionablePromptFromChatMessage = useCallback((messageOrText, explicitMeta = null) => {
+        const assistantInput = resolveChatAssistantEnvelopeInput(
+            typeof messageOrText === 'string'
+                ? messageOrText
+                : { ...messageOrText, assistantMeta: mergeChatAssistantMeta(messageOrText?.assistantMeta || messageOrText?.meta || null, explicitMeta) }
+        );
+        const workflowPayload = resolvePrimaryChatWorkflowPayload(
+            mergeChatAssistantMeta(assistantInput?.meta || null, explicitMeta || null)
+        );
+        if (workflowPayload) {
+            if (typeof workflowPayload === 'string') {
+                const directText = workflowPayload.trim();
+                if (directText) return directText;
+            } else if (workflowPayload && typeof workflowPayload === 'object') {
+                return JSON.stringify(workflowPayload, null, 2);
+            }
+        }
+        const rawSourceText = typeof messageOrText === 'string'
+            ? messageOrText
+            : (messageOrText?.rawContent || messageOrText?.content || '');
+        const stripped = stripChatSourceFooter(assistantInput?.rawText || rawSourceText);
         if (!stripped) return '';
         const codeBlocks = Array.from(stripped.matchAll(/```([a-zA-Z0-9_-]+)?\s*([\s\S]*?)```/g));
         let previousBlockEnd = 0;
@@ -27416,12 +28600,14 @@ ${inputText.substring(0, 15000)} ... (截断)
             if (structuredFromBlock) {
                 return JSON.stringify(structuredFromBlock, null, 2);
             }
-            if (CHAT_EXECUTION_MARKER_PATTERN.test(content)) return content;
+            if (CHAT_EXECUTION_MARKER_PATTERN.test(content)) {
+                const structuredContent = extractStructuredPromptSpecFromText(content);
+                if (structuredContent) return JSON.stringify(structuredContent, null, 2);
+            }
             const labeledBlockContent = extractLabeledChatPromptBlock(content);
             if (labeledBlockContent) return labeledBlockContent;
             if (CHAT_PROMPT_HEADING_PATTERN.test(headingContext)) return content;
         }
-        if (CHAT_EXECUTION_MARKER_PATTERN.test(stripped)) return stripped;
         if (/^[\[{][\s\S]*[\]}]$/.test(stripped)) {
             try {
                 const parsed = JSON.parse(stripped);
@@ -27441,7 +28627,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             return JSON.stringify(structuredFromWholeText, null, 2);
         }
         return extractLabeledChatPromptBlock(stripped);
-    }, [stripChatSourceFooter]);
+    }, [stripChatSourceFooter, resolvePrimaryChatWorkflowPayload]);
     const extractChatSourceIndexesFromText = useCallback((text, maxCount = 0) => {
         const source = String(text || '');
         if (!source) return [];
@@ -27834,12 +29020,15 @@ ${inputText.substring(0, 15000)} ... (截断)
             normalized.copywriting?.brandName ? `brand name: ${normalized.copywriting.brandName}` : '',
             normalized.copywriting?.logoPlacement ? `logo placement: ${normalized.copywriting.logoPlacement}` : ''
         ]);
-        const compiledPrompt = uniqSegments([
-            ...(explicitCompiledPromptSegments.length > 0 ? explicitCompiledPromptSegments : compiledPromptSegments),
-            ...copywritingPromptSegments
-        ]).join(', ');
         const hasReferenceImage = !!options.hasReferenceImage;
         const preset = String(options.sourceEditPreset || '').trim();
+        const isLocalizedMaskedEdit = hasReferenceImage && (preset === 'inpaint' || preset === 'text-rewrite');
+        const compiledPrompt = uniqSegments([
+            ...(isLocalizedMaskedEdit
+                ? explicitCompiledPromptSegments
+                : (explicitCompiledPromptSegments.length > 0 ? explicitCompiledPromptSegments : compiledPromptSegments)),
+            ...copywritingPromptSegments
+        ]).join(', ');
         const fallbackEditInstruction = (() => {
             if (preset === 'upscale') {
                 return 'Upscale and restore details, keep the subject completely intact and unchanged, reduce noise and preserve real materials.';
@@ -27895,8 +29084,8 @@ ${inputText.substring(0, 15000)} ... (截断)
             }
         };
     }, [normalizeGeminiImagePromptSpec]);
-    const stringifyGeminiImagePromptSpec = useCallback((spec, defaults = {}) => {
-        const normalized = buildGeminiImageRenderPayload(spec, defaults);
+    const stringifyGeminiImagePromptSpec = useCallback((spec, defaults = {}, options = {}) => {
+        const normalized = buildGeminiImageRenderPayload(spec, defaults, options);
         const compactObject = (value, { keepZero = false } = {}) => {
             const next = {};
             Object.entries(value || {}).forEach(([key, rawValue]) => {
@@ -28032,9 +29221,12 @@ ${inputText.substring(0, 15000)} ... (截断)
             }
         };
     }, [extractActionablePromptFromChatMessage]);
-    const parseChatImageWorkflowBlueprints = useCallback((assistantText, sourceFiles = [], defaults = {}) => {
-        const rawText = stripChatSourceFooter(assistantText);
-        if (!rawText) return [];
+    const parseChatImageWorkflowBlueprints = useCallback((assistantInput, sourceFiles = [], defaults = {}) => {
+        const normalizedAssistant = resolveChatAssistantEnvelopeInput(assistantInput);
+        const rawText = stripChatSourceFooter(
+            normalizedAssistant?.rawText
+            || (typeof assistantInput === 'string' ? assistantInput : assistantInput?.content || '')
+        );
         const sourceCount = Array.isArray(sourceFiles) ? sourceFiles.length : 0;
         const allSourceIndexes = Array.from({ length: sourceCount }, (_, index) => index);
         const tryParseJson = (value) => {
@@ -28096,6 +29288,10 @@ ${inputText.substring(0, 15000)} ... (截断)
             return blocks.filter(Boolean);
         };
         const collectEntries = (() => {
+            const workflowPayload = extractChatAssistantWorkflowPayload(normalizedAssistant?.meta || null);
+            const workflowEntries = expandParsedEntries(workflowPayload);
+            if (workflowEntries.length > 0) return workflowEntries;
+            if (!rawText) return [];
             const directParsedEntries = expandParsedEntries(tryParseJson(rawText));
             if (directParsedEntries.length > 0) return directParsedEntries;
             const fencedMatches = Array.from(rawText.matchAll(/```(?:json|prompt|text|markdown)?\s*([\s\S]*?)```/gi));
@@ -28218,7 +29414,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         normalizeGeminiImagePromptSpec,
         stringifyGeminiImagePromptSpec
     ]);
-    const evaluateChatAssistantActions = useCallback((assistantText, sourceUserMessage = null) => {
+    const evaluateChatAssistantActions = useCallback((assistantInput, sourceUserMessage = null) => {
         const sourceImageFiles = (sourceUserMessage?.files || []).filter((file) => file?.isImage);
         const imageModelKey = preferredWorkflowImageModel;
         const imageModelConfig = getApiConfigByKey(imageModelKey);
@@ -28229,20 +29425,25 @@ ${inputText.substring(0, 15000)} ... (截断)
             resolution: defaultResolution,
             imageCount: 1
         };
-        const workflowBlueprints = parseChatImageWorkflowBlueprints(assistantText || '', sourceImageFiles, defaults);
-        const strippedText = stripChatSourceFooter(assistantText || '');
-        const actionablePrompt = extractActionablePromptFromChatMessage(assistantText || '');
+        const normalizedAssistant = resolveChatAssistantEnvelopeInput(assistantInput);
+        const workflowBlueprints = parseChatImageWorkflowBlueprints(assistantInput || '', sourceImageFiles, defaults);
+        const strippedText = stripChatSourceFooter(
+            normalizedAssistant?.rawText
+            || (typeof assistantInput === 'string' ? assistantInput : assistantInput?.content || '')
+        );
+        const actionablePrompt = extractActionablePromptFromChatMessage(assistantInput || '');
         const parsedPromptSpec = actionablePrompt ? parseGeminiImagePromptSpec(actionablePrompt, defaults) : null;
         const hasStructuredPromptPayload = [
             parsedPromptSpec?.apiPayload?.compiledPrompt,
             parsedPromptSpec?.apiPayload?.editInstruction,
             parsedPromptSpec?.apiPayload?.negativePrompt
         ].some((value) => String(value || '').trim());
+        const hasMetaWorkflow = !!extractChatAssistantWorkflowPayload(normalizedAssistant?.meta || null);
         const hasExplicitPromptMarkers = /```(?:json|prompt|text)?/i.test(strippedText)
             || /\b(?:SYSTEM_REASONING|API_PAYLOAD|COMPILED_PROMPT|EDIT_INSTRUCTION|NEGATIVE_PROMPT)\b/i.test(strippedText);
         return {
-            canCreateWorkflow: workflowBlueprints.length > 0,
-            canSyncPrompt: !!actionablePrompt && (hasStructuredPromptPayload || hasExplicitPromptMarkers)
+            canCreateWorkflow: workflowBlueprints.length > 0 || hasMetaWorkflow,
+            canSyncPrompt: !!actionablePrompt && (hasStructuredPromptPayload || hasExplicitPromptMarkers || hasMetaWorkflow)
         };
     }, [
         parseChatImageWorkflowBlueprints,
@@ -28636,8 +29837,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                     return { applied: true, promptText: rawPrompt, spec: baseSettings.geminiImagePromptSpec || null };
                 }
             }
+            const sourceEditPreset = extraUpdates.sourceEditPreset || baseSettings.sourceEditPreset || '';
             const promptSpec = sanitizeImagePromptSpecForModel(parseGeminiImagePromptSpec(rawPrompt, defaults), modelKey, defaults);
-            const promptJson = stringifyGeminiImagePromptSpec(promptSpec, defaults);
+            const promptJson = stringifyGeminiImagePromptSpec(promptSpec, defaults, {
+                hasReferenceImage: !!(extraUpdates.sourceEditNodeId || baseSettings.sourceEditNodeId),
+                sourceEditPreset
+            });
             const imageCount = normalizeImageConcurrency(promptSpec.output?.imageCount || defaults.imageCount || 1);
             const nextSizing = estimateImageNodeDisplaySize({
                 prompt: promptSpec.apiPayload?.compiledPrompt || promptSpec.renderPrompt || rawPrompt,
@@ -28930,11 +30135,82 @@ ${inputText.substring(0, 15000)} ... (截断)
         callToAction: '',
         brandName: '',
         backgroundMode: preset === 'cutout' ? 'pure-white' : 'keep-original',
+        localEditAction: 'repair',
+        localEditNote: '',
+        replacementImage: '',
+        replacementImageDimensions: null,
+        replacementImageName: '',
         textBlocks: [],
         selectedTextBlockIds: [],
+        maskNotes: [],
         recognizedAt: 0,
         recognizedModel: ''
     }), []);
+    const uploadEditReplacementImage = useCallback((nodeId, file) => {
+        const targetNode = nodesMap.get(nodeId);
+        if (!targetNode || targetNode.type !== 'input-image' || !file) return;
+        if (!file.type?.startsWith('image/')) {
+            showToast('请上传图片素材', 'warning', 2200);
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+            try {
+                const rawUrl = String(event.target?.result || '');
+                let dims = null;
+                try {
+                    dims = await getImageDimensions(rawUrl);
+                } catch (error) {
+                    dims = null;
+                }
+                const persistedUrl = await persistBase64ImageUrl(rawUrl);
+                const currentWorkbench = {
+                    ...getDefaultImageEditWorkbench('inpaint'),
+                    ...(targetNode.settings?.editWorkbench || {})
+                };
+                updateNodeSettings(nodeId, {
+                    editWorkbench: {
+                        ...currentWorkbench,
+                        preset: 'inpaint',
+                        localEditAction: 'material',
+                        replacementImage: persistedUrl,
+                        replacementImageDimensions: dims,
+                        replacementImageName: file.name || '替换素材',
+                        instruction: String(currentWorkbench.instruction || '').trim()
+                            || '用上传素材替换遮罩区域，保持原图未遮罩区域不变'
+                    }
+                });
+                showToast('替换素材已加入局部编辑', 'success', 2200);
+            } catch (error) {
+                console.error('[Image Edit] 替换素材上传失败:', error);
+                showToast('替换素材上传失败', 'error', 2600);
+            }
+        };
+        reader.readAsDataURL(file);
+    }, [nodesMap, getImageDimensions, persistBase64ImageUrl, getDefaultImageEditWorkbench, updateNodeSettings, showToast]);
+    useEffect(() => {
+        const activeNodeId = imageEditModal?.nodeId;
+        if (!activeNodeId || imageEditModal?.isMasking) return undefined;
+        const activeNode = nodesMap.get(activeNodeId);
+        if (!activeNode || activeNode.type !== 'input-image') return undefined;
+        const handlePasteReplacementImage = (event) => {
+            const target = event.target;
+            if (target && ['INPUT', 'TEXTAREA'].includes(target.tagName)) return;
+            const items = Array.from(event.clipboardData?.items || []);
+            const imageItem = items.find((item) => item.type?.startsWith('image/'));
+            if (!imageItem) return;
+            const file = imageItem.getAsFile();
+            if (!file) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') {
+                event.stopImmediatePropagation();
+            }
+            uploadEditReplacementImage(activeNodeId, file);
+        };
+        window.addEventListener('paste', handlePasteReplacementImage, true);
+        return () => window.removeEventListener('paste', handlePasteReplacementImage, true);
+    }, [imageEditModal?.nodeId, imageEditModal?.isMasking, nodesMap, uploadEditReplacementImage]);
     const getPreferredTextRewriteModelKey = useCallback(() => {
         const candidates = [
             lastUsedExtractModel,
@@ -29012,7 +30288,27 @@ ${inputText.substring(0, 15000)} ... (截断)
             showToast('浏览器不支持当前的遮罩绘制能力', 'error', 2600);
             return;
         }
-        const padding = Math.max(12, Math.round(Math.min(dims.w, dims.h) * 0.012));
+        const padding = Math.max(10, Math.round(Math.min(dims.w, dims.h) * 0.01));
+        const drawRoundedMaskRect = (left, top, width, height) => {
+            const radius = clampNumber(Math.round(Math.min(width, height) * 0.18), 3, Math.max(3, padding));
+            ctx.beginPath();
+            if (typeof ctx.roundRect === 'function') {
+                ctx.roundRect(left, top, width, height, radius);
+            } else {
+                const right = left + width;
+                const bottom = top + height;
+                ctx.moveTo(left + radius, top);
+                ctx.lineTo(right - radius, top);
+                ctx.quadraticCurveTo(right, top, right, top + radius);
+                ctx.lineTo(right, bottom - radius);
+                ctx.quadraticCurveTo(right, bottom, right - radius, bottom);
+                ctx.lineTo(left + radius, bottom);
+                ctx.quadraticCurveTo(left, bottom, left, bottom - radius);
+                ctx.lineTo(left, top + radius);
+                ctx.quadraticCurveTo(left, top, left + radius, top);
+            }
+            ctx.fill();
+        };
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.fillStyle = '#FFFFFF';
         selectedBlocks.forEach((block) => {
@@ -29027,7 +30323,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             const bottom = clampNumber(y + h + padding, 0, dims.h);
             const width = Math.max(1, right - left);
             const height = Math.max(1, bottom - top);
-            ctx.fillRect(left, top, width, height);
+            drawRoundedMaskRect(left, top, width, height);
         });
         saveToUndoStack();
         setNodes((prev) => prev.map((item) => (
@@ -29273,6 +30569,17 @@ ${inputText.substring(0, 15000)} ... (截断)
             brandName: String(workbench.brandName || '').trim(),
             logoPlacement: ''
         };
+        const maskNotes = Array.isArray(workbench.maskNotes)
+            ? workbench.maskNotes.map((item) => String(item || '').trim()).filter(Boolean)
+            : [];
+        const maskNoteText = maskNotes.length > 0 ? ` Point notes: ${maskNotes.join('; ')}.` : '';
+        const localEditAction = String(workbench.localEditAction || '').trim() || (workbench.replacementImage ? 'material' : 'repair');
+        const localEditNote = String(workbench.localEditNote || '').trim();
+        const actionLabel = LOCAL_EDIT_ACTION_LABELS[localEditAction] || LOCAL_EDIT_ACTION_LABELS.repair;
+        const replacementMaterialText = workbench.replacementImage
+            ? ' A second reference image is provided as the replacement material. Use that replacement material only inside the transparent mask; do not restyle or copy it outside the mask.'
+            : '';
+        const localActionText = ` Region action: ${actionLabel}.${localEditNote ? ` User note: ${localEditNote}.` : ''}${replacementMaterialText}`;
         const baseSpec = {
             creativeGoal: '',
             subject: {},
@@ -29370,9 +30677,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                 logoPlacement: '保持与原稿协调'
             };
             baseSpec.apiPayload = {
-                compiledPrompt: 'clean premium poster layout, keep original composition, preserve paper and packaging texture, realistic typography rendering',
-                negativePrompt: 'unmasked area changes, layout collapse, extra text, warped letters, distorted product shape',
-                editInstruction: `Rewrite only the masked text area, keep the product, layout and background structure intact.${textTargets ? ` ${textTargets}.` : ''}${instruction ? ` ${instruction}` : ''}`.trim(),
+                compiledPrompt: '',
+                negativePrompt: 'changes outside mask, moving target, extra text outside mask, warped letters, distorted product shape',
+                editInstruction: `Use the transparent mask as the exact edit boundary. Rewrite only the masked text/object under the point note, preserve every unmasked pixel, and match the original font weight, baseline, kerning, perspective, shadows and reflections.${maskNoteText}${textTargets ? ` Target text: ${textTargets}.` : ''}${instruction ? ` ${instruction}` : ''}`.trim(),
                 aspectRatio: defaults.aspectRatio || 'Auto',
                 resolution: defaults.resolution || '2K',
                 sampleCount: 1
@@ -29409,6 +30716,34 @@ ${inputText.substring(0, 15000)} ... (截断)
             };
             baseSpec.editNotes = [CUTOUT_PROMPT_TEXT, instruction].filter(Boolean).join('\n');
             baseSpec.negativePrompt = '不要新增道具，不要改变主体比例，不要出现脏边或锯齿';
+        } else if (preset === 'layer-decompose') {
+            // V3.8.8+: Layer decomposition - decompose image into clean material layers
+            const layerCount = Math.max(2, Math.min(6, Number(workbench.layerCount) || 4));
+            const layerLabels = ['主体层', '背景层', '文案层', '渲染层', '特效叠加层', '环境遮罩层'];
+            const decomposePrompt = LAYER_DECOMPOSE_PROMPT_TEXT.replace(/\{N\}/g, String(layerCount));
+            const layerDesc = layerLabels.slice(0, layerCount).map((label, i) => `图层${i + 1}-${label}`).join(' / ');
+            baseSpec.creativeGoal = `拆图分层：${layerDesc}`;
+            baseSpec.systemReasoning = {
+                intent: `图生图：拆分为${layerCount}个独立干净图层`,
+                originalSubject: '保留原图所有视觉元素，按主体/背景/文案/渲染分层',
+                editStrategy: `严格分解为${layerCount}层独立PNG素材，透明背景，无棋盘格`
+            };
+            baseSpec.visualStyle = {
+                style: 'production-ready material layers',
+                lighting: 'preserve original per-layer lighting',
+                material: 'clean transparent PNG layers, no grid background'
+            };
+            baseSpec.apiPayload = {
+                compiledPrompt: decomposePrompt,
+                negativePrompt: 'fake grid background, checkerboard, merged layers, blurred edges, overlapping pixels, watermark, annotations, white box border',
+                editInstruction: `Decompose this image into exactly ${layerCount} separate production-ready layers on transparent backgrounds. Each layer must be a clean material image with no grid or checkerboard background.${instruction ? ` ${instruction}` : ''}`.trim(),
+                aspectRatio: defaults.aspectRatio || 'Auto',
+                resolution: defaults.resolution || '2K',
+                sampleCount: layerCount
+            };
+            baseSpec.output.imageCount = layerCount;
+            baseSpec.editNotes = [decomposePrompt, instruction].filter(Boolean).join('\n');
+            baseSpec.negativePrompt = '禁止生成棋盘格背景，禁止合并图层，禁止弱化主体边缘';
         } else {
             baseSpec.creativeGoal = '图生图：基于遮罩进行局部重绘';
             baseSpec.systemReasoning = {
@@ -29422,9 +30757,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                 material: 'preserve real materials, metallic edges and matte surfaces'
             };
             baseSpec.apiPayload = {
-                compiledPrompt: 'photorealistic product edit, preserve geometry, maintain original lighting, realistic metallic and matte material texture, edge-to-edge clarity',
-                negativePrompt: 'structural changes, inaccurate textures, dirty background, harsh shadows, AI artifacts',
-                editInstruction: `Edit only the masked area, keep the subject completely intact and unchanged, preserve geometry, edges and material realism.${instruction ? ` ${instruction}` : ''}`.trim(),
+                compiledPrompt: '',
+                negativePrompt: 'changes outside mask, moving target, changing unmasked structure, extra objects, inaccurate target, AI artifacts',
+                editInstruction: `Use the transparent mask as the exact edit boundary. Follow the region action and notes literally. Modify only the marked object/part under the mask; preserve every unmasked pixel, original geometry, edges, shadows, reflections, material and layout.${localActionText}${maskNoteText}${instruction ? ` ${instruction}` : ''}`.trim(),
                 aspectRatio: defaults.aspectRatio || 'Auto',
                 resolution: defaults.resolution || '2K',
                 sampleCount: 1
@@ -29452,11 +30787,24 @@ ${inputText.substring(0, 15000)} ... (截断)
             return null;
         }
 
-        const imageModelKey = preferredWorkflowImageModel;
-        const defaultRatio = getPreferredModelRatio(imageModelKey, 'image') || 'Auto';
+        const gptImage2Config = apiConfigs.find((entry) => (
+            entry
+            && !entry.disabled
+            && (isOpenAIGptImage2ModelId(entry.id) || isOpenAIGptImage2ModelId(entry.modelName))
+        ));
+        const imageModelKey = requiresMask && gptImage2Config
+            ? resolveModelKey(gptImage2Config._uid || gptImage2Config.id || preferredWorkflowImageModel)
+            : preferredWorkflowImageModel;
+        const sourceDims = sourceNode.dimensions;
+        const sourceOriginalResolution = sourceDims?.w && sourceDims?.h
+            ? `${Math.round(sourceDims.w)}x${Math.round(sourceDims.h)}`
+            : '';
+        const defaultRatio = sourceOriginalResolution
+            ? 'Auto'
+            : (getPreferredModelRatio(imageModelKey, 'image') || 'Auto');
         const defaultResolution = preset === 'upscale'
             ? '4K'
-            : (getPreferredImageResolutionForModel(imageModelKey) || '2K');
+            : (sourceOriginalResolution || getPreferredImageResolutionForModel(imageModelKey) || '2K');
         const promptSpec = buildImageEditPromptSpec(preset, workbench, {
             aspectRatio: defaultRatio,
             resolution: defaultResolution,
@@ -29466,17 +30814,43 @@ ${inputText.substring(0, 15000)} ... (截断)
             aspectRatio: defaultRatio,
             resolution: defaultResolution,
             imageCount: 1
+        }, {
+            hasReferenceImage: true,
+            sourceEditPreset: preset
         });
         const targetX = sourceNode.x + sourceNode.width + 280;
         const targetY = sourceNode.y + (sourceNode.height / 2);
         const imageNode = addNode('gen-image', targetX, targetY, sourceNodeId);
+        const replacementImage = String(workbench.replacementImage || '').trim();
+        if (replacementImage) {
+            const replacementNode = addNode(
+                'input-image',
+                sourceNode.x + sourceNode.width + 120,
+                sourceNode.y + sourceNode.height + 160,
+                null,
+                replacementImage,
+                workbench.replacementImageDimensions || undefined,
+                imageNode.id
+            );
+            if (replacementNode?.id) {
+                updateNodeSettings(replacementNode.id, {
+                    label: workbench.replacementImageName || '替换素材',
+                    role: 'replacement-material'
+                });
+            }
+        }
+        // V3.8.8+: Layer decomposition uses concurrent image generation
+        const isLayerDecompose = preset === 'layer-decompose';
+        const layerCount = isLayerDecompose ? Math.max(2, Math.min(6, Number(workbench.layerCount) || 4)) : 1;
         applyImagePromptTextToNode(imageNode.id, promptJson, {
             model: imageModelKey,
             linkedPromptNodeId: '',
             ratio: promptSpec.output?.aspectRatio || defaultRatio,
             resolution: promptSpec.output?.resolution || defaultResolution,
             sourceEditPreset: preset,
-            sourceEditNodeId: sourceNodeId
+            sourceEditNodeId: sourceNodeId,
+            concurrentImages: isLayerDecompose ? layerCount : 1,
+            imageConcurrency: isLayerDecompose ? layerCount : undefined,
         });
         setImageEditModal({ nodeId: null, isMasking: false });
         setSelectedNodeId(imageNode.id);
@@ -29489,7 +30863,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                 ? '文字无痕修改'
                 : preset === 'cutout'
                     ? '智能抠图 / 换底'
-                    : '局部重绘';
+                    : isLayerDecompose
+                        ? `拆图分层 ×${layerCount}`
+                        : '局部重绘';
         showToast(`已创建${actionLabel}工作流`, 'success', 2400);
         return imageNode.id;
     }, [
@@ -29505,6 +30881,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         buildImageEditPromptSpec,
         stringifyGeminiImagePromptSpec,
         addNode,
+        updateNodeSettings,
         applyImagePromptTextToNode,
         touchNodeSelectionPriority,
         markInteraction
@@ -29527,7 +30904,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         const imageModelConfig = getApiConfigByKey(imageModelKey);
         const defaultRatio = getPreferredModelRatio(imageModelKey || imageModelConfig?.id || '', 'image') || lastUsedRatio || '1:1';
         const defaultResolution = getPreferredImageResolutionForModel(imageModelKey || imageModelConfig?.id || '') || lastUsedImageResolution || '2K';
-        const workflowBlueprints = parseChatImageWorkflowBlueprints(assistantMessage?.content || '', sourceImageFiles, {
+        const workflowBlueprints = parseChatImageWorkflowBlueprints(assistantMessage, sourceImageFiles, {
             aspectRatio: defaultRatio,
             resolution: defaultResolution,
             imageCount: 1
@@ -32736,7 +34113,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             { id: 'inpaint', label: '局部重绘', icon: Brush, desc: '局部替换 / 修瑕 / 局部改稿' },
                                             { id: 'upscale', label: '高清还原', icon: Sparkles, desc: '放大 / 锐化 / 去噪' },
                                             { id: 'text-rewrite', label: '文字无痕修改', icon: Edit3, desc: '改标题 / 副标题 / 排版文案' },
-                                            { id: 'cutout', label: '智能抠图 / 换底', icon: Scissors, desc: '主体分离 / 换底 / 电商精修' }
+                                            { id: 'cutout', label: '智能抠图 / 换底', icon: Scissors, desc: '主体分离 / 换底 / 电商精修' },
+                                            { id: 'layer-decompose', label: '拆图分层', icon: Layers, desc: '主体/背景/文案/渲染四层分离' }
                                         ];
                                         return createPortal(
                                             <div
@@ -32909,6 +34287,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         theme={theme}
                                                                         view={view}
                                                                         maskContent={node.maskContent}
+                                                                        nodeSettings={node.settings}
                                                                     />
                                                                 )}
                                                             </div>
@@ -32961,6 +34340,116 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 : '例如：只修改产品标签区域，换成更高级的材质与颜色'}
                                                                 />
                                                             </label>
+
+                                                            {currentPreset === 'inpaint' && (
+                                                                <div className={`rounded-2xl border p-3 space-y-3 ${theme === 'dark'
+                                                                    ? 'border-zinc-800 bg-zinc-900/60'
+                                                                    : 'border-zinc-200 bg-zinc-50'
+                                                                    }`}>
+                                                                    <div className="flex items-center justify-between gap-2">
+                                                                        <div>
+                                                                            <div className="text-[11px] font-medium">区域动作</div>
+                                                                            <div className={`text-[10px] mt-0.5 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                                                                先圈区域，再指定这块区域要怎么改
+                                                                            </div>
+                                                                        </div>
+                                                                        <select
+                                                                            value={workbench.localEditAction || 'repair'}
+                                                                            onChange={(e) => updateNodeSettings(node.id, {
+                                                                                editWorkbench: {
+                                                                                    ...workbench,
+                                                                                    localEditAction: e.target.value
+                                                                                }
+                                                                            })}
+                                                                            className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                                : 'bg-white border-zinc-200 text-zinc-800'
+                                                                                }`}
+                                                                        >
+                                                                            <option value="repair">修复/清理</option>
+                                                                            <option value="replace">替换/改成</option>
+                                                                            <option value="erase">擦除/移除</option>
+                                                                            <option value="material">按上传素材替换</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <input
+                                                                        value={workbench.localEditNote || ''}
+                                                                        onChange={(e) => updateNodeSettings(node.id, {
+                                                                            editWorkbench: {
+                                                                                ...workbench,
+                                                                                localEditNote: e.target.value
+                                                                            }
+                                                                        })}
+                                                                        className={`w-full px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                            ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100 placeholder-zinc-600'
+                                                                            : 'bg-white border-zinc-200 text-zinc-800 placeholder-zinc-400'
+                                                                            }`}
+                                                                        placeholder="例如：只修阀门 / 用素材替换这个接头 / 擦掉划痕"
+                                                                    />
+                                                                    <div className="flex items-center gap-2">
+                                                                        <label className={`inline-flex items-center gap-2 px-3 py-2 rounded-xl text-[11px] font-medium border cursor-pointer ${theme === 'dark'
+                                                                            ? 'border-blue-400/30 bg-blue-500/10 text-blue-200 hover:bg-blue-500/20'
+                                                                            : 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
+                                                                            }`}
+                                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                                            onClick={(e) => e.stopPropagation()}
+                                                                        >
+                                                                            <UploadCloud size={12} />
+                                                                            上传替换素材
+                                                                            <input
+                                                                                type="file"
+                                                                                accept="image/*"
+                                                                                className="hidden"
+                                                                                onClick={(e) => e.stopPropagation()}
+                                                                                onChange={(e) => {
+                                                                                    e.stopPropagation();
+                                                                                    const file = e.target.files?.[0];
+                                                                                    if (file) uploadEditReplacementImage(node.id, file);
+                                                                                    e.target.value = '';
+                                                                                }}
+                                                                            />
+                                                                        </label>
+                                                                        {workbench.replacementImage && (
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => updateNodeSettings(node.id, {
+                                                                                    editWorkbench: {
+                                                                                        ...workbench,
+                                                                                        replacementImage: '',
+                                                                                        replacementImageDimensions: null,
+                                                                                        replacementImageName: '',
+                                                                                        localEditAction: workbench.localEditAction === 'material' ? 'repair' : workbench.localEditAction
+                                                                                    }
+                                                                                })}
+                                                                                className={`px-3 py-2 rounded-xl text-[11px] border ${theme === 'dark'
+                                                                                    ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                                                                    : 'border-zinc-300 text-zinc-700 hover:bg-zinc-100'
+                                                                                    }`}
+                                                                            >
+                                                                                移除素材
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
+                                                                    {workbench.replacementImage && (
+                                                                        <div className={`flex items-center gap-3 rounded-xl border p-2 ${theme === 'dark'
+                                                                            ? 'border-zinc-800 bg-zinc-950/70'
+                                                                            : 'border-zinc-200 bg-white'
+                                                                            }`}>
+                                                                            <LazyBase64Image
+                                                                                src={workbench.replacementImage}
+                                                                                className="w-14 h-14 rounded-lg object-cover border border-black/10"
+                                                                                alt=""
+                                                                            />
+                                                                            <div className="min-w-0">
+                                                                                <div className="text-[11px] font-medium truncate">{workbench.replacementImageName || '替换素材'}</div>
+                                                                                <div className={`text-[10px] mt-0.5 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                                                                    创建工作流时会作为第二张参考图连接，只用于遮罩区域
+                                                                                </div>
+                                                                            </div>
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            )}
 
                                                             {currentPreset === 'text-rewrite' && (
                                                                 <div className="space-y-3">
@@ -33181,6 +34670,26 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         <option value="pure-white">纯白背景</option>
                                                                         <option value="studio-gray">中性灰背景</option>
                                                                         <option value="transparent-look">透明感背景</option>
+                                                                    </select>
+                                                                </label>
+                                                            )}
+                                                            {/* V3.8.8+: Layer decomposition layer count selector */}
+                                                            {currentPreset === 'layer-decompose' && (
+                                                                <label className="flex flex-col gap-1.5">
+                                                                    <span className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>图层数量</span>
+                                                                    <select
+                                                                        value={workbench.layerCount || 4}
+                                                                        onChange={(e) => updateNodeSettings(node.id, { editWorkbench: { ...workbench, layerCount: Number(e.target.value) } })}
+                                                                        className={`px-3 py-2 rounded-xl text-[12px] border outline-none ${theme === 'dark'
+                                                                            ? 'bg-zinc-950/80 border-zinc-800 text-zinc-100'
+                                                                            : 'bg-white border-zinc-200 text-zinc-800'
+                                                                            }`}
+                                                                    >
+                                                                        <option value="2">2 层（主体+背景）</option>
+                                                                        <option value="3">3 层（主体+背景+文案）</option>
+                                                                        <option value="4">4 层（主体+背景+文案+渲染）</option>
+                                                                        <option value="5">5 层（全拆分）</option>
+                                                                        <option value="6">6 层（超细拆分）</option>
                                                                     </select>
                                                                 </label>
                                                             )}
@@ -41081,9 +42590,39 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         <FileSearch size={10} /> 联网搜索
                                     </button>
                                 </div>
+                                {currentChatRuntimeTools.length > 0 && (
+                                    <div className="flex flex-wrap gap-1.5 mt-2">
+                                        {currentChatRuntimeTools.map((tool) => (
+                                            <span
+                                                key={tool.id}
+                                                className={`text-[10px] px-2 py-0.5 rounded-full border ${theme === 'dark'
+                                                    ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                                                    : 'bg-amber-50 text-amber-700 border-amber-200'
+                                                    }`}
+                                                title={tool.description || tool.label || tool.id}
+                                            >
+                                                {String(tool.kind || 'tool').toUpperCase()} · {tool.label || tool.id}
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                             <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4 select-text">
-                                {currentSession?.messages.map((msg) => (
+                                {currentSession?.messages.map((msg) => {
+                                    const assistantEnvelope = msg.role === 'assistant'
+                                        ? resolveChatAssistantEnvelopeInput(msg)
+                                        : null;
+                                    const messageContent = msg.role === 'assistant' && !msg.isError
+                                        ? String(assistantEnvelope?.displayText || msg.content || '')
+                                        : String(msg.content || '');
+                                    const assistantMeta = assistantEnvelope?.meta || msg.assistantMeta || null;
+                                    const suggestedReplies = msg.role === 'assistant'
+                                        ? normalizeChatSuggestedReplies(msg.suggestedReplies || assistantMeta?.suggestedReplies || [])
+                                        : [];
+                                    const assistantRawText = msg.role === 'assistant'
+                                        ? String(assistantEnvelope?.rawText || msg.rawContent || msg.content || '')
+                                        : '';
+                                    return (
                                     <div key={msg.id || msg.timestamp || `msg-${Math.random()}`} className={`flex gap-3 select-text ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
                                         <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 select-none ${msg.role === 'user' ? 'bg-blue-600' : 'bg-green-600'}`}>{msg.role === 'user' ? <User size={16} className="text-white" /> : <Bot size={16} className="text-white" />}</div>
                                         <div className={`flex flex-col gap-1 max-w-[85%] select-text ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
@@ -41169,7 +42708,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     ))}
                                                 </div>
                                             )}
-                                            {msg.content && msg.content.trim() && (
+                                            {messageContent && messageContent.trim() && (
                                                 <div
                                                     className={`rounded-2xl px-4 py-2.5 text-sm select-text break-words ${msg.role === 'user'
                                                         ? theme === 'dark'
@@ -41182,13 +42721,13 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     style={{ userSelect: 'text', cursor: 'text' }}
                                                 >
                                                     {msg.isError ? (
-                                                        <span className="text-red-500 select-text cursor-text" style={{ userSelect: 'text', cursor: 'text' }}>{msg.content}</span>
-                                                    ) : msg.content ? (
-                                                        <div className="markdown-body" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(msg.content)) }} style={{ userSelect: 'text', cursor: 'text' }}></div>
+                                                        <span className="text-red-500 select-text cursor-text" style={{ userSelect: 'text', cursor: 'text' }}>{messageContent}</span>
+                                                    ) : messageContent ? (
+                                                        <div className="markdown-body" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(messageContent)) }} style={{ userSelect: 'text', cursor: 'text' }}></div>
                                                     ) : null}
                                                 </div>
                                             )}
-                                            {msg.role === 'assistant' && msg.content && msg.content.trim() && !msg.isError && (msg.canCreateWorkflow !== false || msg.canSyncPrompt !== false) && (
+                                            {msg.role === 'assistant' && messageContent && messageContent.trim() && !msg.isError && (msg.canCreateWorkflow !== false || msg.canSyncPrompt !== false) && (
                                                 <div className="flex flex-wrap gap-2 pt-1">
                                                     {msg.canCreateWorkflow !== false && (
                                                         <button
@@ -41216,7 +42755,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     showToast('请先选中一个画布节点', 'warning', 2200);
                                                                     return;
                                                                 }
-                                                                const actionablePrompt = extractActionablePromptFromChatMessage(msg.content);
+                                                                const actionablePrompt = extractActionablePromptFromChatMessage({
+                                                                    content: messageContent,
+                                                                    rawContent: assistantRawText,
+                                                                    assistantMeta
+                                                                });
                                                                 if (!actionablePrompt) {
                                                                     showToast('这条回复里没有可直接同步的提示词', 'warning', 2400);
                                                                     return;
@@ -41235,9 +42778,27 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     )}
                                                 </div>
                                             )}
+                                            {msg.role === 'assistant' && suggestedReplies.length > 0 && !msg.isError && (
+                                                <div className="flex flex-wrap gap-2 pt-1">
+                                                    {suggestedReplies.map((reply, idx) => (
+                                                        <button
+                                                            key={`${msg.id || msg.timestamp || 'reply'}-${idx}`}
+                                                            className={`px-2 py-1 rounded-full text-[10px] border ${theme === 'dark'
+                                                                ? 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
+                                                                : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50'
+                                                                } ${isChatSending ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                            disabled={isChatSending}
+                                                            onMouseDown={(e) => e.stopPropagation()}
+                                                            onClick={() => sendChatMessage({ input: reply, files: [] })}
+                                                        >
+                                                            {reply}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
-                                ))}
+                                )})}
                                 {isChatSending && (
                                     <div className="flex gap-3">
                                         <div className="w-8 h-8 rounded-full bg-green-600 flex items-center justify-center shrink-0">
@@ -43152,8 +44713,15 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     ? JSON.stringify(requestChainValue, null, 2)
                                                     : REQUEST_CHAIN_TEMPLATE_TEXT
                                             );
+                                            const chatRuntimeToolsValue = normalizeChatRuntimeToolDefinitions(entry.chatRuntimeTools);
+                                            const chatRuntimeToolsDraft = libraryChatRuntimeToolDrafts[entry.id] || (
+                                                chatRuntimeToolsValue.length > 0
+                                                    ? JSON.stringify(chatRuntimeToolsValue, null, 2)
+                                                    : CHAT_RUNTIME_TOOLS_TEMPLATE_TEXT
+                                            );
                                             const isAsyncPreviewOpen = libraryAsyncPreviewModels.has(entry.id);
                                             const isRequestTemplateCollapsed = isLibrarySectionCollapsed(entry.id, 'request-template');
+                                            const isChatRuntimeToolsCollapsed = isLibrarySectionCollapsed(entry.id, 'chat-runtime-tools');
                                             const isAsyncSectionCollapsed = isLibrarySectionCollapsed(entry.id, 'async-task');
                                             const asyncPreviewVars = {
                                                 requestId: 'REQUEST_ID',
@@ -44476,6 +46044,85 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     </div>
                                                                 </div>
                                                                 </>
+                                                                )}
+                                                            </div>
+                                                            <div className={`rounded-md border p-2 mt-3 ${theme === 'dark'
+                                                                ? 'bg-zinc-950/60 border-zinc-800'
+                                                                : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
+                                                                }`}>
+                                                                <div className="flex items-center justify-between mb-2">
+                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('Chat Runtime Tools（热加载）')}</div>
+                                                                    <button
+                                                                        onClick={() => toggleLibrarySectionCollapsed(entry.id, 'chat-runtime-tools')}
+                                                                        className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
+                                                                        title={isChatRuntimeToolsCollapsed ? t('展开') : t('折叠')}
+                                                                    >
+                                                                        <ChevronDown size={12} className={`transition-transform ${isChatRuntimeToolsCollapsed ? '' : 'rotate-180'}`} />
+                                                                    </button>
+                                                                </div>
+                                                                {!isChatRuntimeToolsCollapsed && (
+                                                                    <>
+                                                                        <textarea
+                                                                            value={chatRuntimeToolsDraft}
+                                                                            onChange={(e) => setLibraryChatRuntimeToolDrafts(prev => ({ ...prev, [entry.id]: e.target.value }))}
+                                                                            disabled={!isEditing}
+                                                                            className={`w-full h-48 text-[9px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-900 border-zinc-800 text-zinc-200'
+                                                                                : 'bg-white border-zinc-300 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                        <div className={`text-[9px] mt-2 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                                                            支持 `mcp / cli / skill / http / builtin`。Chat 会把 toolRequests 发给本地服务执行，支持热更新定义而不改代码。
+                                                                        </div>
+                                                                        <div className="flex items-center justify-between mt-2">
+                                                                            <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                                                                示例字段：`id`、`kind`、`description`、`command`、`argsTemplate`、`path`、`url`、`toolName`
+                                                                            </div>
+                                                                            <div className="flex items-center gap-2">
+                                                                                <button
+                                                                                    onClick={() => {
+                                                                                        try {
+                                                                                            const parsed = chatRuntimeToolsDraft ? JSON.parse(chatRuntimeToolsDraft) : [];
+                                                                                            if (!Array.isArray(parsed)) {
+                                                                                                throw new Error('运行时工具必须是数组');
+                                                                                            }
+                                                                                            updateModelLibraryEntry(entry.id, { chatRuntimeTools: normalizeChatRuntimeToolDefinitions(parsed) });
+                                                                                            setLibraryChatRuntimeToolDrafts(prev => {
+                                                                                                const { [entry.id]: _removed, ...rest } = prev;
+                                                                                                return rest;
+                                                                                            });
+                                                                                            showToast('运行时工具已保存', 'success', 2000);
+                                                                                        } catch (e) {
+                                                                                            showToast('运行时工具 JSON 格式无效', 'error', 2000);
+                                                                                        }
+                                                                                    }}
+                                                                                    disabled={!isEditing}
+                                                                                    className={`px-2 py-1 rounded text-[9px] ${theme === 'dark'
+                                                                                        ? 'bg-zinc-700 text-zinc-200 hover:bg-zinc-600'
+                                                                                        : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'
+                                                                                        } ${!isEditing ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                                                >
+                                                                                    {t('保存运行时工具')}
+                                                                                </button>
+                                                                                <button
+                                                                                    onClick={() => {
+                                                                                        updateModelLibraryEntry(entry.id, { chatRuntimeTools: [] });
+                                                                                        setLibraryChatRuntimeToolDrafts(prev => {
+                                                                                            const { [entry.id]: _removed, ...rest } = prev;
+                                                                                            return rest;
+                                                                                        });
+                                                                                    }}
+                                                                                    disabled={!isEditing}
+                                                                                    className={`px-2 py-1 rounded text-[9px] ${theme === 'dark'
+                                                                                        ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'
+                                                                                        : 'bg-zinc-100 text-zinc-500 hover:bg-zinc-200'
+                                                                                        } ${!isEditing ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                                                >
+                                                                                    {t('清空')}
+                                                                                </button>
+                                                                            </div>
+                                                                        </div>
+                                                                    </>
                                                                 )}
                                                             </div>
                                                             <div className={`rounded-md border p-2 mt-3 ${theme === 'dark'
